@@ -24,3 +24,5 @@
 /*.log
 /*.py
 /*.json/native/vendor/craft-libs/.git*
+/.merkle-snapshot.json
+/.t6_dump_cache.json
