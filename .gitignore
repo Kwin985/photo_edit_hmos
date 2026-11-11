@@ -1,0 +1,26 @@
+/node_modules
+/oh_modules
+/local.properties
+/.idea
+**/build
+/.hvigor
+.cxx
+/.clangd
+/.clang-format
+/.clang-tidy
+**/.test
+/.appanalyzer
+# Rust 构建产物（体积 20GB，绝不可入库）
+/native/target
+
+# 预编译动态库（由 scripts/build-photocraft.ps1 重建）
+/entry/libs/**/*.so
+
+# 运行时验证取证产物（截图 / dump / 日志 / 一次性驱动脚本）
+/verify-artifacts
+/*.jpeg
+/*.jpg
+/*.png
+/*.log
+/*.py
+/*.json/native/vendor/craft-libs/.git*

@@ -1,0 +1,56 @@
+{
+  "app": {
+    "signingConfigs": [
+      {
+        "name": "default",
+        "type": "HarmonyOS",
+        "material": {
+          "certpath": "C:\\Users\\34492\\.ohos\\config\\default_photocraft_gLieZTBnJgoCBU9a9gfSCkzKpXSjMWY7FCVpZiONpmo=.cer",
+          "keyAlias": "debugKey",
+          "keyPassword": "0000001B97216FB4FA03DD7B14FD96F89F3AD0C843D2BFA78663611C60ACA9E7EA0E8B5ECA7306653BC4F3",
+          "profile": "C:\\Users\\34492\\.ohos\\config\\default_photocraft_gLieZTBnJgoCBU9a9gfSCkzKpXSjMWY7FCVpZiONpmo=.p7b",
+          "signAlg": "SHA256withECDSA",
+          "storeFile": "C:\\Users\\34492\\.ohos\\config\\default_photocraft_gLieZTBnJgoCBU9a9gfSCkzKpXSjMWY7FCVpZiONpmo=.p12",
+          "storePassword": "0000001B67BB20B5B759AAE1BEB07AC2F7E2157DA0D8ECF3EF70711603CD2613668CF334C6EBF4319905C0"
+        }
+      }
+    ],
+    "products": [
+      {
+        "name": "default",
+        "signingConfig": "default",
+        "targetSdkVersion": "26.0.0",
+        "compatibleSdkVersion": "26.0.0",
+        "runtimeOS": "HarmonyOS",
+        "buildOption": {
+          "strictMode": {
+            "caseSensitiveCheck": true,
+            "useNormalizedOHMUrl": true
+          }
+        }
+      }
+    ],
+    "buildModeSet": [
+      {
+        "name": "debug",
+      },
+      {
+        "name": "release"
+      }
+    ]
+  },
+  "modules": [
+    {
+      "name": "entry",
+      "srcPath": "./entry",
+      "targets": [
+        {
+          "name": "default",
+          "applyToProducts": [
+            "default"
+          ]
+        }
+      ]
+    }
+  ]
+}

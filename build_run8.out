@@ -1,0 +1,153 @@
+=== PhotoCraft ¹¹½¨¿ªÊ¼ 2026-11-09 20:04:17
+²Ö¿â¸ù£ºD:\HarmonyApp\photocraft
+DevEco£ºD:\Program Files\Huawei\DevEco Studio
+PATH ÖÐÎÞ java£¬Ê¹ÓÃ DevEco ×Ô´ø JBR£ºD:\Program Files\Huawei\DevEco Studio\jbr
+cargo£ºC:\Users\34492\.cargo\bin\cargo.exe
+hvigorw£ºD:\Program Files\Huawei\DevEco Studio\tools\hvigor\bin\hvigorw.bat
+DEVECO_SDK_HOME£ºD:\Program Files\Huawei\DevEco Studio\sdk
+java£ºD:\Program Files\Huawei\DevEco Studio\jbr\bin\java.exe
+=== Step 1/3 ¹¹½¨ Rust ¶¯Ì¬¿â£¨arm64-v8a / x86_64£©
+> C:\Users\34492\.cargo\bin\cargo.exe build --release --target aarch64-unknown-linux-ohos
+cargo.exe :     Finished `release` profile [optimized] target(s) in 0.58s
+ËùÔÚÎ»ÖÃ D:\HarmonyApp\photocraft\scripts\build-photocraft.ps1:76 ×Ö·û: 9
++         & $FilePath @Arguments 2>&1 | Tee-Object -FilePath $LogPath - ...
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (    Finished `r...get(s) in 0.58s:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+> C:\Users\34492\.cargo\bin\cargo.exe build --release --target x86_64-unknown-linux-ohos
+cargo.exe :     Finished `release` profile [optimized] target(s) in 0.42s
+ËùÔÚÎ»ÖÃ D:\HarmonyApp\photocraft\scripts\build-photocraft.ps1:76 ×Ö·û: 9
++         & $FilePath @Arguments 2>&1 | Tee-Object -FilePath $LogPath - ...
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (    Finished `r...get(s) in 0.42s:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+=== Step 2/3 ¸´ÖÆ²úÎïµ½ entry/libs
+aarch64-unknown-linux-ohos -> D:\HarmonyApp\photocraft\entry\libs\arm64-v8a\libphotocraft_core.so (31,440,272 ×Ö½Ú (29.98 MB))
+x86_64-unknown-linux-ohos -> D:\HarmonyApp\photocraft\entry\libs\x86_64\libphotocraft_core.so (34,134,248 ×Ö½Ú (32.55 MB))
+=== Step 3/3 hvigorw assembleHap
+> D:\Program Files\Huawei\DevEco Studio\tools\hvigor\bin\hvigorw.bat assembleHap --no-daemon
+> hvigor [32mUP-TO-DATE :entry:default@PreBuild...  [39m
+> hvigor [32mFinished :entry:default@CreateModuleInfo... after 1 ms [39m
+> hvigor [32mUP-TO-DATE :entry:default@GenerateMetadata...  [39m
+> hvigor [32mFinished :entry:default@ConfigureCmake... after 14 ms [39m
+> hvigor [32mUP-TO-DATE :entry:default@MergeProfile...  [39m
+> hvigor [32mUP-TO-DATE :entry:default@CreateBuildProfile...  [39m
+> hvigor [32mFinished :entry:default@PreCheckSyscap... after 1 ms [39m
+> hvigor [32mFinished :entry:default@GeneratePkgSdkInfo... after 3 ms [39m
+> hvigor [32mFinished :entry:default@ProcessIntegratedHsp... after 1 ms [39m
+> hvigor [32mFinished :entry:default@BuildNativeWithCmake... after 14 ms [39m
+> hvigor [32mUP-TO-DATE :entry:default@MakePackInfo...  [39m
+> hvigor [32mFinished :entry:default@SyscapTransform... after 9 ms [39m
+> hvigor [32mUP-TO-DATE :entry:default@GeneratePkgContextInfo...  [39m
+> hvigor [32mUP-TO-DATE :entry:default@ProcessProfile...  [39m
+> hvigor [32mUP-TO-DATE :entry:default@ProcessRouterMap...  [39m
+> hvigor [32mUP-TO-DATE :entry:default@ProcessShareConfig...  [39m
+> hvigor [32mFinished :entry:default@ProcessStartupConfig... after 2 ms [39m
+> hvigor [32mUP-TO-DATE :entry:default@ProcessResource...  [39m
+> hvigor [32mUP-TO-DATE :entry:default@GenerateLoaderJson...  [39m
+> hvigor [32mUP-TO-DATE :entry:default@CompileResource...  [39m
+> hvigor [32mFinished :entry:default@BuildJS... after 6 ms [39m
+> hvigor [32mFinished :entry:default@BuildNativeWithNinja... after 90 ms [39m
+> hvigor [32mUP-TO-DATE :entry:default@ProcessLibs...  [39m
+> hvigor [32mUP-TO-DATE :entry:default@DoNativeStrip...  [39m
+> hvigor [32mUP-TO-DATE :entry:default@CacheNativeLibs...  [39m
+hvigorw.bat : > hvigor [33mWARN: [33mWARN: [33m[33mArkTS:WARN File: D:/HarmonyApp/photocraft/entry/src/main/ets/pages/Index.ets:546:36
+ËùÔÚÎ»ÖÃ D:\HarmonyApp\photocraft\scripts\build-photocraft.ps1:76 ×Ö·û: 9
++         & $FilePath @Arguments 2>&1 | Tee-Object -FilePath $LogPath - ...
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (> hvigor [33mW...ndex.ets:546:36:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+ 'getSystemFontList' has been deprecated.
+[39m[39m
+[33mWARN: [33m[33mArkTS:WARN File: D:/HarmonyApp/photocraft/entry/src/main/ets/pages/Index.ets:564:25
+ 'getFontByName' has been deprecated.
+[39m[39m
+[33mWARN: [33m[33mArkTS:WARN File: D:/HarmonyApp/photocraft/entry/src/main/ets/pages/Index.ets:640:56
+ 'getContext' has been deprecated.
+[39m[39m
+[33mWARN: [33m[33mArkTS:WARN File: D:/HarmonyApp/photocraft/entry/src/main/ets/pages/Index.ets:681:22
+ 'showToast' has been deprecated.
+[39m[39m
+[33mWARN: [33m[33mArkTS:WARN File: D:/HarmonyApp/photocraft/entry/src/main/ets/pages/Index.ets:685:20
+ 'showToast' has been deprecated.
+[39m[39m
+[33mWARN: [33m[33mArkTS:WARN File: D:/HarmonyApp/photocraft/entry/src/main/ets/pages/Index.ets:685:20
+ Function may throw exceptions. Special handling is required.
+[39m[39m
+[33mWARN: [33m[33mArkTS:WARN File: D:/HarmonyApp/photocraft/entry/src/main/ets/pages/Index.ets:695:19
+ 'getContext' has been deprecated.
+[39m[39m
+[33mWARN: [33m[33mArkTS:WARN File: D:/HarmonyApp/photocraft/entry/src/main/ets/pages/Index.ets:725:20
+ 'showToast' has been deprecated.
+[39m[39m
+[33mWARN: [33m[33mArkTS:WARN File: D:/HarmonyApp/photocraft/entry/src/main/ets/pages/Index.ets:725:20
+ Function may throw exceptions. Special handling is required.
+[39m[39m
+[33mWARN: [33m[33mArkTS:WARN File: D:/HarmonyApp/photocraft/entry/src/main/ets/pages/Index.ets:1863:20
+ 'showToast' has been deprecated.
+[39m[39m
+[33mWARN: [33m[33mArkTS:WARN File: D:/HarmonyApp/photocraft/entry/src/main/ets/pages/Index.ets:1863:20
+ Function may throw exceptions. Special handling is required.
+[39m[39m
+[33mWARN: [33m[33mArkTS:WARN File: D:/HarmonyApp/photocraft/entry/src/main/ets/pages/Index.ets:1965:20
+ 'showToast' has been deprecated.
+[39m[39m
+[33mWARN: [33m[33mArkTS:WARN File: D:/HarmonyApp/photocraft/entry/src/main/ets/pages/Index.ets:1965:20
+ Function may throw exceptions. Special handling is required.
+[39m[39m
+[33mWARN: [33m[33mArkTS:WARN File: D:/HarmonyApp/photocraft/entry/src/main/ets/pages/Index.ets:3592:20
+ 'showToast' has been deprecated.
+[39m[39m
+[33mWARN: [33m[33mArkTS:WARN File: D:/HarmonyApp/photocraft/entry/src/main/ets/pages/Index.ets:3592:20
+ Function may throw exceptions. Special handling is required.
+[39m[39m
+[33mWARN: [33m[33mArkTS:WARN File: D:/HarmonyApp/photocraft/entry/src/main/ets/pages/Index.ets:3719:20
+ 'showToast' has been deprecated.
+[39m[39m
+[33mWARN: [33m[33mArkTS:WARN File: D:/HarmonyApp/photocraft/entry/src/main/ets/pages/Index.ets:3719:20
+ Function may throw exceptions. Special handling is required.
+[39m[39m
+[33mWARN: [33m[33mArkTS:WARN File: D:/HarmonyApp/photocraft/entry/src/main/ets/pages/Index.ets:3727:56
+ 'getContext' has been deprecated.
+[39m[39m
+[33mWARN: [33m[33mArkTS:WARN File: D:/HarmonyApp/photocraft/entry/src/main/ets/pages/Index.ets:3735:20
+ 'showToast' has been deprecated.
+[39m[39m
+[33mWARN: [33m[33mArkTS:WARN File: D:/HarmonyApp/photocraft/entry/src/main/ets/pages/Index.ets:3738:20
+ 'showToast' has been deprecated.
+[39m[39m
+[33mWARN: [33m[33mArkTS:WARN File: D:/HarmonyApp/photocraft/entry/src/main/ets/pages/Index.ets:3738:20
+ Function may throw exceptions. Special handling is required.
+[39m[39m
+[39m
+> hvigor [32mFinished :entry:default@CompileArkTS... after 2 s 926 ms [39m
+> hvigor [32mUP-TO-DATE :entry:default@GeneratePkgModuleJson...  [39m
+> hvigor [32mFinished :entry:default@ProcessCompiledResources... after 1 ms [39m
+> hvigor [33mWARN: Picked up JAVA_TOOL_OPTIONS: -Dfile.encoding=UTF-8 -Dstdout.encoding=UTF-8 -Dstderr.encoding=UTF-8
+[39m
+> hvigor [32mFinished :entry:default@PackageHap... after 581 ms [39m
+> hvigor [32mFinished :entry:default@PackingCheck... after 4 ms [39m
+> hvigor [33mWARN: Picked up JAVA_TOOL_OPTIONS: -Dfile.encoding=UTF-8 -Dstdout.encoding=UTF-8 -Dstderr.encoding=UTF-8
+[39m
+> hvigor [33mWARN: Picked up JAVA_TOOL_OPTIONS: -Dfile.encoding=UTF-8 -Dstdout.encoding=UTF-8 -Dstderr.encoding=UTF-8
+[39m
+> hvigor [32mFinished :entry:default@SignHap... after 1 s 712 ms [39m
+> hvigor [32mFinished :entry:default@CollectDebugSymbol... after 1 ms [39m
+> hvigor [32mFinished :entry:assembleHap... after 1 ms [39m
+> hvigor [32mBUILD SUCCESSFUL in 7 s 861 ms [39m
+
+33 tasks in total: 17 executed, 16 up-to-date
+=== ½á¹ûÐ£Ñé
+=== ¹¹½¨³É¹¦ 2026-11-09 20:04:28
+ÈÕÖ¾ÎÄ¼þ£ºD:\HarmonyApp\photocraft\build_hap.log
+BUILD SUCCESSFUL ÐÐ£º> hvigor [32mBUILD SUCCESSFUL in 7 s 861 ms [39m
+ArkTS error ÐÐÊý£º0
+ERROR ÐÐÊý£º0
+Ç©Ãû HAP£ºD:\HarmonyApp\photocraft\entry\build\default\outputs\default\entry-default-signed.hap (60,462,888 ×Ö½Ú (57.66 MB))
+
+HAP: D:\HarmonyApp\photocraft\entry\build\default\outputs\default\entry-default-signed.hap
+HAP ´óÐ¡: 60,462,888 ×Ö½Ú (57.66 MB)
+¹¹½¨ºÄÊ±: 10.3 s

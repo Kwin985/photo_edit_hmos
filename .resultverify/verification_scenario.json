@@ -1,0 +1,12 @@
+{
+  "verification_scenario": "bug-fix",
+  "task_id": 11,
+  "task_title": "T6-R2 复验「命中后画面与首次渲染一致」",
+  "issue_summary": "detail 渲染缓存命中后画面整体变暗：NAPI 返回的 ArrayBuffer 归 ArkTS GC 管理，image.createPixelMap 与之零拷贝共享，旧实现无字段持有 ArrayBuffer，切「适应」时分配预览内存触发 GC，字节被回收导致 PixelMap 内容失效。修复：新增 detailPixels/previewPixels/displayPixels 长期持有字节，命中时用缓存字节重建 PixelMap。",
+  "target_files": [
+    "entry/src/main/ets/pages/Index.ets",
+    "verify-artifacts/layer-styles/t6-final"
+  ],
+  "generated_by": "team-result-verifier (manual fallback, scenario-recognition skill unavailable in this session)",
+  "generated_at": "2026-11-08"
+}

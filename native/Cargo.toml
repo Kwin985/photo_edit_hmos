@@ -1,0 +1,99 @@
+[workspace]
+resolver = "3"
+exclude = ["vendor/craft-libs"]
+members = [
+    "crates/geom",
+    "crates/color",
+    "crates/raster",
+    "crates/doc",
+    "crates/ops",
+    "crates/algo",
+    "crates/compose",
+    "crates/psd",
+    "crates/codecs",
+    "crates/format",
+    "crates/text",
+    "crates/vector",
+    "crates/paint",
+    "crates/cms",
+    "crates/raw",
+    "crates/affinity",
+    "crates/heif",
+    "crates/io",
+    "ohos-bridge",
+]
+default-members = ["ohos-bridge"]
+
+[workspace.package]
+version = "0.20.1"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.95"
+
+[workspace.dependencies]
+photocraft-geom = { path = "crates/geom" }
+photocraft-color = { path = "crates/color" }
+photocraft-cms = { path = "crates/cms" }
+photocraft-raster = { path = "crates/raster" }
+photocraft-doc = { path = "crates/doc" }
+photocraft-ops = { path = "crates/ops" }
+photocraft-psd = { path = "crates/psd" }
+photocraft-codecs = { path = "crates/codecs" }
+photocraft-raw = { path = "crates/raw" }
+photocraft-affinity = { path = "crates/affinity" }
+photocraft-compose = { path = "crates/compose" }
+
+photocraft-paint = { path = "crates/paint" }
+photocraft-algo = { path = "crates/algo" }
+photocraft-io = { path = "crates/io" }
+photocraft-text = { path = "crates/text" }
+photocraft-vector = { path = "crates/vector" }
+photocraft-format = { path = "crates/format" }
+photocraft-heif = { path = "crates/heif" }
+photocraft-testkit = { path = "crates/testkit" }
+
+craft-docpath = { path = "vendor/craft-libs/crates/docpath" }
+craft-jpeg = { path = "vendor/craft-libs/crates/jpeg" }
+craft-pcraft-format = { path = "vendor/craft-libs/crates/pcraft-format" }
+
+proptest = "1"
+criterion = { version = "0.8", default-features = false }
+
+thiserror = "2"
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+arc-swap = "1"
+bytemuck = { version = "1", features = ["derive"] }
+flate2 = { version = "1.1.10", default-features = false, features = ["zlib-rs", "runtime_detection"] }
+encoding_rs = { version = "0.8", default-features = false, features = ["alloc"] }
+image = { version = "0.25", default-features = false }
+zune-core = "0.5"
+zune-jpeg = "0.5"
+log = "0.4"
+chrono = { version = "0.4.45", default-features = false, features = ["std"] }
+rayon = "1"
+rustc-hash = "2.1.3"
+getrandom = "0.3"
+web-time = "1"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+cognitive_complexity = "deny"
+too_many_arguments = "deny"
+wildcard_imports = "deny"
+dbg_macro = "warn"
+todo = "warn"
+
+[profile.dev.package."*"]
+opt-level = 2
+debug = false
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3

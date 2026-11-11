@@ -1,0 +1,27 @@
+[package]
+name = "photocraft-ohos-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "photocraft_core"
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+photocraft-doc = { workspace = true }
+photocraft-compose = { workspace = true }
+
+photocraft-codecs = { workspace = true }
+photocraft-io = { workspace = true }
+photocraft-geom = { workspace = true }
+photocraft-color = { workspace = true }
+photocraft-raster = { workspace = true }
+photocraft-paint = { workspace = true }
+photocraft-algo = { workspace = true }
+photocraft-vector = { workspace = true }
+photocraft-text = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Transform resampling spreads output rows across cores.
+rayon = { workspace = true }

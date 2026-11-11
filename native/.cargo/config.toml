@@ -1,0 +1,16 @@
+[target.aarch64-unknown-linux-ohos]
+linker = "D:/Program Files/Huawei/DevEco Studio/sdk/default/openharmony/native/llvm/bin/clang.exe"
+rustflags = [
+    "-Clink-arg=--target=aarch64-linux-ohos",
+    "-Clink-arg=--sysroot=D:/Program Files/Huawei/DevEco Studio/sdk/default/openharmony/native/sysroot",
+    "-Clink-arg=-fuse-ld=lld",
+    "-Clink-arg=-Wl,-z,max-page-size=16384",
+]
+
+[target.x86_64-unknown-linux-ohos]
+linker = "D:/Program Files/Huawei/DevEco Studio/sdk/default/openharmony/native/llvm/bin/clang.exe"
+rustflags = [
+    "-Clink-arg=--target=x86_64-linux-ohos",
+    "-Clink-arg=--sysroot=D:/Program Files/Huawei/DevEco Studio/sdk/default/openharmony/native/sysroot",
+    "-Clink-arg=-fuse-ld=lld",
+]

@@ -1,0 +1,16 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "PhotoCraft 图像编辑器"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "PhotoCraft 图像编辑器"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "PhotoCraft"
+    }
+  ]
+}
