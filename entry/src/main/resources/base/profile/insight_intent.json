@@ -1,0 +1,64 @@
+{
+  "insightIntents": [
+    {
+      "intentName": "CreateNewDocument",
+      "domain": "image.edit",
+      "intentVersion": "1.0.0",
+      "srcEntry": "./ets/insightintent/IntentExecutor.ets",
+      "uiAbility": {
+        "ability": "EntryAbility",
+        "executeMode": ["foreground"]
+      },
+      "displayName": "新建文档",
+      "displayDescription": "在 ArtsPhoto 中新建一个空白图像文档开始编辑",
+      "keywords": ["新建", "文档", "ArtsPhoto", "图像编辑", "空白"],
+      "inputParams": [],
+      "outputParams": []
+    },
+    {
+      "intentName": "OpenSampleImage",
+      "domain": "image.edit",
+      "intentVersion": "1.0.0",
+      "srcEntry": "./ets/insightintent/IntentExecutor.ets",
+      "uiAbility": {
+        "ability": "EntryAbility",
+        "executeMode": ["foreground"]
+      },
+      "displayName": "打开示例图",
+      "displayDescription": "在 ArtsPhoto 中打开示例图片开始编辑",
+      "keywords": ["示例", "打开", "ArtsPhoto", "示例图", "样图"],
+      "inputParams": [],
+      "outputParams": []
+    },
+    {
+      "intentName": "OpenRecentDocument",
+      "domain": "image.edit",
+      "intentVersion": "1.0.0",
+      "srcEntry": "./ets/insightintent/IntentExecutor.ets",
+      "uiAbility": {
+        "ability": "EntryAbility",
+        "executeMode": ["foreground"]
+      },
+      "displayName": "打开最近编辑",
+      "displayDescription": "在 ArtsPhoto 中打开最近编辑的文档继续编辑",
+      "keywords": ["最近", "打开", "编辑", "文档", "ArtsPhoto", "继续"],
+      "inputParams": [],
+      "outputParams": []
+    },
+    {
+      "intentName": "ContinueLastEdit",
+      "domain": "image.edit",
+      "intentVersion": "1.0.0",
+      "srcEntry": "./ets/insightintent/IntentExecutor.ets",
+      "uiAbility": {
+        "ability": "EntryAbility",
+        "executeMode": ["foreground"]
+      },
+      "displayName": "继续上次编辑",
+      "displayDescription": "在 ArtsPhoto 中继续上次编辑的文档",
+      "keywords": ["继续", "上次", "编辑", "文档", "ArtsPhoto", "恢复"],
+      "inputParams": [],
+      "outputParams": []
+    }
+  ]
+}

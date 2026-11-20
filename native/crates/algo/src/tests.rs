@@ -11,9 +11,15 @@ fn relight_admission_tracks_the_document_dependent_working_set() {
     let large = Rect::new(0, 0, 86400, 43200);
     assert!(working_bytes(&params, small, small, 4) < working_bytes(&params, small, large, 4));
     assert_eq!(working_bytes(&params, Rect::EMPTY, large, 4), 0);
-    // A tiny image must not reserve the 256 MiB group budget three times over.
+    // A tiny image must not reserve the 256 MiB group budget three times over. The tile-scratch
+    // part of the estimate scales with the rayon thread count (one scratch per worker), so the
+    // cap scales with it too; the per-worker budget stays at 64 MiB on any machine.
+    #[cfg(not(target_arch = "wasm32"))]
+    let threads = rayon::current_num_threads().max(1) as u64;
+    #[cfg(target_arch = "wasm32")]
+    let threads = 1u64;
     let tiny = Rect::new(0, 0, 24, 18);
-    assert!(working_bytes(&params, tiny, tiny, 4) < 64 << 20, "{}", working_bytes(&params, tiny, tiny, 4));
+    assert!(working_bytes(&params, tiny, tiny, 4) < (64 << 20) * threads, "{}", working_bytes(&params, tiny, tiny, 4));
 }
 
 fn fmt(s: SampleType) -> PixelFormat {

@@ -166,6 +166,16 @@ declare const native: {
   guidesSet(documentId: number, paramsJson: string): string;
   /** 图层自由变换（`C-XFORM-API@1`）：参数相对当前状态；返回 `{bounds:[x0,y0,x1,y1],scaleX,scaleY,angle}`。 */
   layerTransform(documentId: number, layerId: number, paramsJson: string): string;
+  /** A1 矢量绘图（1.2.0）：新建带空路径的矢量图层，返回 `{layerId, info}`。 */
+  vectorPathCreate(documentId: number, paramsJson: string): string;
+  /** A1 矢量绘图（1.2.0）：编辑矢量路径（addAnchor/moveAnchor/setCtrl/setSmooth/setClosed/setFill/setStroke）。 */
+  vectorPathEdit(documentId: number, paramsJson: string): string;
+  /** A1 矢量绘图（1.2.0）：将矢量路径栅格化为像素缓存，更新图层 cache。 */
+  vectorPathRasterize(documentId: number, paramsJson: string): string;
+  /** A1 矢量绘图（1.2.0）：矢量图层路径转选区。paramsJson: {layer, feather?, antiAlias?, mode?}。 */
+  vectorPathToSelection(documentId: number, paramsJson: string): string;
+  /** D2 智能抠图（1.2.0，传统算法纯离线）：Select Subject + 边缘细化 → 非破坏性图层蒙版。paramsJson: {layer:number, refine?:boolean}。 */
+  cutoutRemoveBackground(documentId: number, paramsJson: string): string;
 };
 
 export default native;

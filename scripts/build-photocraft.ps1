@@ -23,7 +23,11 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$DevEcoHome = 'D:\Program Files\Huawei\DevEco Studio'
+    [string]$DevEcoHome = 'D:\Program Files\Huawei\DevEco Studio',
+    # hap = 调试安装包（默认，保持既有流程）；app = 上架用发布包（必须配置 AGC 发布证书）
+    [ValidateSet('hap', 'app')][string]$PackageType = 'hap',
+    # 仅用于本地验证 .app 打包链路；带调试签名产出的 .app 不能提交应用市场
+    [switch]$AllowDebugSigning
 )
 
 # 任一步失败立即中止；原生命令的退出码在 Invoke-NativeCommand 内单独校验。
@@ -164,6 +168,21 @@ try {
     ('DevEco：{0}' -f $DevEcoHome) | Tee-Object -FilePath $LogPath -Append
 
     # --- 前置检查 -----------------------------------------------------------
+    # 任务 1.4：零权限/纯离线自检 — 打包前拦截任何引入网络权限或网络 SDK 的改动，
+    # 守住 S1 第一优势（真机已证竞品亦无 INTERNET 权限，本作 0 权限）。
+    $ModuleJson = Get-Content -LiteralPath (Join-Path $RepoRoot 'entry\src\main\module.json5') -Raw
+    if ($ModuleJson -match 'requestPermissions') {
+        throw 'module.json5 出现 requestPermissions，违反零权限红线（R1）。任何新功能不得引入权限。'
+    }
+    $EtsRoot = Join-Path $RepoRoot 'entry\src\main\ets'
+    $networkHits = @(Get-ChildItem -Path $EtsRoot -Filter '*.ets' -File -Recurse |
+        Select-String -Pattern '@kit\.NetworkKit|@ohos\.net|\bfetch\s*\(|@kit\.RemoteCommunicationKit' -ErrorAction SilentlyContinue)
+    if ($networkHits.Count -gt 0) {
+        $hits = ($networkHits | ForEach-Object { '{0}:{1}' -f $_.Path, $_.LineNumber }) -join '; '
+        throw ('检测到网络 SDK/调用，违反纯离线红线（R1）：{0}' -f $hits)
+    }
+    ('【零权限自检】module.json5 无 requestPermissions、ets 无网络 SDK 调用，PASS') | Tee-Object -FilePath $LogPath -Append
+
     if (-not (Test-Path -LiteralPath $HvigorwBat)) {
         # 候选路径不存在时在 DevEco 安装目录内定位，找不到则明确报错，不猜测参数。
         $found = Get-ChildItem -Path (Join-Path $DevEcoHome 'tools') -Filter 'hvigorw.bat' -File -Recurse -ErrorAction SilentlyContinue |
@@ -179,16 +198,17 @@ try {
         throw 'PATH 中未找到 cargo，无法构建 Rust 动态库。'
     }
 
-    # hvigorw.bat 需要 node 在 PATH 或 NODE_HOME 中（见其启动脚本）。
-    # 系统 node 可用时不注入额外环境变量；不可用时给出明确指引，不臆造 SDK 变量。
-    $node = Get-Command -Name 'node' -CommandType Application -ErrorAction SilentlyContinue
-    if ($null -eq $node -and [string]::IsNullOrWhiteSpace($env:NODE_HOME)) {
-        $bundledNode = Join-Path $DevEcoHome 'tools\node'
-        if (Test-Path -LiteralPath (Join-Path $bundledNode 'node.exe')) {
-            $env:NODE_HOME = $bundledNode
-            ('未在 PATH 中找到 node，使用 DevEco 自带 Node：{0}' -f $bundledNode) | Tee-Object -FilePath $LogPath -Append
-        }
-        else {
+    # hvigorw.bat 需要 node。系统 Node 25+ 与 hvigor 的 native 增量清理逻辑不兼容
+    # （报 "options.recursive is no longer supported"），因此优先使用 DevEco 自带 Node。
+    $bundledNode = Join-Path $DevEcoHome 'tools\node'
+    if (Test-Path -LiteralPath (Join-Path $bundledNode 'node.exe')) {
+        $env:NODE_HOME = $bundledNode
+        $env:PATH = $bundledNode + ';' + $env:PATH
+        ('使用 DevEco 自带 Node：{0}' -f $bundledNode) | Tee-Object -FilePath $LogPath -Append
+    }
+    else {
+        $node = Get-Command -Name 'node' -CommandType Application -ErrorAction SilentlyContinue
+        if ($null -eq $node) {
             throw '未找到 node。请把 Node.js 加入 PATH 或设置 NODE_HOME 后重试。'
         }
     }
@@ -272,13 +292,54 @@ try {
         }
     }
 
-    # --- Step 3/3：hvigorw assembleHap --------------------------------------
-    Write-Step 'Step 3/3 hvigorw assembleHap'
+    # --- Step 3/3：hvigorw assembleHap / assembleApp ------------------------
+    $hvigorTask = if ($PackageType -eq 'app') { 'assembleApp' } else { 'assembleHap' }
+    # 上架包走 release product（AGC 发布证书）；-AllowDebugSigning 仅用于本地验证链路。
+    $productName = if ($PackageType -eq 'app' -and -not $AllowDebugSigning) { 'release' } else { 'default' }
+    Write-Step ('Step 3/3 hvigorw {0} (product={1})' -f $hvigorTask, $productName)
 
-    # --no-daemon 由 hvigorw --help 明确支持；任务名沿用 .hvigor 上次构建记录 assembleHap。
+    # .app 必须是 release 构建：debug 模式会保留调试符号、跳过混淆，不能提交应用市场。
+    $hvigorArgs = @($hvigorTask, '--no-daemon', '-p', ('product={0}' -f $productName))
+    if ($PackageType -eq 'app') {
+        $hvigorArgs += @('-p', 'buildMode=release')
+    }
+
+    # 应用市场上架只接受发布证书签名的 .app。debugKey/自动签名只能用于本地调试，
+    # 这里在打包前显式拦截，避免误把调试包提交审核。
+    if ($PackageType -eq 'app' -and -not $AllowDebugSigning) {
+        $profileText = Get-Content -LiteralPath (Join-Path $RepoRoot 'build-profile.json5') -Raw
+        $releaseBlock = [regex]::Match($profileText, '"name"\s*:\s*"release"[\s\S]*')
+        if (-not $releaseBlock.Success) {
+            throw 'build-profile.json5 中缺少 release 签名配置。'
+        }
+        if ($releaseBlock.Value -match '"keyAlias"\s*:\s*"debugKey"') {
+            throw 'release 签名仍在用调试证书（keyAlias=debugKey），不能用于上架。请配置 AGC 发布证书（.cer/.p7b/.p12）后重试；仅本地验证链路可加 -AllowDebugSigning。'
+        }
+
+        # Profile 绑定 bundleName，跨应用不能复用；.p12/.cer 是账号级发布证书，可以复用。
+        $profilePaths = @([regex]::Matches($releaseBlock.Value, '"profile"\s*:\s*"([^"]+)"') | ForEach-Object { $_.Groups[1].Value })
+        $releaseProfile = $profilePaths | Where-Object { $_ -notmatch 'default_' } | Select-Object -Last 1
+        if ([string]::IsNullOrWhiteSpace($releaseProfile)) {
+            throw '未在 build-profile.json5 中找到 release 签名 Profile。'
+        }
+        if (-not (Test-Path -LiteralPath $releaseProfile)) {
+            throw ('发布 Profile 不存在：{0}' -f $releaseProfile)
+        }
+        $p7bText = [System.Text.Encoding]::UTF8.GetString([System.IO.File]::ReadAllBytes($releaseProfile))
+        $profileBundle = [regex]::Match($p7bText, '"bundle-name"\s*:\s*"([^"]+)"')
+        $appJsonText = Get-Content -LiteralPath (Join-Path $RepoRoot 'AppScope\app.json5') -Raw
+        $appBundle = [regex]::Match($appJsonText, '"bundleName"\s*:\s*"([^"]+)"')
+        if (-not $profileBundle.Success -or -not $appBundle.Success) {
+            throw '无法从 Profile 或 app.json5 读取 bundleName，拒绝生成上架包。'
+        }
+        if ($profileBundle.Groups[1].Value -ne $appBundle.Groups[1].Value) {
+            throw ('发布 Profile 绑定包名 "{0}"，与当前应用 "{1}" 不一致。.p12/.cer 可复用，但必须在 AGC 为 "{1}" 新建 Profile（选择同一发布证书）后替换 release.profile。' -f $profileBundle.Groups[1].Value, $appBundle.Groups[1].Value)
+        }
+    }
+
     Invoke-NativeCommand -FilePath $HvigorwBat `
-        -Arguments @('assembleHap', '--no-daemon') `
-        -Description 'hvigorw assembleHap'
+        -Arguments $hvigorArgs `
+        -Description ('hvigorw {0} {1}' -f $hvigorTask, ($hvigorArgs[1..($hvigorArgs.Count - 1)] -join ' '))
 
     # --- 结果校验 -----------------------------------------------------------
     Write-Step '结果校验'
@@ -294,12 +355,50 @@ try {
     # hvigor 的彩色输出会在 "ERROR" 前插入 ANSI 转义序列，因此直接按关键字匹配。
     $errorLines = @($logLines | Select-String -Pattern 'ERROR' -CaseSensitive)
 
-    $signedHaps = @(Get-ChildItem -Path $HapOutputDir -Filter '*-signed.hap' -File -ErrorAction SilentlyContinue |
-        Sort-Object -Property LastWriteTime -Descending)
-    if ($signedHaps.Count -eq 0) {
-        throw ('未找到签名 HAP，目录：{0}' -f $HapOutputDir)
+    if ($PackageType -eq 'app') {
+        $appDirs = @()
+        if ($productName -eq 'release') {
+            $appDirs = @(
+                (Join-Path $RepoRoot 'build\outputs\release'),
+                (Join-Path $RepoRoot 'build\release\outputs\default')
+            )
+        } else {
+            $appDirs = @(
+                (Join-Path $RepoRoot 'build\outputs\default'),
+                (Join-Path $RepoRoot 'build\default\outputs\default')
+            )
+        }
+        $appDirs = @($appDirs | Where-Object { Test-Path -LiteralPath $_ })
+        # 找不到当前 product 的产物时再回退到全部候选目录（避免取到旧 product 的包）。
+        if ($appDirs.Count -eq 0) {
+            $appDirs = @(
+                (Join-Path $RepoRoot 'build\outputs\release'),
+                (Join-Path $RepoRoot 'build\outputs\default'),
+                (Join-Path $RepoRoot 'build\default\outputs\default'),
+                (Join-Path $RepoRoot 'build\release\outputs\default'),
+                $HapOutputDir
+            ) | Where-Object { Test-Path -LiteralPath $_ }
+        }
+        $signedApps = @()
+        foreach ($dir in $appDirs) {
+            $signedApps += @(Get-ChildItem -Path $dir -Filter '*.app' -File -ErrorAction SilentlyContinue)
+        }
+        $signedApps = @($signedApps | Sort-Object -Property LastWriteTime -Descending)
+        if ($signedApps.Count -eq 0) {
+            throw ('未找到 .app 发布包，已检查：{0}' -f ($appDirs -join '; '))
+        }
+        $artifact = $signedApps[0]
+        $artifactLabel = 'APP'
     }
-    $signedHap = $signedHaps[0]
+    else {
+        $signedHaps = @(Get-ChildItem -Path $HapOutputDir -Filter '*-signed.hap' -File -ErrorAction SilentlyContinue |
+            Sort-Object -Property LastWriteTime -Descending)
+        if ($signedHaps.Count -eq 0) {
+            throw ('未找到签名 HAP，目录：{0}' -f $HapOutputDir)
+        }
+        $artifact = $signedHaps[0]
+        $artifactLabel = 'HAP'
+    }
 
     # --- 汇总输出 -----------------------------------------------------------
     Write-Step ('构建成功 {0}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
@@ -310,13 +409,23 @@ try {
     }
     ('ArkTS error 行数：{0}' -f $arktsErrorLines.Count) | Tee-Object -FilePath $LogPath -Append
     ('ERROR 行数：{0}' -f $errorLines.Count) | Tee-Object -FilePath $LogPath -Append
-    ('签名 HAP：{0} ({1})' -f $signedHap.FullName, (Format-FileSize $signedHap.Length)) | Tee-Object -FilePath $LogPath -Append
+    ('签名 {0}：{1} ({2})' -f $artifactLabel, $artifact.FullName, (Format-FileSize $artifact.Length)) | Tee-Object -FilePath $LogPath -Append
+
+    # 任务 1.3：体积门禁 — 发布包体积不得超过 70 MB（竞品 97.7 MB，当前基线 28.28 MiB）
+    $VolumeLimitBytes = 70 * 1MB
+    if ($artifact.Length -gt $VolumeLimitBytes) {
+        $warnMsg = ('【体积门禁告警】{0} 体积 {1} 超过 70 MB 限制，需优化后再提审' -f $artifactLabel, (Format-FileSize $artifact.Length))
+        Write-Warning $warnMsg
+        $warnMsg | Tee-Object -FilePath $LogPath -Append
+    } else {
+        ('【体积门禁】{0} 体积 {1} ≤ 70 MB，门禁 PASS' -f $artifactLabel, (Format-FileSize $artifact.Length)) | Tee-Object -FilePath $LogPath -Append
+    }
 
     $elapsedSeconds = ((Get-Date) - $BuildStartedAt).TotalSeconds
 
     Write-Host ''
-    Write-Host ('HAP: {0}' -f $signedHap.FullName) -ForegroundColor Yellow
-    Write-Host ('HAP 大小: {0}' -f (Format-FileSize $signedHap.Length)) -ForegroundColor Yellow
+    Write-Host ('{0}: {1}' -f $artifactLabel, $artifact.FullName) -ForegroundColor Yellow
+    Write-Host ('{0} 大小: {1}' -f $artifactLabel, (Format-FileSize $artifact.Length)) -ForegroundColor Yellow
     Write-Host ('构建耗时: {0:N1} s' -f $elapsedSeconds) -ForegroundColor Yellow
 
     if ($arktsErrorLines.Count -gt 0 -or $errorLines.Count -gt 0) {

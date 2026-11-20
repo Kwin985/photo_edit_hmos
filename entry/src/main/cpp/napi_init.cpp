@@ -33,6 +33,11 @@ PcBuffer *pc_select(void *session, uint64_t id, const uint8_t *params, size_t pa
 PcBuffer *pc_selection_info(void *session, uint64_t id);
 PcBuffer *pc_filter_apply(void *session, uint64_t id, uint64_t layer, const uint8_t *params, size_t params_len);
 PcBuffer *pc_shape_create(void *session, uint64_t id, const uint8_t *params, size_t params_len);
+PcBuffer *pc_vector_path_create(void *session, uint64_t id, const uint8_t *params, size_t params_len);
+PcBuffer *pc_vector_path_edit(void *session, uint64_t id, const uint8_t *params, size_t params_len);
+PcBuffer *pc_vector_path_rasterize(void *session, uint64_t id, const uint8_t *params, size_t params_len);
+PcBuffer *pc_vector_path_to_selection(void *session, uint64_t id, const uint8_t *params, size_t params_len);
+PcBuffer *pc_cutout_remove_background(void *session, uint64_t id, const uint8_t *params, size_t params_len);
 PcBuffer *pc_font_register(const uint8_t *data, size_t data_len);
 PcBuffer *pc_text_create(void *session, uint64_t id, const uint8_t *params, size_t params_len);
 PcBuffer *pc_layer_edit_get(void *session, uint64_t id, uint64_t layer);
@@ -504,6 +509,116 @@ napi_value TextCreate(napi_env env, napi_callback_info info) {
         return Throw(env, "textCreate: paramsJson must be a string");
     }
     std::string result = TakeString(pc_text_create(Session(), GetU64(env, argv[0]), reinterpret_cast<const uint8_t *>(params.data()), params.size()));
+    if (!IsOk(result)) {
+        return Throw(env, ErrorOf(result));
+    }
+    napi_value out = nullptr;
+    napi_create_string_utf8(env, result.c_str(), result.size(), &out);
+    return out;
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// A1 矢量绘图 NAPI 包装（1.2.0）
+// ──────────────────────────────────────────────────────────────────────
+napi_value VectorPathCreate(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 2) {
+        return Throw(env, "vectorPathCreate(documentId, paramsJson) needs two arguments");
+    }
+    std::string params;
+    if (!GetString(env, argv[1], params)) {
+        return Throw(env, "vectorPathCreate: paramsJson must be a string");
+    }
+    std::string result = TakeString(pc_vector_path_create(Session(), GetU64(env, argv[0]),
+        reinterpret_cast<const uint8_t *>(params.data()), params.size()));
+    if (!IsOk(result)) {
+        return Throw(env, ErrorOf(result));
+    }
+    napi_value out = nullptr;
+    napi_create_string_utf8(env, result.c_str(), result.size(), &out);
+    return out;
+}
+
+napi_value VectorPathEdit(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 2) {
+        return Throw(env, "vectorPathEdit(documentId, paramsJson) needs two arguments");
+    }
+    std::string params;
+    if (!GetString(env, argv[1], params)) {
+        return Throw(env, "vectorPathEdit: paramsJson must be a string");
+    }
+    std::string result = TakeString(pc_vector_path_edit(Session(), GetU64(env, argv[0]),
+        reinterpret_cast<const uint8_t *>(params.data()), params.size()));
+    if (!IsOk(result)) {
+        return Throw(env, ErrorOf(result));
+    }
+    napi_value out = nullptr;
+    napi_create_string_utf8(env, result.c_str(), result.size(), &out);
+    return out;
+}
+
+napi_value VectorPathRasterize(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 2) {
+        return Throw(env, "vectorPathRasterize(documentId, paramsJson) needs two arguments");
+    }
+    std::string params;
+    if (!GetString(env, argv[1], params)) {
+        return Throw(env, "vectorPathRasterize: paramsJson must be a string");
+    }
+    std::string result = TakeString(pc_vector_path_rasterize(Session(), GetU64(env, argv[0]),
+        reinterpret_cast<const uint8_t *>(params.data()), params.size()));
+    if (!IsOk(result)) {
+        return Throw(env, ErrorOf(result));
+    }
+    napi_value out = nullptr;
+    napi_create_string_utf8(env, result.c_str(), result.size(), &out);
+    return out;
+}
+
+// D1 矢量绘图：矢量图层路径转选区。
+napi_value VectorPathToSelection(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 2) {
+        return Throw(env, "vectorPathToSelection(documentId, paramsJson) needs two arguments");
+    }
+    std::string params;
+    if (!GetString(env, argv[1], params)) {
+        return Throw(env, "vectorPathToSelection: paramsJson must be a string");
+    }
+    std::string result = TakeString(pc_vector_path_to_selection(Session(), GetU64(env, argv[0]),
+        reinterpret_cast<const uint8_t *>(params.data()), params.size()));
+    if (!IsOk(result)) {
+        return Throw(env, ErrorOf(result));
+    }
+    napi_value out = nullptr;
+    napi_create_string_utf8(env, result.c_str(), result.size(), &out);
+    return out;
+}
+
+// D2 智能抠图（传统算法，纯离线）：Select Subject + 边缘细化 → 非破坏性图层蒙版。
+napi_value CutoutRemoveBackground(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value argv[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 2) {
+        return Throw(env, "cutoutRemoveBackground(documentId, paramsJson) needs two arguments");
+    }
+    std::string params;
+    if (!GetString(env, argv[1], params)) {
+        return Throw(env, "cutoutRemoveBackground: paramsJson must be a string");
+    }
+    std::string result = TakeString(pc_cutout_remove_background(Session(), GetU64(env, argv[0]),
+        reinterpret_cast<const uint8_t *>(params.data()), params.size()));
     if (!IsOk(result)) {
         return Throw(env, ErrorOf(result));
     }
@@ -1230,6 +1345,11 @@ napi_value Init(napi_env env, napi_value exports) {
         {"shapeCreate", nullptr, ShapeCreate, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"fontRegister", nullptr, FontRegister, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"textCreate", nullptr, TextCreate, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"vectorPathCreate", nullptr, VectorPathCreate, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"vectorPathEdit", nullptr, VectorPathEdit, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"vectorPathRasterize", nullptr, VectorPathRasterize, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"vectorPathToSelection", nullptr, VectorPathToSelection, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"cutoutRemoveBackground", nullptr, CutoutRemoveBackground, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"layerEditGet", nullptr, LayerEditGet, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"layerEditApply", nullptr, LayerEditApply, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"setLayerVisible", nullptr, LayerVisible, nullptr, nullptr, nullptr, napi_default, nullptr},

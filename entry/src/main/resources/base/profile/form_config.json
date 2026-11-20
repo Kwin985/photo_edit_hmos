@@ -1,0 +1,58 @@
+{
+  "forms": [
+    {
+      "name": "QuickOpenCard",
+      "isDefault": true,
+      "uiSyntax": "arkts",
+      "displayName": "$string:quick_open_card_name",
+      "description": "$string:quick_open_card_desc",
+      "src": "./ets/form/QuickOpenCard.ets",
+      "window": {
+        "designWidth": 720,
+        "autoDesignWidth": true
+      },
+      "colorMode": "auto",
+      "defaultDimension": "2*2",
+      "supportDimensions": ["2*2"],
+      "updateEnabled": true,
+      "scheduledUpdateTime": "08:00",
+      "updateDuration": 1
+    },
+    {
+      "name": "RecentDocsCard",
+      "isDefault": false,
+      "uiSyntax": "arkts",
+      "displayName": "$string:recent_docs_card_name",
+      "description": "$string:recent_docs_card_desc",
+      "src": "./ets/form/RecentDocsCard.ets",
+      "window": {
+        "designWidth": 720,
+        "autoDesignWidth": true
+      },
+      "colorMode": "auto",
+      "defaultDimension": "2*2",
+      "supportDimensions": ["2*2"],
+      "updateEnabled": true,
+      "scheduledUpdateTime": "09:00",
+      "updateDuration": 1
+    },
+    {
+      "name": "QuickCreateCard",
+      "isDefault": false,
+      "uiSyntax": "arkts",
+      "displayName": "$string:quick_create_card_name",
+      "description": "$string:quick_create_card_desc",
+      "src": "./ets/form/QuickCreateCard.ets",
+      "window": {
+        "designWidth": 720,
+        "autoDesignWidth": true
+      },
+      "colorMode": "auto",
+      "defaultDimension": "1*2",
+      "supportDimensions": ["1*2"],
+      "updateEnabled": true,
+      "scheduledUpdateTime": "10:00",
+      "updateDuration": 1
+    }
+  ]
+}

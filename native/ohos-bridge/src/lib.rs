@@ -20,12 +20,12 @@ use photocraft_compose::{Buffer, render_layer_in};
 use photocraft_raster::{from_rgba_into, to_rgba, Rgba8Image, Surface};
 use photocraft_doc::adjust::HueRange;
 use photocraft_doc::text::{AntiAlias, TextShape};
-use photocraft_doc::vector::{LiveShape, ShapeLayer, ShapeStroke};
+use photocraft_doc::vector::{LiveShape, ShapeLayer, ShapeStroke, Subpath};
 use photocraft_doc::{
     Adjustment, Bevel, BevelStyle, BevelTechnique, Contour, Document, Effect, Fill, FxCommon, FxPaint, Glow, GlowSource, GlowTechnique, Gradient, GradientStyle,
-    Layer, LayerContent, LayerMask, StrokeFx, StrokePosition, TextLayer,
+    Knot, Layer, LayerContent, LayerMask, Path, PathOp, StrokeFx, StrokePosition, TextLayer,
 };
-use photocraft_geom::{Affine, Rect};
+use photocraft_geom::{Affine, Point, Rect};
 
 use photocraft_algo::selection::{self, SelectionMode};
 use photocraft_algo::{FilterParams, apply_in, output_area};
@@ -319,6 +319,14 @@ fn layer_json(layer: &Layer, depth: u32) -> Value {
         LayerContent::Group(group) => group.expanded,
         _ => true,
     };
+    // 内容包围盒：组取画板矩形/子层并集，非组取 surface.content_bounds（与 transform_content_bounds 同口径）。
+    // 空（空层/文本未栅格化）给空数组，由 ArkTS 回退文档 bounds。
+    let cb = transform_content_bounds(layer);
+    let content_bounds = if cb.is_empty() {
+        json!([])
+    } else {
+        json!([cb.x0, cb.y0, cb.x1, cb.y1])
+    };
     json!({
         "id": layer.id.0,
         "name": layer.name,
@@ -331,6 +339,7 @@ fn layer_json(layer: &Layer, depth: u32) -> Value {
         "depth": depth,
         "isGroup": layer.is_group(),
         "expanded": expanded,
+        "contentBounds": content_bounds,
         "children": children,
     })
 }
@@ -1391,6 +1400,301 @@ pub extern "C" fn pc_shape_create(session: *mut Session, id: u64, params_ptr: *c
     })
 }
 
+// ──────────────────────────────────────────────────────────────────────
+// A1 矢量绘图：pc_vector_path_create（1.2.0）
+// ──────────────────────────────────────────────────────────────────────
+#[unsafe(no_mangle)]
+pub extern "C" fn pc_vector_path_create(session: *mut Session, id: u64, params_ptr: *const u8, params_len: usize) -> *mut PcBuffer {
+    guard(move || {
+        if session.is_null() { return fail("null session"); }
+        let params = match unsafe { slice(params_ptr, params_len) } { Ok(b) => b, Err(e) => return fail(e) };
+        let p: serde_json::Value = match serde_json::from_slice(params) { Ok(v) => v, Err(e) => return fail(format!("invalid vector path parameters: {e}")) };
+        let s = unsafe { &mut *session };
+        let entry = match s.docs.get_mut(&id) { Some(e) => e, None => return fail(format!("document {id} is not open")) };
+        let bounds = entry.doc.bounds();
+        if bounds.is_empty() { return fail("document is empty"); }
+        let fill = p.get("fill").and_then(|v| v.as_array()).map(|arr| {
+            let b = arr.get(0).and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let g = arr.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let r = arr.get(2).and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let a = arr.get(3).and_then(|v| v.as_f64()).unwrap_or(1.0);
+            Fill::Solid(shape_color([b as f32, g as f32, r as f32, a.clamp(0.0, 1.0) as f32]))
+        });
+        let stroke_width = p.get("strokeWidth").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let stroke = p.get("stroke").and_then(|v| v.as_array()).filter(|_| stroke_width > 0.0).map(|arr| {
+            let b = arr.get(0).and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let g = arr.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let r = arr.get(2).and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let a = arr.get(3).and_then(|v| v.as_f64()).unwrap_or(1.0);
+            ShapeStroke { width: stroke_width.clamp(0.0, 10000.0) as f32, paint: Fill::Solid(shape_color([b as f32, g as f32, r as f32, a.clamp(0.0, 1.0) as f32])), opacity: a.clamp(0.0, 1.0) as f32, ..Default::default() }
+        });
+        let name = p.get("name").and_then(|v| v.as_str()).filter(|s| !s.trim().is_empty()).unwrap_or("Vector Path").to_string();
+        let mut shape = ShapeLayer { path: Path::new(Vec::new()), fill, stroke, live: None, cache: None, ..Default::default() };
+        shape.cache = Some(render_shape(&shape, entry.doc.pixel_format(), bounds));
+        entry.checkpoint();
+        let layer = Layer::new(name, LayerContent::Shape(shape));
+        let layer_id = layer.id.0;
+        entry.doc.layers.push(layer);
+        ok(json!({ "layerId": layer_id, "info": doc_info(entry) }))
+    })
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// A1 矢量绘图：pc_vector_path_edit（1.2.0）
+// ──────────────────────────────────────────────────────────────────────
+#[unsafe(no_mangle)]
+pub extern "C" fn pc_vector_path_edit(session: *mut Session, id: u64, params_ptr: *const u8, params_len: usize) -> *mut PcBuffer {
+    guard(move || {
+        if session.is_null() { return fail("null session"); }
+        let params = match unsafe { slice(params_ptr, params_len) } { Ok(b) => b, Err(e) => return fail(e) };
+        let p: serde_json::Value = match serde_json::from_slice(params) { Ok(v) => v, Err(e) => return fail(format!("invalid vector path edit parameters: {e}")) };
+        let op = p.get("op").and_then(|v| v.as_str()).unwrap_or("");
+        let layer_id = p.get("layerId").and_then(|v| v.as_u64()).unwrap_or(0);
+        let s = unsafe { &mut *session };
+        let entry = match s.docs.get_mut(&id) { Some(e) => e, None => return fail(format!("document {id} is not open")) };
+        let layer = match entry.doc.layers.iter_mut().find(|l| l.id.0 == layer_id) { Some(l) => l, None => return fail(format!("layer {layer_id} not found")) };
+        let content = match &mut layer.content { LayerContent::Shape(shape) => shape, _ => return fail("layer is not a vector/shape layer") };
+        match op {
+            "addAnchor" => {
+                let x = p.get("anchor").and_then(|v| v.get(0)).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let y = p.get("anchor").and_then(|v| v.get(1)).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let knot = Knot::corner(x, y);
+                let subpath_idx = p.get("subpathIndex").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                if subpath_idx >= content.path.subpaths.len() {
+                    content.path.subpaths.push(Subpath { closed: false, knots: vec![knot], op: PathOp::Combine });
+                } else {
+                    content.path.subpaths[subpath_idx].knots.push(knot);
+                }
+            }
+            "moveAnchor" => {
+                let x = p.get("anchor").and_then(|v| v.get(0)).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let y = p.get("anchor").and_then(|v| v.get(1)).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let subpath_idx = p.get("subpathIndex").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let knot_idx = p.get("knotIndex").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                if let Some(subpath) = content.path.subpaths.get_mut(subpath_idx) {
+                    if let Some(knot) = subpath.knots.get_mut(knot_idx) { knot.anchor = Point::new(x, y); }
+                }
+            }
+            "setCtrl" => {
+                let in_x = p.get("inCtrl").and_then(|v| v.get(0)).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let in_y = p.get("inCtrl").and_then(|v| v.get(1)).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let out_x = p.get("outCtrl").and_then(|v| v.get(0)).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let out_y = p.get("outCtrl").and_then(|v| v.get(1)).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let subpath_idx = p.get("subpathIndex").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let knot_idx = p.get("knotIndex").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                if let Some(subpath) = content.path.subpaths.get_mut(subpath_idx) {
+                    if let Some(knot) = subpath.knots.get_mut(knot_idx) { knot.in_ctrl = Point::new(in_x, in_y); knot.out_ctrl = Point::new(out_x, out_y); }
+                }
+            }
+            "setSmooth" => {
+                let smooth = p.get("smooth").and_then(|v| v.as_bool()).unwrap_or(false);
+                let subpath_idx = p.get("subpathIndex").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let knot_idx = p.get("knotIndex").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                if let Some(subpath) = content.path.subpaths.get_mut(subpath_idx) {
+                    if let Some(knot) = subpath.knots.get_mut(knot_idx) { knot.smooth = smooth; }
+                }
+            }
+            "setClosed" => {
+                let closed = p.get("closed").and_then(|v| v.as_bool()).unwrap_or(false);
+                let subpath_idx = p.get("subpathIndex").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                if let Some(subpath) = content.path.subpaths.get_mut(subpath_idx) { subpath.closed = closed; }
+            }
+            "setFill" => {
+                if let Some(arr) = p.get("fill").and_then(|v| v.as_array()) {
+                    let b = arr.get(0).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let g = arr.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let r = arr.get(2).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let a = arr.get(3).and_then(|v| v.as_f64()).unwrap_or(1.0);
+                    content.fill = Some(Fill::Solid(shape_color([b as f32, g as f32, r as f32, a.clamp(0.0, 1.0) as f32])));
+                } else { content.fill = None; }
+            }
+            "setStroke" => {
+                let width = p.get("strokeWidth").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                if let Some(arr) = p.get("stroke").and_then(|v| v.as_array()) {
+                    let b = arr.get(0).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let g = arr.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let r = arr.get(2).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let a = arr.get(3).and_then(|v| v.as_f64()).unwrap_or(1.0);
+                    content.stroke = Some(ShapeStroke { width: width.clamp(0.0, 10000.0) as f32, paint: Fill::Solid(shape_color([b as f32, g as f32, r as f32, a.clamp(0.0, 1.0) as f32])), opacity: a.clamp(0.0, 1.0) as f32, ..Default::default() });
+                } else { content.stroke = None; }
+            }
+            _ => return fail(format!("unsupported vector path op: {op}")),
+        }
+        entry.checkpoint();
+        ok(json!({ "ok": true, "info": doc_info(entry) }))
+    })
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// A1 矢量绘图：pc_vector_path_rasterize（1.2.0）
+// ──────────────────────────────────────────────────────────────────────
+#[unsafe(no_mangle)]
+pub extern "C" fn pc_vector_path_rasterize(session: *mut Session, id: u64, params_ptr: *const u8, params_len: usize) -> *mut PcBuffer {
+    guard(move || {
+        if session.is_null() { return fail("null session"); }
+        let params = match unsafe { slice(params_ptr, params_len) } { Ok(b) => b, Err(e) => return fail(e) };
+        let p: serde_json::Value = match serde_json::from_slice(params) { Ok(v) => v, Err(e) => return fail(format!("invalid vector path rasterize parameters: {e}")) };
+        let layer_id = p.get("layerId").and_then(|v| v.as_u64()).unwrap_or(0);
+        let s = unsafe { &mut *session };
+        let entry = match s.docs.get_mut(&id) { Some(e) => e, None => return fail(format!("document {id} is not open")) };
+        let bounds = entry.doc.bounds();
+        let pixel_format = entry.doc.pixel_format();
+        let layer = match entry.doc.layers.iter_mut().find(|l| l.id.0 == layer_id) { Some(l) => l, None => return fail(format!("layer {layer_id} not found")) };
+        let content = match &mut layer.content { LayerContent::Shape(shape) => shape, _ => return fail("layer is not a vector/shape layer") };
+        let cache = render_shape(content, pixel_format, bounds);
+        content.cache = Some(cache);
+        entry.checkpoint();
+        ok(json!({ "ok": true, "info": doc_info(entry) }))
+    })
+}
+
+/// D2 鏅鸿兘鎶犲浘锛堜紶缁熺畻娉曡捣姝ワ紝绾绾匡級锛歋elect Subject锛圙rabCut 绫伙級+ 杈圭紭缁嗗寲锛?/// 鐢熸垚闈炵牬鍧忔€у浘灞傝挋鐗堛€傜粷涓嶈闂綉缁滐紙R1 闆舵潈闄愮孩绾匡級銆
+#[unsafe(no_mangle)]
+pub extern "C" fn pc_cutout_remove_background(session: *mut Session, id: u64, params_ptr: *const u8, params_len: usize) -> *mut PcBuffer {
+    guard(move || {
+        if session.is_null() {
+            return fail("null session");
+        }
+        let params = match unsafe { slice(params_ptr, params_len) } {
+            Ok(b) => b,
+            Err(e) => return fail(e),
+        };
+        let p: serde_json::Value = match serde_json::from_slice(params) {
+            Ok(v) => v,
+            Err(e) => return fail(format!("invalid cutout parameters: {e}")),
+        };
+        let layer = p.get("layer").and_then(|v| v.as_u64()).unwrap_or(0);
+        let refine = p.get("refine").and_then(|v| v.as_bool()).unwrap_or(true);
+        // SAFETY: live session pointer.
+        let s = unsafe { &mut *session };
+        let entry = match s.docs.get_mut(&id) {
+            Some(e) => e,
+            None => return fail(format!("document {id} is not open")),
+        };
+        let target = match find_layer(&entry.doc.layers, layer) {
+            Some(l) => l,
+            None => return fail("layer not found"),
+        };
+        let surface = match &target.content {
+            LayerContent::Raster(s) => s,
+            _ => return fail("智能抠图仅支持像素图层"),
+        };
+        let bounds = entry.doc.bounds();
+        if bounds.is_empty() {
+            return fail("document is empty");
+        }
+        let area = {
+            let b = surface.content_bounds().intersect(&bounds);
+            if !b.is_empty() { b } else { bounds }
+        };
+        let sampler = photocraft_algo::segment::SurfaceSampler(surface);
+        let found = photocraft_algo::segment::subject::select_subject(&sampler, area);
+        let mut region = match found {
+            Some(r) => r,
+            None => return fail("no subject found"),
+        };
+        if refine {
+            const REFINE: photocraft_algo::matting::RefineParams = photocraft_algo::matting::RefineParams {
+                radius: 2.0,
+                smart_radius: true,
+                smooth: 10.0,
+                feather: 0.5,
+                contrast: 10.0,
+                shift_edge: 0.0,
+            };
+            let refined = photocraft_algo::matting::refine_mask(
+                &sampler,
+                &photocraft_algo::matting::region_reader(&region),
+                region.bbox,
+                area,
+                &REFINE,
+            );
+            if let Some(r) = refined {
+                region = r;
+            }
+        }
+        let mask = match mask_at_depth(
+            LayerMask { surface: photocraft_algo::matting::region_surface(&region), ..LayerMask::reveal_all() },
+            entry.doc.depth,
+        ) {
+            Ok(m) => m,
+            Err(e) => return fail(e),
+        };
+        let b = region.bbox;
+        let payload = json!({
+            "layer": layer,
+            "bounds": [b.x0, b.y0, b.width() as i32, b.height() as i32],
+            "info": doc_info(entry),
+        });
+        // 鍞竴鍐欏墠蹇収鐐癸細鎵€鏈return fail(...) 閮藉湪鏈涔嬪墠銆?
+        entry.checkpoint_named("智能抠图");
+        if let Some(target) = find_layer_mut(&mut entry.doc.layers, layer) {
+            target.mask = Some(mask);
+        }
+        entry.doc.selection = None;
+        ok(payload)
+    })
+}
+
+/// D1 鐭㈤噺缁樺浘锛?.2.0锛夛細鎶婄煝閲忓浘灞傜殑璺緞杞负閫夊尯锛堝彲鍔?鍑?浜?鏇挎崲锛夛紝鏀寔缇藉寲涓庢姉閿娇寮€鍏炽€
+#[unsafe(no_mangle)]
+pub extern "C" fn pc_vector_path_to_selection(session: *mut Session, id: u64, params_ptr: *const u8, params_len: usize) -> *mut PcBuffer {
+    guard(move || {
+        if session.is_null() {
+            return fail("null session");
+        }
+        let params = match unsafe { slice(params_ptr, params_len) } {
+            Ok(b) => b,
+            Err(e) => return fail(e),
+        };
+        let p: serde_json::Value = match serde_json::from_slice(params) {
+            Ok(v) => v,
+            Err(e) => return fail(format!("invalid vector path selection parameters: {e}")),
+        };
+        let layer = p.get("layer").and_then(|v| v.as_u64()).unwrap_or(0);
+        let feather = p.get("feather").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        if !feather.is_finite() || !(0.0..=1000.0).contains(&feather) {
+            return fail("feather must be a finite number in 0..1000");
+        }
+        let anti_alias = p.get("antiAlias").and_then(|v| v.as_bool()).unwrap_or(true);
+        let mode = p.get("mode").and_then(|v| v.as_str()).unwrap_or("replace");
+        if !matches!(mode, "replace" | "add" | "subtract" | "intersect") {
+            return fail("mode must be replace, add, subtract or intersect");
+        }
+        // SAFETY: live session pointer.
+        let s = unsafe { &mut *session };
+        let entry = match s.docs.get_mut(&id) {
+            Some(e) => e,
+            None => return fail(format!("document {id} is not open")),
+        };
+        let target = match find_layer(&entry.doc.layers, layer) {
+            Some(l) => l,
+            None => return fail("layer not found"),
+        };
+        let path = match &target.content {
+            LayerContent::Shape(shape) => &shape.path,
+            _ => return fail("layer is not a vector/shape layer"),
+        };
+        let area = entry.doc.bounds();
+        if area.is_empty() {
+            return fail("document is empty");
+        }
+        let mut mask = photocraft_vector::fill_rasterizer(path, photocraft_vector::DEFAULT_TOLERANCE).render(area);
+        if !anti_alias {
+            for v in &mut mask {
+                *v = if *v >= 0.5 { 1.0 } else { 0.0 };
+            }
+        }
+        if feather > 0.0 {
+            mask = selection::feather(&mask, area.width() as usize, area.height() as usize, feather as f32);
+        }
+        entry.checkpoint_named("璺緞杞€夊尯");
+        let old = entry.doc.selection.clone();
+        entry.doc.selection = selection::combine(old.as_ref(), &mask, area, selection::SelectionMode::parse(mode));
+        ok(selection_json(&entry.doc))
+    })
+}
+
 static TEXT_ENGINE: OnceLock<Mutex<TextEngine>> = OnceLock::new();
 static TEXT_FONT_FAMILIES: OnceLock<Vec<String>> = OnceLock::new();
 
@@ -2187,7 +2491,7 @@ pub extern "C" fn pc_layer_mask_add(
     })
 }
 
-/// 修改启用 / 密度 / 羽化。`params` 是 JSON：`{"enabled":bool?,"density":0..1?,"feather":0..1000?}`。
+/// 修改启用 / 密度 / 羽化。`params` 是 JSON：`{"enabled":bool?,"density":0..1?,"feather":0..1000}`。
 /// 与现值全部相同则不 checkpoint、不写文档，直接返回当前状态（`C-MASK-API@1 §E.3`）。
 #[unsafe(no_mangle)]
 pub extern "C" fn pc_layer_mask_set(
@@ -4712,15 +5016,18 @@ struct TransformParams {
 /// 重采样输出像素数上限：超过即拒绝，避免一次变换把内存打爆（`C-XFORM-API@1 §2.6`）。
 const MAX_TRANSFORM_PIXELS: u64 = 64_000_000;
 
-/// 图层内容包围盒：组取画板矩形，无画板时取子层并集（与 `comps::position_bounds` 同口径）。
+/// 图层内容包围盒：组取子层并集，无子层时回退画板矩形。
+///
+/// 画板 rect 经非轴对齐变换后 `turn_map_rect` 取 AABB 会放大外接框，故组内容包围盒直接取
+/// 子层实际内容并集（B6）；仅当组无子层时回退画板 rect，避免空组返回空盒。
 fn transform_content_bounds(l: &Layer) -> Rect {
     match &l.content {
         LayerContent::Group(g) => {
-            let board = g.artboard.as_ref().map_or(Rect::EMPTY, |ab| ab.rect);
-            if board.is_empty() {
-                g.children.iter().fold(Rect::EMPTY, |r, c| r.union(&transform_content_bounds(c)))
+            let bounds = g.children.iter().fold(Rect::EMPTY, |r, c| r.union(&transform_content_bounds(c)));
+            if bounds.is_empty() {
+                g.artboard.as_ref().map_or(Rect::EMPTY, |ab| ab.rect)
             } else {
-                board
+                bounds
             }
         }
         _ => layer_content_bounds(l),
@@ -4745,6 +5052,12 @@ static RESAMPLE_PRUNE_NANOS: AtomicU64 = AtomicU64::new(0);
 ///
 /// 输出像素中心反算到源坐标后取四个邻点：源包围盒之外按 `Surface` 的读语义取默认像素，
 /// 因此内容边界不会向内渗色。带 alpha 的表面用预乘权重累加，避免透明像素把边缘颜色拖暗。
+///
+/// C2+C3 优化（2026-11-18）：
+/// - C3：只读源包围盒——`inv` 映射 dest 四角得到源坐标 box，与 `s.content_bounds()` intersect，
+///   只读取该区域而非整层 source（四段定论：readMs 与 px 无关，整层读是固定开销，只读包围盒是唯一有效方向）。
+/// - C2：按条带分块「算一块写一块」——每条带填充后立即 `write_region` 写入，内存峰值 = 条带大小
+///   而非整块 dest（64M px × 4ch × 4B = 1GB 的 OOM 风险降为条带级）。
 fn resample_affine(s: &Surface, inv: &Affine, dest: Rect) -> Surface {
     // 一次性环境探针：判定鸿蒙是否把进程限制到单核、以及 rayon 全局池实际线程数。
     static RESAMPLE_ENV_ONCE: std::sync::Once = std::sync::Once::new();
@@ -4757,19 +5070,28 @@ fn resample_affine(s: &Surface, inv: &Affine, dest: Rect) -> Surface {
         eprintln!("[PC-RESAMPLE] env available_parallelism={avail} rayon_threads={rayon_threads}");
     });
     let mut out = Surface::with_default(s.format(), &s.default_pixel());
-    let src = s.content_bounds();
-    if src.is_empty() || dest.is_empty() {
+    let src_full = s.content_bounds();
+    if src_full.is_empty() || dest.is_empty() {
         return out;
     }
     let n = s.channels().max(1);
-    let (w, h) = (src.width() as usize, src.height() as usize);
+    // C3：只读源包围盒——inv 映射 dest 四角到源坐标，取 AABB 后与 content_bounds intersect。
+    let src_box = turn_map_box(inv, [f64::from(dest.x0), f64::from(dest.y0), f64::from(dest.x1), f64::from(dest.y1)]);
+    let i = |v: f64| v.round().clamp(f64::from(i32::MIN / 2), f64::from(i32::MAX / 2)) as i32;
+    let src_needed = Rect::new(i(src_box[0]), i(src_box[1]), i(src_box[2]), i(src_box[3])).intersect(&src_full);
+    if src_needed.is_empty() {
+        // dest 完全映射到源内容之外 → 全默认像素，无需读取。
+        out.write_region(dest, &vec![0.0f32; dest.width() as usize * dest.height() as usize * n]);
+        return out;
+    }
+    let (w, h) = (src_needed.width() as usize, src_needed.height() as usize);
     let t_read = Instant::now();
-    let raw = s.read_region(src);
+    let raw = s.read_region(src_needed);
     let read_d = t_read.elapsed();
     let read_ms = read_d.as_secs_f64() * 1_000.0;
     let default = s.default_pixel();
     let at = |x: i64, y: i64, c: usize| -> f32 {
-        let (dx, dy) = (x - i64::from(src.x0), y - i64::from(src.y0));
+        let (dx, dy) = (x - i64::from(src_needed.x0), y - i64::from(src_needed.y0));
         if dx < 0 || dy < 0 || dx >= w as i64 || dy >= h as i64 {
             return default.get(c).copied().unwrap_or(0.0);
         }
@@ -4779,19 +5101,9 @@ fn resample_affine(s: &Surface, inv: &Affine, dest: Rect) -> Surface {
     let (dw, dh) = (dest.width() as usize, dest.height() as usize);
     let stride = dw * n;
     let parallel = cfg!(not(target_arch = "wasm32")) && dw * dh >= PARALLEL_RESAMPLE_MIN_PIXELS;
-    // 计时包含输出缓冲分配与默认值填充 + 逐行填充（即整段填充阶段）。
+    // C2：条带分块——每条带 RESAMPLE_STRIP_ROWS 行，填充后立即写回，内存峰值 = 条带而非整块。
+    const RESAMPLE_STRIP_ROWS: usize = 512;
     let t_fill = Instant::now();
-    // `Surface::write_pixel` 需要 `&mut self`，surface 本身不能按行拆分，所以先把结果算进行连续的
-    // 浮点缓冲，再整块写回。反算坐标非有限的像素保持默认值，等价于串行路径的“跳过即默认”。
-    let mut buf = vec![0.0f32; stride * dh];
-    // 默认像素全零（绝大多数图层内容）时缓冲初值已等于默认值，省掉整块逐像素填充。
-    if default.iter().take(n).any(|v| *v != 0.0) {
-        for px in buf.chunks_mut(n) {
-            for (c, slot) in px.iter_mut().enumerate() {
-                *slot = default.get(c).copied().unwrap_or(0.0);
-            }
-        }
-    }
     let fill_row = |row: &mut [f32], y: i32| {
         let mut px = vec![0.0f32; n];
         for (i, x) in (dest.x0..dest.x1).enumerate() {
@@ -4836,28 +5148,45 @@ fn resample_affine(s: &Surface, inv: &Affine, dest: Rect) -> Surface {
             row[i * n..][..n].copy_from_slice(&px);
         }
     };
-    if !parallel {
-        for (row, data) in buf.chunks_mut(stride).enumerate() {
-            fill_row(data, dest.y0 + row as i32);
-        }
-    } else {
-        // 线程数沿用 rayon 默认（全局池按可用 CPU 核数），不在此处硬编码。
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            use rayon::prelude::*;
-            buf.par_chunks_mut(stride).enumerate().for_each(|(row, data)| fill_row(data, dest.y0 + row as i32));
-        }
-        #[cfg(target_arch = "wasm32")]
-        {
-            for (row, data) in buf.chunks_mut(stride).enumerate() {
-                fill_row(data, dest.y0 + row as i32);
+    // C2：按条带分块填充 + 写入。条带内可并行，条带间串行 write_region（不进 rayon，安全）。
+    let t_write = Instant::now();
+    let mut strip_buf: Vec<f32> = Vec::new();
+    let mut row = dest.y0;
+    while row < dest.y1 {
+        let strip_h = (dest.y1 - row).min(RESAMPLE_STRIP_ROWS as i32) as usize;
+        let strip_stride = dw * strip_h;
+        strip_buf.clear();
+        strip_buf.resize(stride * strip_h, 0.0f32);
+        // 默认像素非零时填充默认值（绝大多数图层默认全零，已跳过）。
+        if default.iter().take(n).any(|v| *v != 0.0) {
+            for px in strip_buf.chunks_mut(n) {
+                for (c, slot) in px.iter_mut().enumerate() {
+                    *slot = default.get(c).copied().unwrap_or(0.0);
+                }
             }
         }
+        if parallel {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                use rayon::prelude::*;
+                strip_buf.par_chunks_mut(stride).enumerate().for_each(|(r, data)| fill_row(data, row + r as i32));
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                for (r, data) in strip_buf.chunks_mut(stride).enumerate() {
+                    fill_row(data, row + r as i32);
+                }
+            }
+        } else {
+            for (r, data) in strip_buf.chunks_mut(stride).enumerate() {
+                fill_row(data, row + r as i32);
+            }
+        }
+        out.write_region(Rect::new(dest.x0, row, dest.x1, row + strip_h as i32), &strip_buf);
+        row += strip_h as i32;
     }
     let fill_d = t_fill.elapsed();
     let fill_ms = fill_d.as_secs_f64() * 1_000.0;
-    let t_write = Instant::now();
-    out.write_region_par(dest, &buf);
     let write_d = t_write.elapsed();
     let write_ms = write_d.as_secs_f64() * 1_000.0;
     let t_prune = Instant::now();
@@ -4874,14 +5203,15 @@ fn resample_affine(s: &Surface, inv: &Affine, dest: Rect) -> Surface {
     RESAMPLE_PRUNE_NANOS.fetch_add(u64::try_from(prune_d.as_nanos()).unwrap_or(u64::MAX), Ordering::Relaxed);
     // 仅供本地排查；真机 stderr 不进 hilog，真值走 ABI 顶层 `perf`（见 `transform_perf`）。
     eprintln!(
-        "[PC-RESAMPLE] px={} threads={} read={:.1}ms fill={:.1}ms write={:.1}ms prune={:.1}ms parallel={}",
+        "[PC-RESAMPLE] px={} threads={} read={:.1}ms fill={:.1}ms write={:.1}ms prune={:.1}ms parallel={} strip_rows={}",
         dw * dh,
         rayon_threads(),
         read_ms,
         fill_ms,
         write_ms,
         prune_ms,
-        u8::from(parallel)
+        u8::from(parallel),
+        RESAMPLE_STRIP_ROWS
     );
     out
 }
@@ -5013,6 +5343,14 @@ fn transform_layer_pixels(l: &mut Layer, a: &Affine, inv: &Affine) {
         LayerContent::Group(g) => {
             for child in &mut g.children {
                 transform_layer_pixels(child, a, inv);
+            }
+            // 非轴对齐变换后 turn_map_rect 取 AABB 会放大画板 rect；用变换后子层实际
+            // 内容包围盒重设，保持画板 rect 与真实内容一致（B6）。
+            if let Some(ab) = &mut g.artboard {
+                let child_bounds = g.children.iter().fold(Rect::EMPTY, |r, c| r.union(&transform_content_bounds(c)));
+                if !child_bounds.is_empty() {
+                    ab.rect = child_bounds;
+                }
             }
         }
         _ => {}
@@ -11170,3 +11508,163 @@ mod transform_api_tests {
     }
 }
 
+#[cfg(test)]
+mod cutout_api_tests {
+    //! D2 鏅鸿兘鎶犲浘锛堜紶缁熺畻娉曪紝绾绾匡級C ABI 濂戠害娴嬭瘯銆?    #![allow(clippy::panic, clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+
+    use super::*;
+
+    fn take_json(buf: *mut PcBuffer, ctx: &str) -> Value {
+        assert!(!buf.is_null(), "{ctx}: 鏈熸湜闈炵┖ PcBuffer");
+        let bytes = unsafe {
+            let b = &*buf;
+            std::slice::from_raw_parts(b.ptr, b.len).to_vec()
+        };
+        pc_buffer_free(buf);
+        serde_json::from_slice::<Value>(&bytes).unwrap_or_else(|e| panic!("{ctx}: 闈炴硶 JSON ({e})"))
+    }
+
+    fn fixture(w: u32, h: u32) -> (*mut Session, u64, u64) {
+        let session = pc_session_new();
+        let created = take_json(pc_document_new(session, w, h, b"cutout".as_ptr(), 6), "寤哄浘");
+        assert_eq!(created["ok"].as_bool(), Some(true), "寤哄浘澶辫触: {created}");
+        let doc = created["data"]["id"].as_u64().expect("data.id");
+        let info = take_json(pc_info(session, doc), "info");
+        let layer = info["data"]["layers"][0]["id"].as_u64().expect("鍥惧眰 id");
+        (session, doc, layer)
+    }
+
+    /// 閫犱竴寮犳湁鏄庣‘涓讳綋鐨勫浘锛氱櫧搴?+ 涓ぎ娣辫壊鐭╁舰锛圙rabCut 搴旇兘鍒嗙锛夈€
+    fn fixture_with_subject(w: u32, h: u32) -> (*mut Session, u64, u64) {
+        let (session, doc, layer) = fixture(w, h);
+        // SAFETY: 娴嬭瘯妯″潡涓?Session 鍚?crate锛宻ession 鐢?pc_session_new 鍒嗛厤涓斾粛鏈夋晥銆
+        unsafe {
+            let s = &mut *session;
+            let entry = s.docs.get_mut(&doc).expect("doc");
+            let target = find_layer_mut(&mut entry.doc.layers, layer).expect("layer");
+            if let LayerContent::Raster(surface) = &mut target.content {
+                surface.fill_rect(Rect::new(30, 30, (w as i32) - 30, (h as i32) - 30), &[0.05, 0.05, 0.08, 1.0]);
+            }
+        }
+        (session, doc, layer)
+    }
+
+    /// 鎶犲浘杩斿洖 ok + bounds + mask 鐗堟湰閫掑锛屼笖鍙挙閿€銆
+    #[test]
+    fn cutout_creates_mask_and_is_undoable() {
+        let (session, doc, layer) = fixture_with_subject(120, 120);
+        let params = json!({ "layer": layer, "refine": true });
+        let pb = params.to_string();
+        let before = take_json(pc_revision(session, doc), "revision before");
+        let out = take_json(
+            pc_cutout_remove_background(session, doc, pb.as_ptr(), pb.len()),
+            "pc_cutout_remove_background",
+        );
+        assert_eq!(out["ok"].as_bool(), Some(true), "鎶犲浘搴旀垚鍔? {out}");
+        assert_eq!(out["data"]["layer"].as_u64(), Some(layer), "返回 layer 应一致");
+        assert!(out["data"]["bounds"].is_array(), "搴旇繑鍥?bounds");
+        let after = take_json(pc_revision(session, doc), "revision after");
+        assert!(
+            after["data"]["revision"].as_u64().unwrap_or(0) > before["data"]["revision"].as_u64().unwrap_or(0),
+            "鎶犲浘鍚?revision 搴旈€掑"
+        );
+        let mask = take_json(pc_layer_mask_get(session, doc, layer), "mask get");
+        assert_eq!(mask["data"]["present"].as_bool(), Some(true), "抠图应生成蒙版");
+        let undo = take_json(pc_undo(session, doc), "undo");
+        assert_eq!(undo["ok"].as_bool(), Some(true), "鎶犲浘搴斿彲鎾ら攢: {undo}");
+        let mask2 = take_json(pc_layer_mask_get(session, doc, layer), "mask get after undo");
+        assert_eq!(mask2["data"]["present"].as_bool(), Some(false), "鎾ら攢鍚庤挋鐗堝簲绉婚櫎");
+        pc_session_free(session);
+    }
+
+    /// 闈炲儚绱犲浘灞傚簲鏄庣‘澶辫触涓斾笉浜х敓鍓綔鐢ㄣ€
+    #[test]
+    fn cutout_rejects_non_raster_layer() {
+        let (session, doc, _layer) = fixture(40, 40);
+        let params = json!({ "layer": 999999u64 });
+        let pb = params.to_string();
+        let out = take_json(
+            pc_cutout_remove_background(session, doc, pb.as_ptr(), pb.len()),
+            "missing layer",
+        );
+        assert_eq!(out["ok"].as_bool(), Some(false), "涓嶅瓨鍦ㄥ浘灞傚簲澶辫触");
+        pc_session_free(session);
+    }
+}
+
+#[cfg(test)]
+mod vector_selection_api_tests {
+    //! D1 鐭㈤噺缁樺浘锛氳矾寰勮浆閫夊尯 C ABI 濂戠害娴嬭瘯銆?    #![allow(clippy::panic, clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+
+    use super::*;
+
+    fn take_json(buf: *mut PcBuffer, ctx: &str) -> Value {
+        assert!(!buf.is_null(), "{ctx}: 鏈熸湜闈炵┖ PcBuffer");
+        let bytes = unsafe {
+            let b = &*buf;
+            std::slice::from_raw_parts(b.ptr, b.len).to_vec()
+        };
+        pc_buffer_free(buf);
+        serde_json::from_slice::<Value>(&bytes).unwrap_or_else(|e| panic!("{ctx}: 闈炴硶 JSON ({e})"))
+    }
+
+    /// 瀵圭煩褰㈣矾寰勮浆閫夊尯锛氬簲浜х敓鏈夋晥閫夊尯锛涢潪鐭㈤噺灞傚簲鏄庣‘澶辫触銆
+    #[test]
+    fn path_to_selection_works_and_rejects_raster() {
+        let session = pc_session_new();
+        let created = take_json(pc_document_new(session, 80, 80, b"vec".as_ptr(), 3), "寤哄浘");
+        let doc = created["data"]["id"].as_u64().expect("data.id");
+        let info = take_json(pc_info(session, doc), "info");
+        let raster_layer = info["data"]["layers"][0]["id"].as_u64().expect("鍥惧眰 id");
+
+        // 鍏堝缓涓€涓甫鐭╁舰璺緞鐨勭煝閲忓浘灞傘€
+        let path = Path::new(vec![Subpath::polygon(&[
+            (10.0, 10.0), (60.0, 10.0), (60.0, 60.0), (10.0, 60.0),
+        ])]);
+        let params = json!({ "name": "sel" });
+        let pb = params.to_string();
+        take_json(pc_vector_path_create(session, doc, pb.as_ptr(), pb.len()), "vectorPathCreate");
+
+        // 閫氳繃 ABI 鎷垮埌 shape layer锛氱敤 info 閲屾渶鍚庝竴涓?shape 灞傘€
+        let info2 = take_json(pc_info(session, doc), "info2");
+        let mut shape_layer = 0u64;
+        if let Some(layers) = info2["data"]["layers"].as_array() {
+            for l in layers {
+                if l["kind"].as_str() == Some("Shape") {
+                    shape_layer = l["id"].as_u64().unwrap_or(0);
+                }
+            }
+        }
+        assert!(shape_layer != 0, "鏈熸湜瀛樺湪鐭㈤噺鍥惧眰, 瀹為檯 {info2}");
+
+        // 娉ㄥ叆璺緞闇€閫氳繃缂栬緫 ABI锛氱洿鎺ュ啓鍐呴儴璺緞浠ヤ繚璇佺‘瀹氭€э紙娴嬭瘯涓?bridge 鍚?crate锛夈€
+        unsafe {
+            let s = &mut *session;
+            let entry = s.docs.get_mut(&doc).expect("doc");
+            let target = find_layer_mut(&mut entry.doc.layers, shape_layer).expect("shape layer");
+            if let LayerContent::Shape(shape) = &mut target.content {
+                shape.path = path;
+            }
+        }
+
+        let params = json!({ "layer": shape_layer, "mode": "replace" });
+        let pb = params.to_string();
+        let out = take_json(
+            pc_vector_path_to_selection(session, doc, pb.as_ptr(), pb.len()),
+            "vectorPathToSelection",
+        );
+        assert_eq!(out["ok"].as_bool(), Some(true), "璺緞杞€夊尯搴旀垚鍔? {out}");
+        let sel = take_json(pc_selection_info(session, doc), "selectionInfo");
+        assert_eq!(sel["data"]["active"].as_bool(), Some(true), "搴斾骇鐢熸湁鏁堥€夊尯: {sel}");
+
+        // 鍍忕礌鍥惧眰搴旇鎷掔粷銆
+        let params = json!({ "layer": raster_layer });
+        let pb = params.to_string();
+        let bad = take_json(
+            pc_vector_path_to_selection(session, doc, pb.as_ptr(), pb.len()),
+            "raster reject",
+        );
+        assert_eq!(bad["ok"].as_bool(), Some(false), "鍍忕礌鍥惧眰搴旇鎷掔粷");
+        pc_session_free(session);
+    }
+}

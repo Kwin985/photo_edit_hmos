@@ -158,5 +158,283 @@ export default function engineTest() {
         Engine.close(docId);
       }
     });
+
+    it('guidesUndoRedoChainStepsIndividually', 0, () => {
+      // 多条参考线撤销链逐项验（B5）：每次 guidesSet 占一个 checkpoint（lib.rs:4699），
+      // undo 必须逐项回退、redo 逐项恢复；同值是空操作（lib.rs:4695），故每次值不同。
+      const created = Engine.newDocument(64, 48, 'guides-undo-chain');
+      const docId: number = created.id;
+      try {
+        // 三次全量替换 → 三个独立 checkpoint。
+        Engine.guidesSet(docId, '{"horizontal":[10]}');
+        Engine.guidesSet(docId, '{"horizontal":[10,20]}');
+        Engine.guidesSet(docId, '{"horizontal":[10,20,30]}');
+        expect(Engine.guidesGet(docId).horizontal.length).assertEqual(3);
+
+        // undo 逐项回退：30 → 20 → 10 → 空。
+        Engine.undo(docId);
+        expect(Engine.guidesGet(docId).horizontal.length).assertEqual(2);
+        Engine.undo(docId);
+        expect(Engine.guidesGet(docId).horizontal.length).assertEqual(1);
+        Engine.undo(docId);
+        expect(Engine.guidesGet(docId).horizontal.length).assertEqual(0);
+
+        // redo 逐项恢复：空 → 10 → 20 → 30。
+        Engine.redo(docId);
+        expect(Engine.guidesGet(docId).horizontal.length).assertEqual(1);
+        Engine.redo(docId);
+        expect(Engine.guidesGet(docId).horizontal.length).assertEqual(2);
+        Engine.redo(docId);
+        expect(Engine.guidesGet(docId).horizontal.length).assertEqual(3);
+      } finally {
+        Engine.close(docId);
+      }
+    });
+
+    it('layerTransformScaleBoundary10', 0, () => {
+      // B7：UI 缩放滑块下限 10% → 引擎 scaleX=0.1，在 0.01..100 内应成功（lib.rs:5098）。
+      const created = Engine.newDocument(64, 48, 'transform-scale-10');
+      const docId: number = created.id;
+      try {
+        const layerId: number = Engine.info(docId).layers[0].id;
+        const result = Engine.layerTransform(docId, layerId, '{"scaleX":0.1}');
+        expect(result.bounds.length).assertEqual(4);
+        expect(result.scaleX).assertEqual(0.1);
+      } finally {
+        Engine.close(docId);
+      }
+    });
+
+    it('layerTransformScaleBoundary400', 0, () => {
+      // B7：UI 缩放滑块上限 400% → 引擎 scaleX=4.0，在 0.01..100 内应成功（lib.rs:5098）。
+      const created = Engine.newDocument(64, 48, 'transform-scale-400');
+      const docId: number = created.id;
+      try {
+        const layerId: number = Engine.info(docId).layers[0].id;
+        const result = Engine.layerTransform(docId, layerId, '{"scaleX":4.0}');
+        expect(result.bounds.length).assertEqual(4);
+        expect(result.scaleX).assertEqual(4.0);
+      } finally {
+        Engine.close(docId);
+      }
+    });
+
+    it('layerTransformScaleBelowMinThrows', 0, () => {
+      // B7：scaleX=0.009 < 0.01 下限，应抛 "invalid transform"（lib.rs:5098-5104）。
+      const created = Engine.newDocument(64, 48, 'transform-scale-below-min');
+      const docId: number = created.id;
+      try {
+        const layerId: number = Engine.info(docId).layers[0].id;
+        const message: string = caughtMessage(() => {
+          Engine.layerTransform(docId, layerId, '{"scaleX":0.009}');
+        });
+        expect(message.indexOf('invalid transform') >= 0).assertTrue();
+      } finally {
+        Engine.close(docId);
+      }
+    });
+
+    it('layerTransformAngleBoundary180', 0, () => {
+      // B7：UI 角度滑块上限 180°，在 -3600..3600 内应成功（lib.rs:5100）。
+      const created = Engine.newDocument(64, 48, 'transform-angle-180');
+      const docId: number = created.id;
+      try {
+        const layerId: number = Engine.info(docId).layers[0].id;
+        const result = Engine.layerTransform(docId, layerId, '{"angle":180}');
+        expect(result.bounds.length).assertEqual(4);
+        expect(result.angle).assertEqual(180);
+      } finally {
+        Engine.close(docId);
+      }
+    });
+
+    it('layerTransformAngleBoundary200', 0, () => {
+      // B7：angle=200° 超出 UI 滑块范围但在引擎 -3600..3600 内，应成功（lib.rs:5100）。
+      const created = Engine.newDocument(64, 48, 'transform-angle-200');
+      const docId: number = created.id;
+      try {
+        const layerId: number = Engine.info(docId).layers[0].id;
+        const result = Engine.layerTransform(docId, layerId, '{"angle":200}');
+        expect(result.bounds.length).assertEqual(4);
+        expect(result.angle).assertEqual(200);
+      } finally {
+        Engine.close(docId);
+      }
+    });
+
+    it('layerTransformAngleBoundaryNeg180', 0, () => {
+      // B7：UI 角度滑块下限 -180°，应成功。
+      const created = Engine.newDocument(64, 48, 'transform-angle-neg180');
+      const docId: number = created.id;
+      try {
+        const layerId: number = Engine.info(docId).layers[0].id;
+        const result = Engine.layerTransform(docId, layerId, '{"angle":-180}');
+        expect(result.bounds.length).assertEqual(4);
+        expect(result.angle).assertEqual(-180);
+      } finally {
+        Engine.close(docId);
+      }
+    });
+
+    it('layerTransformAngleBoundaryNeg200', 0, () => {
+      // angle=-200° 超出 UI 滑块范围但在引擎范围内，应成功。
+      const created = Engine.newDocument(64, 48, 'transform-angle-neg200');
+      const docId: number = created.id;
+      try {
+        const layerId: number = Engine.info(docId).layers[0].id;
+        const result = Engine.layerTransform(docId, layerId, '{"angle":-200}');
+        expect(result.bounds.length).assertEqual(4);
+        expect(result.angle).assertEqual(-200);
+      } finally {
+        Engine.close(docId);
+      }
+    });
+
+    // ──────────────────────────────────────────────────────────────────────
+    // A1 矢量绘图（1.0.2）：vectorPathCreate/Edit/Rasterize/ToSelection
+    // ──────────────────────────────────────────────────────────────────────
+
+    it('vectorPathCreateOnNewDocument', 0, () => {
+      const created = Engine.newDocument(64, 48, 'vp-create');
+      const docId: number = created.id;
+      try {
+        const out = Engine.vectorPathCreate(docId, '{}');
+        expect(out.layerId > 0).assertTrue();
+        expect(out.info.layers.length >= 1).assertTrue();
+      } finally {
+        Engine.close(docId);
+      }
+    });
+
+    it('vectorPathEditAddAnchor', 0, () => {
+      const created = Engine.newDocument(64, 48, 'vp-add-anchor');
+      const docId: number = created.id;
+      try {
+        const out = Engine.vectorPathCreate(docId, '{}');
+        const info = Engine.vectorPathEdit(docId,
+          '{"op":"addAnchor","layerId":' + out.layerId + ',"subpathIndex":0,"knotIndex":0,"anchor":[10,20]}');
+        expect(info.layers.length >= 1).assertTrue();
+      } finally {
+        Engine.close(docId);
+      }
+    });
+
+    it('vectorPathEditUnsupportedOpThrows', 0, () => {
+      const created = Engine.newDocument(64, 48, 'vp-bad-op');
+      const docId: number = created.id;
+      try {
+        const out = Engine.vectorPathCreate(docId, '{}');
+        const message: string = caughtMessage(() => {
+          Engine.vectorPathEdit(docId, '{"op":"bogus","layerId":' + out.layerId + '}');
+        });
+        expect(message.indexOf('unsupported vector path op') >= 0).assertTrue();
+      } finally {
+        Engine.close(docId);
+      }
+    });
+
+    it('vectorPathEditNonShapeLayerThrows', 0, () => {
+      // Background 层 kind=Pixel，vectorPathEdit 应报「not a vector/shape layer」。
+      const created = Engine.newDocument(64, 48, 'vp-non-shape');
+      const docId: number = created.id;
+      try {
+        const layerId: number = Engine.info(docId).layers[0].id;
+        const message: string = caughtMessage(() => {
+          Engine.vectorPathEdit(docId,
+            '{"op":"addAnchor","layerId":' + layerId + ',"subpathIndex":0,"knotIndex":0,"anchor":[1,2]}');
+        });
+        expect(message.indexOf('not a vector/shape layer') >= 0).assertTrue();
+      } finally {
+        Engine.close(docId);
+      }
+    });
+
+    it('vectorPathRasterizeOnCreatedPath', 0, () => {
+      const created = Engine.newDocument(64, 48, 'vp-rasterize');
+      const docId: number = created.id;
+      try {
+        const out = Engine.vectorPathCreate(docId, '{}');
+        const info = Engine.vectorPathRasterize(docId, '{"layerId":' + out.layerId + '}');
+        expect(info.layers.length >= 1).assertTrue();
+      } finally {
+        Engine.close(docId);
+      }
+    });
+
+    it('vectorPathToSelectionOnClosedPath', 0, () => {
+      // 闭合三角形路径转选区，填充面积非零 → active=true。
+      const created = Engine.newDocument(64, 48, 'vp-to-sel');
+      const docId: number = created.id;
+      try {
+        const out = Engine.vectorPathCreate(docId, '{}');
+        const layerId: number = out.layerId;
+        Engine.vectorPathEdit(docId,
+          '{"op":"addAnchor","layerId":' + layerId + ',"subpathIndex":0,"knotIndex":0,"anchor":[10,10]}');
+        Engine.vectorPathEdit(docId,
+          '{"op":"addAnchor","layerId":' + layerId + ',"subpathIndex":0,"knotIndex":1,"anchor":[50,10]}');
+        Engine.vectorPathEdit(docId,
+          '{"op":"addAnchor","layerId":' + layerId + ',"subpathIndex":0,"knotIndex":2,"anchor":[30,50]}');
+        Engine.vectorPathEdit(docId,
+          '{"op":"setClosed","layerId":' + layerId + ',"subpathIndex":0,"closed":true}');
+        const sel = Engine.vectorPathToSelection(docId, layerId, 'replace', 0);
+        expect(sel.active).assertTrue();
+      } finally {
+        Engine.close(docId);
+      }
+    });
+
+    it('vectorPathToSelectionInvalidModeThrows', 0, () => {
+      const created = Engine.newDocument(64, 48, 'vp-bad-mode');
+      const docId: number = created.id;
+      try {
+        const out = Engine.vectorPathCreate(docId, '{}');
+        const message: string = caughtMessage(() => {
+          Engine.vectorPathToSelection(docId, out.layerId, 'bogus', 0);
+        });
+        expect(message.indexOf('mode must be') >= 0).assertTrue();
+      } finally {
+        Engine.close(docId);
+      }
+    });
+
+    it('vectorPathCreateOnClosedDocumentThrows', 0, () => {
+      const created = Engine.newDocument(64, 48, 'vp-closed');
+      const docId: number = created.id;
+      Engine.close(docId);
+      const message: string = caughtMessage(() => {
+        Engine.vectorPathCreate(docId, '{}');
+      });
+      expect(message.length > 0).assertTrue();
+    });
+
+    // ──────────────────────────────────────────────────────────────────────
+    // D2 智能抠图（1.0.2）：cutoutRemoveBackground 错误分支
+    // ──────────────────────────────────────────────────────────────────────
+
+    it('cutoutRejectsNonRasterLayer', 0, () => {
+      // 矢量层调抠图报「仅支持像素图层」。
+      const created = Engine.newDocument(64, 48, 'cutout-shape');
+      const docId: number = created.id;
+      try {
+        const out = Engine.vectorPathCreate(docId, '{}');
+        const message: string = caughtMessage(() => {
+          Engine.cutoutRemoveBackground(docId, out.layerId, true);
+        });
+        expect(message.indexOf('像素图层') >= 0).assertTrue();
+      } finally {
+        Engine.close(docId);
+      }
+    });
+
+    it('cutoutUnknownDocumentThrows', 0, () => {
+      const created = Engine.newDocument(64, 48, 'cutout-closed');
+      const docId: number = created.id;
+      Engine.close(docId);
+      const message: string = caughtMessage(() => {
+        Engine.cutoutRemoveBackground(docId, 1, true);
+      });
+      expect(message.length > 0).assertTrue();
+    });
   });
 }
+

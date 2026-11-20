@@ -18,6 +18,8 @@ export interface LayerInfo {
   isGroup: boolean;
   /** 组取原生 `Group.expanded`；非组恒为 true（保证 UI 统一消费） */
   expanded: boolean;
+  /** 内容包围盒 [x0,y0,x1,y1]（`transform_content_bounds` 口径；空层/未栅格化为空数组）。 */
+  contentBounds?: number[];
   children: LayerInfo[];
 }
 
@@ -234,6 +236,17 @@ interface InfoResponse {
   data: DocumentInfo;
 }
 
+/** `pc_document_turn` 的响应把文档元数据包在 `data.info` 内（与 undo/redo 不同）。 */
+interface TurnPayload {
+  info: DocumentInfo;
+}
+
+interface TurnResponse {
+  ok: boolean;
+  error: string;
+  data: TurnPayload;
+}
+
 interface AdjustmentResponse {
   ok: boolean;
   error: string;
@@ -273,6 +286,19 @@ interface ShapeResponse {
   ok: boolean;
   error: string;
   data: ShapeOutcome;
+}
+
+/** D2 智能抠图结果：非破坏性蒙版已挂到图层，bounds 为主体外接框。 */
+export interface CutoutOutcome {
+  layer: number;
+  bounds: number[];
+  info: DocumentInfo;
+}
+
+interface CutoutResponse {
+  ok: boolean;
+  error: string;
+  data: CutoutOutcome;
 }
 
 export interface LayerOutcome {
@@ -457,6 +483,7 @@ function normalizeLayer(raw: LayerInfo): LayerInfo {
     depth: raw.depth,
     isGroup: raw.isGroup,
     expanded: raw.expanded ?? true,
+    contentBounds: raw.contentBounds ?? [],
     children: (raw.children ?? []).map((child: LayerInfo) => normalizeLayer(child))
   };
 }
@@ -607,11 +634,11 @@ export class Engine {
   }
 
   static documentTurn(documentId: number, turn: number): DocumentInfo {
-    const parsed = JSON.parse(native.documentTurn(documentId, turn)) as InfoResponse;
+    const parsed = JSON.parse(native.documentTurn(documentId, turn)) as TurnResponse;
     if (!parsed.ok) {
       throw new Error(parsed.error);
     }
-    return normalizeInfo(parsed.data);
+    return normalizeInfo(parsed.data.info);
   }
 
   static history(documentId: number): HistoryLabels {
@@ -725,6 +752,63 @@ export class Engine {
     }
     const d = parsed.data;
     return { layerId: d.layerId, info: normalizeInfo(d.info) };
+  }
+
+  // ──────────────────────────────────────────────────────────────────────
+  // A1 矢量绘图（1.2.0）
+  // ──────────────────────────────────────────────────────────────────────
+  static vectorPathCreate(documentId: number, paramsJson: string): ShapeOutcome {
+    const parsed = JSON.parse(native.vectorPathCreate(documentId, paramsJson)) as ShapeResponse;
+    if (!parsed.ok) {
+      throw new Error(parsed.error);
+    }
+    const d = parsed.data;
+    return { layerId: d.layerId, info: normalizeInfo(d.info) };
+  }
+
+  static vectorPathEdit(documentId: number, paramsJson: string): DocumentInfo {
+    const parsed = JSON.parse(native.vectorPathEdit(documentId, paramsJson)) as InfoResponse;
+    if (!parsed.ok) {
+      throw new Error(parsed.error);
+    }
+    return normalizeInfo(parsed.data);
+  }
+
+  static vectorPathRasterize(documentId: number, paramsJson: string): DocumentInfo {
+    const parsed = JSON.parse(native.vectorPathRasterize(documentId, paramsJson)) as InfoResponse;
+    if (!parsed.ok) {
+      throw new Error(parsed.error);
+    }
+    return normalizeInfo(parsed.data);
+  }
+
+  /** 矢量路径转选区（返回原始 selection 状态 JSON，由调用方解析）。 */
+  static vectorPathToSelection(documentId: number, layerId: number, mode: string = 'replace', feather: number = 0): SelectionInfo {
+    const params = JSON.stringify({ layer: layerId, mode: mode, feather: feather });
+    const parsed = JSON.parse(native.vectorPathToSelection(documentId, params)) as SelectionResponse;
+    if (!parsed.ok) {
+      throw new Error(parsed.error);
+    }
+    const d = parsed.data;
+    return {
+      active: d.active ?? false,
+      x0: d.x0 ?? 0,
+      y0: d.y0 ?? 0,
+      x1: d.x1 ?? 0,
+      y1: d.y1 ?? 0
+    };
+  }
+
+  // ──────────────────────────────────────────────────────────────────────
+  // D2 智能抠图（1.2.0，传统算法纯离线）
+  // ──────────────────────────────────────────────────────────────────────
+  static cutoutRemoveBackground(documentId: number, layerId: number, refine: boolean = true): CutoutOutcome {
+    const params = JSON.stringify({ layer: layerId, refine: refine });
+    const parsed = JSON.parse(native.cutoutRemoveBackground(documentId, params)) as CutoutResponse;
+    if (!parsed.ok) {
+      throw new Error(parsed.error);
+    }
+    return { layer: parsed.data.layer, bounds: parsed.data.bounds, info: normalizeInfo(parsed.data.info) };
   }
 
   static layerEditGet(documentId: number, layerId: number): LayerEditInfo {

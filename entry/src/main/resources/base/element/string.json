@@ -2,15 +2,39 @@
   "string": [
     {
       "name": "module_desc",
-      "value": "PhotoCraft 图像编辑器"
+      "value": "ArtsPhoto 图像编辑器"
     },
     {
       "name": "EntryAbility_desc",
-      "value": "PhotoCraft 图像编辑器"
+      "value": "ArtsPhoto 图像编辑器"
     },
     {
       "name": "EntryAbility_label",
-      "value": "PhotoCraft"
+      "value": "ArtsPhoto"
+    },
+    {
+      "name": "quick_open_card_name",
+      "value": "ArtsPhoto 快捷入口"
+    },
+    {
+      "name": "quick_open_card_desc",
+      "value": "ArtsPhoto 服务卡片：打开示例图 / 新建文档"
+    },
+    {
+      "name": "recent_docs_card_name",
+      "value": "ArtsPhoto 最近文档"
+    },
+    {
+      "name": "recent_docs_card_desc",
+      "value": "ArtsPhoto 服务卡片：快速打开最近编辑的文档"
+    },
+    {
+      "name": "quick_create_card_name",
+      "value": "ArtsPhoto 快速新建"
+    },
+    {
+      "name": "quick_create_card_desc",
+      "value": "ArtsPhoto 服务卡片：一键新建空白文档"
     }
   ]
 }

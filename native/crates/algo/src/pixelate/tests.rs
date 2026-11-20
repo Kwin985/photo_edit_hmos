@@ -38,6 +38,11 @@ fn fixture(rect: Rect, ctx: &Ctx, pattern: u32) -> Image {
 fn assert_bits(got: &[f32], want: &[f32]) {
     assert_eq!(got.len(), want.len());
     for (i, (a, b)) in got.iter().zip(want).enumerate() {
+        // NaN 的符号位没有语义（fixture 注入 NaN/Inf 后，Inf-Inf 与 NaN 传播产生
+        // 不同的 quiet/负 NaN 位模式），只要求两边同为 NaN；其余样本仍逐位比较。
+        if a.is_nan() && b.is_nan() {
+            continue;
+        }
         assert_eq!(a.to_bits(), b.to_bits(), "sample {i}: {a} != {b}");
     }
 }

@@ -1,9 +1,11 @@
 import { image } from '@kit.ImageKit';
-import { picker, fileIo } from '@kit.CoreFileKit';
-import { font, promptAction } from '@kit.ArkUI';
+import { picker, fileIo, fileUri } from '@kit.CoreFileKit';
+import { font, promptAction, router } from '@kit.ArkUI';
 import { hilog } from '@kit.PerformanceAnalysisKit';
-import { preferences } from '@kit.ArkData';
-import { Engine, DocumentInfo, LayerInfo, AdjustmentInfo, SelectionInfo, emptyAdjustment, flattenLayers, LayerEffectInfo, LayerEffectsInfo, FxGradientInfo, FxGradientStop, LayerEditInfo, LayerMaskInfo, GuidesInfo } from '../engine/Engine';
+import { preferences, uniformTypeDescriptor as utd } from '@kit.ArkData';
+import { bundleManager, common } from '@kit.AbilityKit';
+import { systemShare } from '@kit.ShareKit';
+import { Engine, DocumentInfo, LayerInfo, AdjustmentInfo, SelectionInfo, emptyAdjustment, flattenLayers, LayerEffectInfo, LayerEffectsInfo, FxGradientInfo, FxGradientStop, LayerEditInfo, LayerMaskInfo, GuidesInfo, CutoutOutcome } from '../engine/Engine';
 
 const COLOR_ROOT: string = '#0a0b0d';
 const COLOR_CANVAS: string = '#101216';
@@ -31,16 +33,19 @@ const COLOR_TYPE_ACCENT: string = '#84cc16';
 const BRUSH_COLORS: string[] = ['#ffffff', '#111827', '#e5484d', '#f5a524', '#30a46c', '#3b82f6', '#8b5cf6'];
 
 // 首选项存储（R2）：单实例名 + 四个键，读写全部走同步 API 并静默失败。
-const PREFS_NAME: string = 'photocraft_prefs';
+const PREFS_NAME: string = 'artsphoto_prefs';
 const PREF_KEY_RULERS: string = 'rulers';
 const PREF_KEY_GRID_SIZE: string = 'gridSize';
 const PREF_KEY_GUIDES: string = 'guides';
 const PREF_KEY_DEFAULT_ZOOM: string = 'defaultZoom';
 
+
 const PERF_DOMAIN: number = 0x0A01;
 const PERF_TAG: string = 'PERF';
 const MIN_ZOOM: number = 0.1;
 const MAX_ZOOM: number = 16;
+/** 钢笔工具按下后判定为拖拽控制柄的最小位移平方阈值（vp²），避免点击误判为拖拽。 */
+const PEN_DRAG_THRESHOLD_SQ: number = 64; // 8vp 阈值
 const DETAIL_DELAY_MS: number = 140;
 const MAX_DETAIL_PIXELS: number = 8000000;
 const DETAIL_MARGIN: number = 0.12;
@@ -280,6 +285,8 @@ const BLEND_OPTIONS: BlendOption[] = [
 @Entry
 @Component
 struct Index {
+  @StorageProp('quickAction') quickAction: string = '';
+  @StorageProp('recentFiles') recentFiles: string[] = [];
   @State docId: number = 0;
   @State info: DocumentInfo | undefined = undefined;
   @State layers: LayerInfo[] = [];
@@ -310,6 +317,17 @@ struct Index {
   @State layerThumb: image.PixelMap | undefined = undefined;
   @State layerThumbVersion: number = 0;
   @State tool: string = 'pan';
+  // A1 矢量绘图：钢笔工具状态（1.2.0）
+  @State penPathSubpaths: number[] = [];        // 每个子路径的终止 flat index（钢笔按点构建）
+  @State penPathKnots: number[] = [];         // [x, y, inX, inY, outX, outY, smooth(0/1)] 平展数组
+  @State penActiveSubpath: number = -1;       // 当前正在绘制的 subpath 索引，-1 = 无
+  @State penPendingKnot: number = -1;         // 待放置的下一个锚点（-1 = 无）
+  @State penDraggingCtrl: boolean = false;    // 是否正在拖拽控制柄
+  @State penCtrlKnotIndex: number = -1;       // 被拖拽控制柄的锚点索引
+  @State penCtrlSide: string = 'out';         // 'in' | 'out'
+  @State penPathLayerId: number = 0;          // 钢笔路径图层 id（由 vectorPathCreate 返回）
+  private penDownX: number = 0;                 // 钢笔按下坐标（判定拖拽控制柄用，不驱动 UI）
+  private penDownY: number = 0;
   @State brushSize: number = 24;
   @State brushHardness: number = 80;
   @State brushOpacity: number = 100;
@@ -344,7 +362,7 @@ struct Index {
   @State shapeStrokeWidth: number = 0;
   @State shapeRadius: number = 0;
   @State shapeLineWidth: number = 12;
-  @State textContent: string = 'PhotoCraft';
+  @State textContent: string = 'ArtsPhoto';
   @State textSize: number = 48;
   @State textColor: string = '#ffffff';
   @State textFontFamily: string = 'Inter';
@@ -452,6 +470,8 @@ struct Index {
   @State historyOpen: boolean = false;
   @State historyUndo: string[] = [];
   @State historyRedo: string[] = [];
+
+  @State appVersion: string = '1.0.0';
 
   private brushSettings: RenderingContextSettings = new RenderingContextSettings(true);
   private brushCtx: CanvasRenderingContext2D = new CanvasRenderingContext2D(this.brushSettings);
@@ -1073,16 +1093,25 @@ struct Index {
   // ===== 画布变换手势（C-TRANSFORM-GESTURE@1）=====
   // 红线：trBeginDrag / trUpdateDrag / trEndDrag / drawTransformOverlay 内零引擎调用、零 checkpoint；
   // 只有 trApply 允许一次 layerTransform 写调用，只有 trCancel 允许 refreshPreview/scheduleDetail。
-  // 变换框 = 图层内容包围盒的近似：LayerInfo 只有 id/name/kind，不含内容尺寸，原生 bounds 仅在提交后返回，
-  // 因此进入时以文档 bounds 作为初始框（提交时由引擎按真实内容作用），不读不到数据就放弃。
+  // 变换框 = 图层内容包围盒：LayerInfo 现含 contentBounds（pc_info 经 layer_json 输出，
+  // transform_content_bounds 口径：组取画板/子层并集，非组取 surface.content_bounds）。
+  // 选中层有内容 bounds 时用作初始框（中心=内容中心）；无内容 bounds 回退文档 bounds。
 
   // 启用条件：有文档、非忙、选中图层类型支持变换（与面板 trSupported 同源门控）。
   private trEnabled(): boolean {
     return this.docId !== 0 && !this.busy && this.trSupported();
   }
 
-  // 变换框（文档坐标，左/上/右/下）。
+  // 变换框（文档坐标，左/上/右/下）：选中层有内容 bounds 时用作初始框（中心=内容中心），
+  // 无内容 bounds（空层/未栅格化）回退文档 bounds。
   private trRect(): number[] {
+    const row = this.layerRowById(this.selectedLayerId);
+    if (row !== undefined) {
+      const b = row.contentBounds;
+      if (b !== undefined && b.length >= 4 && b[2] > b[0] && b[3] > b[1]) {
+        return [b[0], b[1], b[2], b[3]];
+      }
+    }
     const info = this.info;
     if (info === undefined) {
       return [0, 0, 0, 0];
@@ -1636,6 +1665,33 @@ struct Index {
     this.initTextFont();
     // 首选项在既有初始化之后读取：读不到时保持默认值，不影响字体/渲染初始化。
     this.loadPrefs();
+    this.loadAppVersion();
+    this.handleQuickAction();
+  }
+
+  onPageShow(): void {
+    this.loadAppVersion();
+    this.handleQuickAction();
+  }
+
+  /** insightIntent 分发：EntryAbility 已将意图名映射为 quickAction 存入 AppStorage，此处消费并清除 */
+  private handleQuickAction(): void {
+    const action = this.quickAction;
+    if (action.length === 0) {
+      return;
+    }
+    if (action === 'newDocument') {
+      this.newDocument();
+    } else if (action === 'openSample') {
+      this.openSample();
+    } else if (action === 'openRecent') {
+      // 任务 2.2 / 1.3.0：打开最近编辑 — 打开最近保存的最近文件
+      this.openRecent();
+    } else if (action === 'continueLast') {
+      // 任务 2.2：继续上次编辑 — 当前无持久化最近文档，降级为新建文档
+      this.newDocument();
+    }
+    AppStorage.setOrCreate<string>('quickAction', '');
   }
 
   private async initTextFont(): Promise<void> {
@@ -1655,7 +1711,20 @@ struct Index {
         }
       }
       if (target === '') {
-        this.status = '文字：未找到系统中文字体，使用内置字体（中文可能缺失）';
+        // D4：真机无中文字体时注册内置 CJK 字体（rawfile/NotoSansCJKsc.otf），避免纹理文字缺字。
+        // 模拟器有系统字体不会走此分支；正式版不因字体探测覆盖状态栏。
+        try {
+          const raw = getContext(this).resourceManager.getRawFileContentSync('NotoSansCJKsc.otf');
+          const buf = raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength) as ArrayBuffer;
+          const families = Engine.fontRegister(buf);
+          if (families.length > 0) {
+            this.textFontFamily = families[0];
+            this.textFontName = families[0];
+            this.textFontReady = true;
+          }
+        } catch (e) {
+          this.textFontName = '内置字体';
+        }
         return;
       }
       const info = font.getFontByName(target);
@@ -1788,9 +1857,90 @@ struct Index {
       if (outcome.warnings.length > 0) {
         promptAction.showToast({ message: outcome.warnings.join('\n'), duration: 4000 });
       }
+      this.saveRecentFile(uri);
     } catch (err) {
       this.status = '打开失败：' + this.messageOf(err as Object);
       promptAction.showToast({ message: '打开失败：' + this.messageOf(err as Object) });
+    } finally {
+      this.busy = false;
+    }
+  }
+
+  /** 保存最近文档路径（L1 缓存，最多 5 项，按最近访问排序） */
+  /** 提取文件名（不含扩展名），用于最近文档列表展示 */
+  private getShortName(path: string): string {
+    const idx = path.lastIndexOf('/');
+    const name = idx >= 0 ? path.substring(idx + 1) : path;
+    const extIdx = name.lastIndexOf('.');
+    return extIdx > 0 ? name.substring(0, extIdx) : name;
+  }
+
+  private saveRecentFile(path: string): void {
+    if (path.length === 0) { return; }
+    const list = this.recentFiles;
+    // 移除已存在的同名文件
+    const filtered = list.filter(p => p !== path);
+    filtered.unshift(path);
+    // 限制最多 5 项
+    this.recentFiles = filtered.slice(0, 5);
+  }
+
+  /** 打开最近编辑的文档（不弹文件选择器，直接打开最近保存路径） */
+  private async openRecent(): Promise<void> {
+    if (this.recentFiles.length === 0) {
+      this.status = '暂无最近文档';
+      return;
+    }
+    const path = this.recentFiles[0];
+    // 由于 HarmonyOS 文件选择器返回临时 URI，此处使用路径直接打开
+    // （实际生产需通过系统分享/内容 URI 服务获取稳定访问路径）
+    this.saveRecentFile(path);
+    this.openFileFromPath(path);
+  }
+
+  private async openFileFromPath(path: string): Promise<void> {
+    try {
+      this.busy = true;
+      this.status = '正在打开最近文档…';
+      if (this.docId !== 0) {
+        Engine.close(this.docId);
+        this.docId = 0;
+      }
+      // 读取文件内容（仅支持本地路径，跨设备需通过系统分享获取稳定 URI）
+      const file = fileIo.openSync(path, fileIo.OpenMode.READ_ONLY);
+      const stat = fileIo.statSync(file.fd);
+      const data = new ArrayBuffer(stat.size);
+      fileIo.readSync(file.fd, data);
+      fileIo.closeSync(file);
+
+      const name = path.substring(path.lastIndexOf('/') + 1);
+      const outcome = Engine.open(name, data);
+      this.docId = outcome.id;
+      this.info = outcome.info;
+      if (this.cropMode) { this.cropDiscard(); }
+      this.layers = flattenLayers(outcome.info.layers, 0);
+      this.selectedLayerId = 0;
+      this.layerOpacity = 100;
+      this.adjust = emptyAdjustment();
+      this.fxReset();
+      this.editReset();
+      this.trResetDraft();
+      this.cancelStroke();
+      this.cancelShape();
+      this.resetView();
+      this.applyDefaultZoom();
+      this.clearAllLayerThumbs();
+      this.loadAllLayerThumbs();
+      this.resetRenderCache();
+      this.resetRenderStats();
+      this.syncDocRevision();
+      this.syncCanvasDraft();
+      this.syncGuides();
+      await this.refreshPreview();
+      this.status = this.info.width + ' × ' + this.info.height + ' · ' + this.info.mode + ' · ' + this.info.depth;
+    } catch (err) {
+      this.status = '最近文档打开失败：' + this.messageOf(err as Object);
+      promptAction.showToast({ message: '最近文档打开失败：' + this.messageOf(err as Object) });
     } finally {
       this.busy = false;
     }
@@ -1838,6 +1988,7 @@ struct Index {
       await this.refreshPreview();
       const info = outcome.info;
       this.status = info.width + ' × ' + info.height + ' · ' + info.mode + ' · ' + info.depth;
+      this.saveRecentFile('sample.jpg');
     } catch (err) {
       this.status = '示例载入失败：' + this.messageOf(err as Object);
       promptAction.showToast({ message: '示例载入失败：' + this.messageOf(err as Object) });
@@ -2097,6 +2248,7 @@ struct Index {
       const options: image.InitializationOptions = {
         size: { width: regionW, height: regionH },
         pixelFormat: image.PixelMapFormat.RGBA_8888,
+        srcPixelFormat: image.PixelMapFormat.RGBA_8888,
         alphaType: image.AlphaType.UNPREMUL
       };
       image.createPixelMap(pixels, options).then((map: image.PixelMap) => {
@@ -2213,6 +2365,7 @@ struct Index {
       const options: image.InitializationOptions = {
         size: { width: width, height: height },
         pixelFormat: image.PixelMapFormat.RGBA_8888,
+        srcPixelFormat: image.PixelMapFormat.RGBA_8888,
         alphaType: image.AlphaType.UNPREMUL
       };
       // slice(8) 跳过 8 字节尺寸头并产生一次独立拷贝：拷贝出的字节由 previewPixels 长期持有，
@@ -2434,6 +2587,18 @@ struct Index {
       this.cancelSelect();
       this.cancelShape();
       this.status = '文字：点击画布放置文字，双指缩放';
+    } else if (tool === 'pen') {
+      this.cancelStroke();
+      this.cancelSelect();
+      this.cancelShape();
+      this.penPathSubpaths = [];
+      this.penPathKnots = [];
+      this.penActiveSubpath = -1;
+      this.penPendingKnot = -1;
+      this.penDraggingCtrl = false;
+      this.penCtrlKnotIndex = -1;
+      this.penCtrlSide = 'out';
+      this.status = '钢笔：点击画布放锚点；按住拖拽出平滑控制柄；Esc 取消';
     } else if (tool === 'move') {
       // 移动工具：不落笔、不建选区、不建形状；提示当前是否具备可移动的选中图层（R3.3 / R3.4）。
       this.cancelStroke();
@@ -2465,6 +2630,148 @@ struct Index {
     this.previewDot = false;
     this.previewDirtyW = 0;
     this.previewDirtyH = 0;
+  }
+
+  // ──────────────────────────────────────────────────────────────────────
+  // A1 矢量绘图：钢笔工具方法（1.2.0）
+  // ──────────────────────────────────────────────────────────────────────
+  private penStart(documentId: number): void {
+    if (documentId === 0) {
+      this.status = '钢笔：请先打开一张图片';
+      return;
+    }
+    try {
+      const outcome = Engine.vectorPathCreate(documentId, JSON.stringify({}));
+      this.penPathSubpaths = [0];
+      this.penPathKnots = [];
+      this.penActiveSubpath = 0;
+      this.penPendingKnot = -1;
+      this.penDraggingCtrl = false;
+      this.penCtrlKnotIndex = -1;
+      this.penCtrlSide = 'out';
+      this.penPathLayerId = outcome.layerId;
+      this.status = '钢笔：点击画布放锚点；按住拖拽出平滑控制柄；Esc 取消';
+      // 栅格化空路径，生成一张透明底层
+      Engine.vectorPathRasterize(documentId, JSON.stringify({ layerId: outcome.layerId }));
+    } catch (err) {
+      this.status = '钢笔创建失败：' + this.messageOf(err as Object);
+    }
+  }
+
+  private penAddKnot(documentId: number, x: number, y: number, isSmooth: boolean): void {
+    if (documentId === 0) { return; }
+    // R-PEN-MULTI@1：上一笔已提交（penPathLayerId 已归零）时，直接为新一笔重建路径图层，
+    // 避免带着 layerId 0 去调 vectorPathEdit（真机报「layer 0 not found」）。
+    if (this.penPathLayerId === 0) {
+      this.penStart(documentId);
+    }
+    // 若 knots 为空，先初始化 subpath 结构
+    if (this.penPathSubpaths.length === 0 || this.penPathKnots.length === 0) {
+      this.penActiveSubpath = 0;
+      this.penPathSubpaths = [0];
+    }
+    const knots = this.penPathKnots;
+    const newIdx = knots.length / 7;
+    this.penPathSubpaths[this.penActiveSubpath] = newIdx;
+    this.penPathKnots.push(x, y, x, y, x, y, isSmooth ? 1 : 0);
+    const params = JSON.stringify({
+      op: 'addAnchor',
+      layerId: this.penPathLayerId,
+      subpathIndex: this.penActiveSubpath,
+      knotIndex: newIdx,
+      anchor: [x, y]
+    });
+    try {
+      Engine.vectorPathEdit(documentId, params);
+      this.penPendingKnot = -1;
+      this.redrawCanvas();
+    } catch (err) {
+      this.status = '钢笔添加锚点失败：' + this.messageOf(err as Object);
+    }
+  }
+
+  private penSetCtrlKnot(documentId: number, knotIndex: number, side: string): void {
+    if (documentId === 0 || !this.penDraggingCtrl) { return; }
+    const knots = this.penPathKnots;
+    const idx = knotIndex * 7 + (side === 'in' ? 2 : 4);
+    if (idx + 2 >= knots.length) { return; }
+    const x = knots[idx];
+    const y = knots[idx + 1];
+    const params = JSON.stringify({
+      op: 'setCtrl',
+      // R-PEN-MULTI@1：控制柄属于钢笔草稿图层，不是当前选中图层（此前误用
+      // selectedLayerId，真机上会命中像素层报「layer is not a vector/shape layer」）。
+      layerId: this.penPathLayerId,
+      subpathIndex: 0,
+      knotIndex,
+      inCtrl: side === 'in' ? [x, y] : this.penPathKnots[knotIndex * 7],
+      outCtrl: side === 'out' ? [x, y] : this.penPathKnots[knotIndex * 7 + 3]
+    });
+    try {
+      Engine.vectorPathEdit(documentId, params);
+      this.redrawCanvas();
+    } catch (err) {
+      this.status = '钢笔设置控制柄失败：' + this.messageOf(err as Object);
+    }
+  }
+
+  private penCommit(documentId: number): void {
+    if (documentId === 0 || this.penPathLayerId === 0) { return; }
+    const knots = this.penPathKnots;
+    if (knots.length === 0) { return; }
+    // 路径数据已在每次 penAddKnot 时通过 vectorPathEdit 提交到引擎；
+    // 这里只做一次最终栅格化，刷新预览并归零路径状态。
+    try {
+      Engine.vectorPathRasterize(documentId, JSON.stringify({ layerId: this.penPathLayerId }));
+      const committedLayerId = this.penPathLayerId;
+      this.penPathSubpaths = [];
+      this.penPathKnots = [];
+      this.penActiveSubpath = -1;
+      this.penPendingKnot = -1;
+      this.penDraggingCtrl = false;
+      this.penCtrlKnotIndex = -1;
+      this.penCtrlSide = 'out';
+      this.penPathLayerId = 0;
+      // R-PEN-MULTI@1：刷新图层列表并选中新路径图层，让「路径转选区」可以直接使用
+      // （此前该层不出现在列表里且不选中，按钮守卫直接静默返回）。
+      if (this.refreshLayersOnly()) {
+        const row = this.layerRowById(committedLayerId);
+        if (row !== undefined) {
+          this.selectLayer(row);
+        }
+      }
+      this.status = '钢笔：路径已完成（已选中路径图层，可转选区）';
+    } catch (err) {
+      this.status = '钢笔提交失败：' + this.messageOf(err as Object);
+    }
+  }
+
+  private penCancel(): void {
+    this.penPathSubpaths = [];
+    this.penPathKnots = [];
+    this.penActiveSubpath = -1;
+    this.penPendingKnot = -1;
+    this.penDraggingCtrl = false;
+    this.penCtrlKnotIndex = -1;
+    this.penCtrlSide = 'out';
+    this.status = '钢笔：已取消';
+  }
+
+  // 把当前选中的矢量图层路径转成选区（D1，可继续用画笔/滤镜编辑）。
+  private async penPathToSelection(): Promise<void> {
+    if (this.docId === 0 || this.selectedLayerId === 0 || this.selectedLayerKind() !== 'Shape') {
+      return;
+    }
+    const layerId = this.selectedLayerId;
+    try {
+      const beforeRev = Engine.revision(this.docId);
+      const sel = Engine.vectorPathToSelection(this.docId, layerId, 'replace', 0);
+      await this.afterEdit();
+      this.status = '路径已转选区：' + (sel.active ? '有效' : '空') +
+        ' rev=' + beforeRev + '->' + Engine.revision(this.docId);
+    } catch (err) {
+      this.status = '路径转选区失败：' + this.messageOf(err as Object);
+    }
   }
 
   private clearPreviewDirty(): void {
@@ -2620,6 +2927,12 @@ struct Index {
       this.selectionFrameDrawn = false;
       return;
     }
+    // 钢笔路径预览：pen 工具激活且有锚点时画路径/控制柄，不走下方早退。
+    if (this.tool === 'pen' && this.penPathKnots.length > 0) {
+      this.clearBrushPreview();
+      this.drawPenPathPreview();
+      return;
+    }
     // 早退条件：无选区、上一帧也没画过选区框、网格关闭、没有可见参考线且标尺关闭时，没有任何叠加层可画（V2）。
     // 保留 selectionFrameDrawn 的判定：选区被清除时仍要靠这里清屏，否则旧选区框会残留在画布上。
     // 参考线为空时同样早退：showGuides 默认开启，无参考线的常见状态下不能为此每帧全屏清屏。
@@ -2643,6 +2956,72 @@ struct Index {
       this.drawRulers();
     }
     this.selectionFrameDrawn = this.selectionActive;
+  }
+
+  // 钢笔路径预览：画锚点、控制柄线、路径段（文档坐标 → 屏幕坐标）。A1 矢量绘图交互反馈。
+  private drawPenPathPreview(): void {
+    const scale = this.displayScale();
+    if (scale <= 0 || this.viewportW <= 0 || this.viewportH <= 0) {
+      return;
+    }
+    const left = this.displayLeft();
+    const top = this.displayTop();
+    const knots = this.penPathKnots;
+    if (knots.length === 0) {
+      return;
+    }
+    const ctx = this.brushCtx;
+    ctx.save();
+    // 控制柄线：锚点 → inCtrl / outCtrl（虚线琥珀色）
+    ctx.strokeStyle = '#f5a52b';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([4, 3]);
+    ctx.beginPath();
+    for (let i = 0; i < knots.length; i += 7) {
+      const ax = left + (knots[i] - this.regionX) * scale;
+      const ay = top + (knots[i + 1] - this.regionY) * scale;
+      const ix = left + (knots[i + 2] - this.regionX) * scale;
+      const iy = top + (knots[i + 3] - this.regionY) * scale;
+      const ox = left + (knots[i + 4] - this.regionX) * scale;
+      const oy = top + (knots[i + 5] - this.regionY) * scale;
+      ctx.moveTo(ax, ay);
+      ctx.lineTo(ix, iy);
+      ctx.moveTo(ax, ay);
+      ctx.lineTo(ox, oy);
+    }
+    ctx.stroke();
+    // 路径段：相邻锚点用三次贝塞尔（前 outCtrl → 后 inCtrl），实线靛蓝
+    ctx.strokeStyle = '#6366f1';
+    ctx.lineWidth = 2;
+    ctx.setLineDash([]);
+    ctx.beginPath();
+    const subpaths = this.penPathSubpaths;
+    let start = 0;
+    for (let s = 0; s < subpaths.length; s++) {
+      const end = subpaths[s];
+      if (end < start) { continue; }
+      const base = start * 7;
+      ctx.moveTo(left + (knots[base] - this.regionX) * scale, top + (knots[base + 1] - this.regionY) * scale);
+      for (let k = start + 1; k <= end; k++) {
+        const b = k * 7;
+        ctx.bezierCurveTo(
+          left + (knots[b - 3] - this.regionX) * scale, top + (knots[b - 2] - this.regionY) * scale,
+          left + (knots[b + 2] - this.regionX) * scale, top + (knots[b + 3] - this.regionY) * scale,
+          left + (knots[b] - this.regionX) * scale, top + (knots[b + 1] - this.regionY) * scale);
+      }
+      start = end + 1;
+    }
+    ctx.stroke();
+    // 锚点：实心小圆
+    ctx.fillStyle = '#6366f1';
+    for (let i = 0; i < knots.length; i += 7) {
+      const ax = left + (knots[i] - this.regionX) * scale;
+      const ay = top + (knots[i + 1] - this.regionY) * scale;
+      ctx.beginPath();
+      ctx.arc(ax, ay, 3, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
   }
 
   // 网格叠加层：按 gridSize（文档像素）换算屏幕间距，只画视口可见区。
@@ -2726,8 +3105,9 @@ struct Index {
     if (scale <= 0 || this.viewportW <= 0 || this.viewportH <= 0) {
       return;
     }
-    // 步长自适应：按候选档位取第一个屏幕间距够宽的；极端缩小时全部不满足，退回最大档避免密到糊成一片。
-    const steps: number[] = [10, 20, 50, 100, 200, 500, 1000, 2000, 5000];
+    // 步长自适应：按候选档位取第一个屏幕间距够宽的；极端缩小时全部不满足，退回最大档。
+    // 档位扩展到 100000 覆盖极小缩放；仍不够时置 extreme，只画主刻度、跳过副刻度与数字。
+    const steps: number[] = [10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000, 100000];
     let step = steps[steps.length - 1];
     for (let i = 0; i < steps.length; i++) {
       if (steps[i] * scale >= RULER_MIN_SPACING) {
@@ -2735,6 +3115,7 @@ struct Index {
         break;
       }
     }
+    const extreme = step * scale < RULER_MIN_SPACING;
     const minor = step / 5;
     const left = this.displayLeft();
     const top = this.displayTop();
@@ -2744,45 +3125,53 @@ struct Index {
     const endDocY = this.screenToDocY(this.viewportH);
     const ctx = this.brushCtx;
     ctx.save();
-    // 先铺满背景：上尺带、左尺带与左上角方格（单独填充，避免依赖前两次填充的覆盖关系）。
+    // 先铺满背景：上尺带、左尺带。缩放工具条覆盖左上角（x<=ZOOM_BAR_RIGHT, y<=ZOOM_BAR_BOTTOM），
+    // 尺带背景跳过该区域避免与悬浮工具条重叠；左上角方格在工具条区域内，不再单独填充。
     ctx.fillStyle = RULER_BG;
-    ctx.fillRect(0, 0, this.viewportW, RULER_SIZE_VP);
-    ctx.fillRect(0, 0, RULER_SIZE_VP, this.viewportH);
-    ctx.fillRect(0, 0, RULER_SIZE_VP, RULER_SIZE_VP);
+    const zoomRight = Math.min(ZOOM_BAR_RIGHT, this.viewportW);
+    const zoomBottom = Math.min(ZOOM_BAR_BOTTOM, this.viewportH);
+    if (zoomRight < this.viewportW) {
+      ctx.fillRect(zoomRight, 0, this.viewportW - zoomRight, RULER_SIZE_VP);
+    }
+    if (zoomBottom < this.viewportH) {
+      ctx.fillRect(0, zoomBottom, RULER_SIZE_VP, this.viewportH - zoomBottom);
+    }
     ctx.strokeStyle = RULER_TICK;
     ctx.lineWidth = 1;
     ctx.setLineDash([]);
-    // 副刻度：短线 4vp，跳过主刻度位置（副刻度的第 5 个就是主刻度）。
-    ctx.beginPath();
-    let mx = Math.ceil(startDocX / minor) * minor;
-    while (mx <= endDocX) {
-      if (mx % step !== 0) {
-        const sx = left + (mx - this.regionX) * scale;
-        if (sx >= RULER_SIZE_VP && sx <= this.viewportW) {
-          ctx.moveTo(sx, RULER_SIZE_VP);
-          ctx.lineTo(sx, RULER_SIZE_VP - 4);
+    // 副刻度：短线 4vp，跳过主刻度位置（副刻度的第 5 个就是主刻度）。极端缩小时跳过，避免密到糊成一片。
+    if (!extreme) {
+      ctx.beginPath();
+      let mx = Math.ceil(startDocX / minor) * minor;
+      while (mx <= endDocX) {
+        if (mx % step !== 0) {
+          const sx = left + (mx - this.regionX) * scale;
+          if (sx >= zoomRight && sx <= this.viewportW) {
+            ctx.moveTo(sx, RULER_SIZE_VP);
+            ctx.lineTo(sx, RULER_SIZE_VP - 4);
+          }
         }
+        mx += minor;
       }
-      mx += minor;
-    }
-    let my = Math.ceil(startDocY / minor) * minor;
-    while (my <= endDocY) {
-      if (my % step !== 0) {
-        const sy = top + (my - this.regionY) * scale;
-        if (sy >= RULER_SIZE_VP && sy <= this.viewportH) {
-          ctx.moveTo(RULER_SIZE_VP, sy);
-          ctx.lineTo(RULER_SIZE_VP - 4, sy);
+      let my = Math.ceil(startDocY / minor) * minor;
+      while (my <= endDocY) {
+        if (my % step !== 0) {
+          const sy = top + (my - this.regionY) * scale;
+          if (sy >= zoomBottom && sy <= this.viewportH) {
+            ctx.moveTo(RULER_SIZE_VP, sy);
+            ctx.lineTo(RULER_SIZE_VP - 4, sy);
+          }
         }
+        my += minor;
       }
-      my += minor;
+      ctx.stroke();
     }
-    ctx.stroke();
-    // 主刻度：长线 8vp，与副刻度分两次 stroke 以便使用不同线宽。
+    // 主刻度：长线 8vp，与副刻度分两次 stroke 以便使用不同线宽。极端缩小时仍画主刻度（线不糊字）。
     ctx.beginPath();
     let gx = Math.ceil(startDocX / step) * step;
     while (gx <= endDocX) {
       const sx = left + (gx - this.regionX) * scale;
-      if (sx >= RULER_SIZE_VP && sx <= this.viewportW) {
+      if (sx >= zoomRight && sx <= this.viewportW) {
         ctx.moveTo(sx, RULER_SIZE_VP);
         ctx.lineTo(sx, RULER_SIZE_VP - 8);
       }
@@ -2791,31 +3180,33 @@ struct Index {
     let gy = Math.ceil(startDocY / step) * step;
     while (gy <= endDocY) {
       const sy = top + (gy - this.regionY) * scale;
-      if (sy >= RULER_SIZE_VP && sy <= this.viewportH) {
+      if (sy >= zoomBottom && sy <= this.viewportH) {
         ctx.moveTo(RULER_SIZE_VP, sy);
         ctx.lineTo(RULER_SIZE_VP - 8, sy);
       }
       gy += step;
     }
     ctx.stroke();
-    // 数字最后画，避免被尺带背景或刻度线覆盖。
-    ctx.fillStyle = RULER_TEXT;
-    ctx.font = '9vp sans-serif';
-    let tx = Math.ceil(startDocX / step) * step;
-    while (tx <= endDocX) {
-      const sx = left + (tx - this.regionX) * scale;
-      if (sx >= RULER_SIZE_VP && sx <= this.viewportW) {
-        ctx.fillText(String(Math.round(tx)), sx + 3, 9);
+    // 数字最后画，避免被尺带背景或刻度线覆盖。极端缩小时跳过，避免文字重叠糊成一片。
+    if (!extreme) {
+      ctx.fillStyle = RULER_TEXT;
+      ctx.font = '9vp sans-serif';
+      let tx = Math.ceil(startDocX / step) * step;
+      while (tx <= endDocX) {
+        const sx = left + (tx - this.regionX) * scale;
+        if (sx >= zoomRight && sx <= this.viewportW) {
+          ctx.fillText(String(Math.round(tx)), sx + 3, 9);
+        }
+        tx += step;
       }
-      tx += step;
-    }
-    let ty = Math.ceil(startDocY / step) * step;
-    while (ty <= endDocY) {
-      const sy = top + (ty - this.regionY) * scale;
-      if (sy >= RULER_SIZE_VP && sy <= this.viewportH) {
-        ctx.fillText(String(Math.round(ty)), 3, sy + 10);
+      let ty = Math.ceil(startDocY / step) * step;
+      while (ty <= endDocY) {
+        const sy = top + (ty - this.regionY) * scale;
+        if (sy >= zoomBottom && sy <= this.viewportH) {
+          ctx.fillText(String(Math.round(ty)), 3, sy + 10);
+        }
+        ty += step;
       }
-      ty += step;
     }
     ctx.restore();
   }
@@ -3560,6 +3951,7 @@ struct Index {
       const options: image.InitializationOptions = {
         size: { width: width, height: height },
         pixelFormat: image.PixelMapFormat.RGBA_8888,
+        srcPixelFormat: image.PixelMapFormat.RGBA_8888,
         alphaType: image.AlphaType.UNPREMUL
       };
       const next = await image.createPixelMap(bytes.slice(8), options);
@@ -3703,7 +4095,13 @@ struct Index {
       await this.refreshPreview();
       this.status = delta > 1 ? '图层已置顶' : (delta === 1 ? '图层已上移' : (delta < -1 ? '图层已置底' : '图层已下移'));
     } catch (err) {
-      this.status = '排序失败：' + this.messageOf(err as Object);
+      const message = this.messageOf(err as Object);
+      // 已在边界时引擎返回 fail（零副作用）；把英文原文翻译成操作提示。
+      if (message.indexOf('already at the edge') >= 0) {
+        this.status = delta > 0 ? '图层已在顶部' : '图层已在底部';
+      } else {
+        this.status = '排序失败：' + message;
+      }
     }
   }
 
@@ -4005,7 +4403,10 @@ struct Index {
       return;
     }
     try {
-      Engine.layerGroup(this.docId, ids, this.nextGroupName());
+      const outcome = Engine.layerGroup(this.docId, ids, this.nextGroupName());
+      this.selectedLayerId = outcome.groupId;
+      this.editReset();
+      this.maskReset();
       await this.afterEdit();
       this.status = '已创建组（' + ids.length + ' 个图层）';
     } catch (err) {
@@ -4599,6 +5000,34 @@ struct Index {
     return kind === 'Pixel' || kind === 'Shape' || kind === 'Type';
   }
 
+  // D2 智能抠图仅支持像素图层（Rust 侧同约束，UI 先置灰避免无效调用）。
+  private maskRasterSupported(): boolean {
+    return this.selectedLayerId !== 0 && this.selectedLayerKind() === 'Pixel';
+  }
+
+  // 智能抠图：调用离线 Select Subject + 边缘细化生成非破坏性蒙版，成功后统一走 afterEdit。
+  private async smartCutout(): Promise<void> {
+    if (!this.maskRasterSupported() || this.docId === 0) {
+      return;
+    }
+    const layerId = this.selectedLayerId;
+    try {
+      const startedAt = Date.now();
+      const beforeRev = Engine.revision(this.docId);
+      const out: CutoutOutcome = Engine.cutoutRemoveBackground(this.docId, layerId, true);
+      const afterRev = Engine.revision(this.docId);
+      this.perf('cutout rev=' + beforeRev + '->' + afterRev +
+        ' calls=1 ms=' + (Date.now() - startedAt) +
+        ' bounds=' + out.bounds.join(','));
+      await this.afterEdit();
+      this.loadMask(layerId);
+      this.status = '已抠出主体（非破坏性蒙版，可撤销）';
+    } catch (err) {
+      this.status = '智能抠图失败：' + this.messageOf(err as Object);
+      this.loadMask(layerId);
+    }
+  }
+
   // 回落空状态：切层 / 撤销 / 重做 / 读取失败时调用（不写文档）。
   private maskReset(): void {
     this.maskInfo = { present: false, enabled: true, linked: true, density: 1, feather: 0 };
@@ -4751,15 +5180,24 @@ struct Index {
     this.trDy = 0;
   }
 
-  // 内容包围盒摘要（§3.3）：选中层取自 this.layers 的扁平列表（layerRowById）。
-  // LayerInfo 只有 id/name/kind 等，不含内容宽高，原生 bounds 也仅在提交后返回，
-  // 因此无尺寸信息时按契约显示 —。
+  // 内容包围盒摘要（§3.3）：LayerInfo 现含 contentBounds（pc_info 经 layer_json 输出，
+  // transform_content_bounds 口径：组取画板/子层并集，非组取 surface.content_bounds）。
+  // 有真实尺寸时显示 W × H；空层/未栅格化回退「内容 —」。
   private trBoundsLabel(): string {
     const row = this.layerRowById(this.selectedLayerId);
     if (row === undefined) {
       return '内容 —';
     }
-    return '内容 —';
+    const b = row.contentBounds;
+    if (b === undefined || b.length < 4) {
+      return '内容 —';
+    }
+    const w = Math.round(b[2] - b[0]);
+    const h = Math.round(b[3] - b[1]);
+    if (w <= 0 || h <= 0) {
+      return '内容 —';
+    }
+    return w + ' × ' + h;
   }
 
   // 唯一提交入口（§3.4）：相对当前状态提交一次；成功后草稿归零，失败保留草稿。
@@ -5764,7 +6202,13 @@ struct Index {
       Engine.updateAdjustment(this.docId, this.selectedLayerId, params);
       this.afterEdit();
     } catch (err) {
-      this.status = this.messageOf(err as Object);
+      const message = this.messageOf(err as Object);
+      // 选中层切走后调整滑块仍可拖动：引擎对该层返回 fail（零副作用），给出可操作的提示。
+      if (message.indexOf('not an adjustment layer') >= 0) {
+        this.status = '请先在图层列表选中调整图层';
+      } else {
+        this.status = message;
+      }
     }
   }
 
@@ -5848,7 +6292,7 @@ struct Index {
       this.busy = true;
       const bytes = Engine.exportImage(this.docId, this.exportFormat, this.exportQuality);
       const options = new picker.DocumentSaveOptions();
-      options.newFileNames = ['photocraft-' + Date.now() + '.' + this.exportFormat];
+      options.newFileNames = ['artsphoto-' + Date.now() + '.' + this.exportFormat];
       const uris = await new picker.DocumentViewPicker(getContext(this)).save(options);
       if (uris.length === 0) {
         return;
@@ -5868,6 +6312,55 @@ struct Index {
 
   private formatLabel(format: string): string {
     return format.toUpperCase();
+  }
+
+  // D3 近场文件流转（经系统分享面板，含 Huawei Share 近场设备；不经公网、零权限）。
+  // 导出当前文档到应用沙箱临时文件，再把文件 URI 交给系统分享面板；本应用不访问网络。
+  private async nearFieldShare(): Promise<void> {
+    if (this.docId === 0) {
+      promptAction.showToast({ message: '请先打开一张图片' });
+      return;
+    }
+    try {
+      this.busy = true;
+      const format = this.exportFormat === 'psd' ? 'png' : this.exportFormat;
+      const bytes = Engine.exportImage(this.docId, format, this.exportQuality);
+      const ctx = getContext(this) as common.UIAbilityContext;
+      const dir = ctx.filesDir + '/share';
+      try {
+        fileIo.mkdirSync(dir);
+      } catch (_) {
+        // 目录已存在：忽略。
+      }
+      const path = dir + '/artsphoto-' + Date.now() + '.' + format;
+      const file = fileIo.openSync(path, fileIo.OpenMode.READ_WRITE | fileIo.OpenMode.CREATE | fileIo.OpenMode.TRUNC);
+      fileIo.writeSync(file.fd, bytes);
+      fileIo.closeSync(file);
+
+      const utdType = format === 'png' ? utd.UniformDataType.PNG :
+        (format === 'jpeg' || format === 'jpg') ? utd.UniformDataType.JPEG : utd.UniformDataType.FILE;
+      const data = new systemShare.SharedData({ utd: utdType, uri: fileUri.getUriFromPath(path) });
+      const controller = new systemShare.ShareController(data);
+      controller.on('dismiss', () => {
+        try {
+          fileIo.unlinkSync(path);
+        } catch (_) {
+          // 已删除或不可删：忽略。
+        }
+      });
+      const uiContext: UIContext = this.getUIContext();
+      const abilityContext = uiContext.getHostContext() as common.UIAbilityContext;
+      await controller.show(abilityContext, {
+        previewMode: systemShare.SharePreviewMode.DEFAULT,
+        selectionMode: systemShare.SelectionMode.SINGLE
+      });
+      this.status = '已打开系统分享（近场传输由系统完成，不经公网）';
+    } catch (err) {
+      this.status = '近场分享失败：' + this.messageOf(err as Object);
+      promptAction.showToast({ message: this.status });
+    } finally {
+      this.busy = false;
+    }
   }
 
   private barEnabled(kind: string): boolean {
@@ -5901,10 +6394,18 @@ struct Index {
   @Builder
   TopBar() {
     Row() {
-      Text('PhotoCraft')
-        .fontSize(17)
-        .fontWeight(FontWeight.Bold)
-        .fontColor(COLOR_TEXT)
+      Column({ space: 2 }) {
+        Text('ArtsPhoto')
+          .fontSize(17)
+          .fontWeight(FontWeight.Bold)
+          .fontColor(COLOR_TEXT)
+          .onClick(() => {
+            this.openLegal();
+          })
+        Text('零权限 · 纯本地处理 · 不收集信息')
+          .fontSize(10)
+          .fontColor(COLOR_MUTED)
+      }
       Text(this.info?.name ?? '图像编辑器')
         .fontSize(11)
         .fontColor(COLOR_MUTED)
@@ -5912,20 +6413,32 @@ struct Index {
         .maxLines(1)
         .textOverflow({ overflow: TextOverflow.Ellipsis })
         .layoutWeight(1)
-      Row({ space: 8 }) {
-        this.BarButton('打开', 'open', () => {
-          this.openFile();
-        })
-        this.BarButton('撤销', 'undo', () => {
-          this.undo();
-        })
-        this.BarButton('重做', 'redo', () => {
-          this.redo();
-        })
-        this.BarButton('导出', 'export', () => {
-          this.exportImage();
-        })
+      // 真机（360vp 宽）验证发现 5 个按钮总宽超出行宽，「近场分享」被推出屏外不可达；
+      // 改为横向 Scroll 兜底：空间不足时可左右滑动触达全部按钮（R-BAR-SCROLL@1）。
+      Scroll() {
+        Row({ space: 8 }) {
+          this.BarButton('打开', 'open', () => {
+            this.openFile();
+          })
+          this.BarButton('撤销', 'undo', () => {
+            this.undo();
+          })
+          this.BarButton('重做', 'redo', () => {
+            this.redo();
+          })
+          this.BarButton('导出', 'export', () => {
+            this.exportImage();
+          })
+          this.BarButton('近场分享', 'share', () => {
+            this.nearFieldShare();
+          })
+        }
       }
+      .scrollable(ScrollDirection.Horizontal)
+      .edgeEffect(EdgeEffect.None)
+      .scrollBar(BarState.Off)
+      .constraintSize({ minWidth: 0 })
+      .flexShrink(1)
     }
     .width('100%')
     .height(54)
@@ -5972,6 +6485,12 @@ struct Index {
             .borderRadius(10)
             .onClick(() => {
               this.openSample();
+            })
+          Text('隐私政策 · 用户协议')
+            .fontSize(11)
+            .fontColor('#6f8aa6')
+            .onClick(() => {
+              this.openLegal();
             })
           // 新建空白文档（file.new）：宽高只写草稿，点击按钮才提交引擎。
           Row({ space: 8 }) {
@@ -6266,6 +6785,57 @@ struct Index {
         } else if (event.type === TouchType.Cancel) {
           this.textMultiTouch = false;
         }
+        return;
+      }
+      if (this.tool === 'pen') {
+        if (event.touches.length > 1) {
+          this.cancelStroke();
+          return;
+        }
+        if (event.type === TouchType.Down) {
+          const touch = event.touches[0];
+          this.penDownX = touch.x;
+          this.penDownY = touch.y;
+          if (this.docId !== 0) {
+            this.penAddKnot(this.docId, touch.x, touch.y, false);
+            this.penPendingKnot = this.penPathKnots.length / 7 - 1;
+          }
+        } else if (event.type === TouchType.Move) {
+          if (this.penDraggingCtrl) {
+            // 拖拽控制柄：更新控制柄位置（第一帧会重置 drag 状态，C 端由 setCtrl 调用处理）
+            const touch = event.touches[0];
+            const knotIdx = this.penCtrlKnotIndex;
+            if (knotIdx >= 0 && this.penPathKnots.length > knotIdx * 7) {
+              this.penPathKnots[knotIdx * 7 + (this.penCtrlSide === 'in' ? 2 : 4)] = touch.x;
+              this.penPathKnots[knotIdx * 7 + (this.penCtrlSide === 'out' ? 3 : 5)] = touch.y;
+              this.penSetCtrlKnot(this.docId, knotIdx, this.penCtrlSide);
+            }
+          } else if (this.penPendingKnot >= 0) {
+            // 首次移动超过阈值：把刚放的锚点转为控制柄拖拽（out 侧），符合「点击放锚点、按住拖出控制柄」。
+            const touch = event.touches[0];
+            const dx = touch.x - this.penDownX;
+            const dy = touch.y - this.penDownY;
+            if (dx * dx + dy * dy >= PEN_DRAG_THRESHOLD_SQ) {
+              this.penDraggingCtrl = true;
+              this.penCtrlKnotIndex = this.penPendingKnot;
+              this.penCtrlSide = 'out';
+              this.penPendingKnot = -1;
+              this.penPathKnots[this.penCtrlKnotIndex * 7 + 4] = touch.x;
+              this.penPathKnots[this.penCtrlKnotIndex * 7 + 5] = touch.y;
+              this.penSetCtrlKnot(this.docId, this.penCtrlKnotIndex, 'out');
+            }
+          }
+          // 未超阈值的移动：视为点击的抖动，不加点、不拖拽（等 Up 确认锚点）。
+        } else if (event.type === TouchType.Up) {
+          // R-PEN-MULTI@1：抬手不再自动提交/取消——钢笔为多次点击累积锚点的交互，
+          // 提交走 PenCard 的「路径」按钮（penCommit），取消走「取消」按钮或切换工具。
+          // 旧逻辑在每次 Up 都 commit 并把 penPathLayerId 归零，导致第二个锚点必报
+          // 「layer 0 not found」（真机 1.2.0 验证发现）。
+          this.penPendingKnot = -1;
+        } else if (event.type === TouchType.Cancel) {
+          this.penCancel();
+        }
+
         return;
       }
       if (event.type === TouchType.Down) {
@@ -6803,6 +7373,24 @@ struct Index {
   private prefsSummaryLabel(): string {
     const zoom = this.defaultZoom === 'oneToOne' ? '1:1' : '适应';
     return '标尺' + (this.showRulers ? '开' : '关') + ' · 网格 ' + this.gridSize + ' · ' + zoom;
+  }
+
+
+  private loadAppVersion(): void {
+    try {
+      const info = bundleManager.getBundleInfoForSelfSync(bundleManager.BundleFlag.GET_BUNDLE_INFO_DEFAULT);
+      if (info.versionName.length > 0) {
+        this.appVersion = info.versionName;
+      }
+    } catch (err) {
+      // 读取失败保留默认版本号，不影响主流程。
+    }
+  }
+
+
+  private openLegal(): void {
+    router.pushUrl({ url: 'pages/LegalPage' }).catch(() => {
+    });
   }
 
   // 首选项读取（R2）：先全部读进局部变量，四项都成功后才落到 @State，
@@ -8277,6 +8865,26 @@ struct Index {
 
       if (this.maskOpen) {
         Column({ space: 6 }) {
+          // D2 智能抠图（1.2.0，传统算法纯离线）：一键 Select Subject + 边缘细化 → 蒙版。
+          // 仅像素图层可用；结果写入非破坏性蒙版，可撤销，无网络权限。
+          Row({ space: 8 }) {
+            Text('智能抠图')
+              .fontSize(10)
+              .fontColor('#b7c9dd')
+              .width(52)
+            Button('抠出主体')
+              .fontSize(10)
+              .height(28)
+              .layoutWeight(1)
+              .backgroundColor('#234a5e')
+              .fontColor('#d8f2ff')
+              .enabled(this.docId !== 0 && this.selectedLayerId !== 0 && this.maskRasterSupported())
+              .onClick(() => {
+                this.smartCutout();
+              })
+          }
+          .width('100%')
+
           // D3：选区行按契约置于状态/添加行之前（恒显示，C-MASK-UI@1 §E/§G）。
           this.MaskSelectionRow()
 
@@ -9556,6 +10164,17 @@ struct Index {
         this.ShapeChip('矩形', 'rect')
         this.ShapeChip('椭圆', 'ellipse')
         this.ShapeChip('直线', 'line')
+        Text('钢笔')
+          .fontSize(11)
+          .fontColor(this.tool === 'pen' ? '#0d1a14' : '#94a3b8')
+          .height(28)
+          .padding({ left: 12, right: 12 })
+          .backgroundColor(this.tool === 'pen' ? COLOR_SHAPE_ACCENT : '#22352b')
+          .borderRadius(7)
+          .onClick(() => {
+            this.tool = 'pen';
+            this.penStart(this.docId);
+          })
       }
       .width('100%')
 
@@ -9785,7 +10404,8 @@ struct Index {
       if (this.adjust.type === 'brightnessContrast') {
         Row({ space: 8 }) {
           Text('亮度').fontSize(11).fontColor('#b9a9e0').width(52)
-          Slider({ value: this.adjust.brightness, min: -100, max: 100, step: 1 })
+          // 引擎 modern_brightness 有效范围 [-150, 150]（tone.rs:144），原 -100..100 偏小。
+          Slider({ value: this.adjust.brightness, min: -150, max: 150, step: 1 })
             .layoutWeight(1)
             .onChange((value: number, mode: SliderChangeMode) => {
               this.adjust = this.adjustWith({ brightness: value });
@@ -9980,6 +10600,125 @@ struct Index {
   }
 
   @Builder
+  PenCard() {
+    Column() {
+      Row({ space: 8 }) {
+        Column()
+          .width(4)
+          .height(18)
+          .backgroundColor('#6366f1')
+          .borderRadius(2)
+        Text('钢笔')
+          .fontSize(14)
+          .fontWeight(FontWeight.Bold)
+          .fontColor('#cbd5e1')
+        Text('路径/线段')
+          .fontSize(10)
+          .fontColor('#94a3b8')
+          .layoutWeight(1)
+      }
+      .width('100%')
+      .margin({ bottom: 10 })
+      Row({ space: 8 }) {
+        Text('按点构建')
+          .fontSize(11)
+          .fontColor(this.tool === 'pan' ? '#64748b' : '#334155')
+          .margin({ right: 4 })
+          .onClick(() => {
+            if (this.docId !== 0) { this.penStart(this.docId); }
+          })
+        Text('路径')
+          .fontSize(11)
+          .fontColor(this.tool === 'pen' ? '#0d1a14' : '#94a3b8')
+          .margin({ right: 4 })
+          .onClick(() => {
+            if (this.docId !== 0 && this.tool === 'pen') { this.penCommit(this.docId); }
+          })
+        Button('取消')
+          .fontSize(11)
+          .height(28)
+          .backgroundColor('#475569')
+          .fontColor('#e2e8f0')
+          .borderRadius(7)
+          .onClick(() => {
+            this.penCancel();
+          })
+      }
+      .width('100%')
+      .margin({ top: 6, bottom: 4 })
+      if (this.tool === 'pen') {
+        Column({ space: 4 }) {
+          Text('点击画布放锚点；拖拽出控制柄；Esc 取消')
+            .fontSize(10)
+            .fontColor('#64748b')
+          Text('当前点数：' + this.penPathKnots.length / 7)
+            .fontSize(10)
+            .fontColor('#64748b')
+        }
+        .width('100%')
+        .padding({ top: 4, bottom: 4 })
+      }
+      // D1：路径转选区（对当前选中的矢量图层）。
+      Row({ space: 8 }) {
+        Button('路径转选区')
+          .fontSize(11)
+          .height(28)
+          .layoutWeight(1)
+          .backgroundColor('#3730a3')
+          .fontColor('#e0e7ff')
+          .enabled(this.docId !== 0 && this.selectedLayerKind() === 'Shape')
+          .onClick(() => {
+            this.penPathToSelection();
+          })
+      }
+      .width('100%')
+      .margin({ top: 6 })
+    }
+    .width('100%')
+    .padding(12)
+    .backgroundColor(COLOR_LAYER_CARD)
+    .borderRadius(14)
+    .border({ width: { left: 4 }, color: COLOR_LAYER_ACCENT })
+  }
+
+  @Builder
+  RecentDocsList() {
+    Column({ space: 6 }) {
+      // 最近编辑的文档列表（按最近访问排序，最多 5 项）
+      ForEach(this.recentFiles, (path: string, index: number) => {
+        Row({ space: 8 }) {
+          Text('#' + (index + 1))
+            .fontSize(11)
+            .fontColor('#6f8aa6')
+            .width(20)
+          Text(this.getShortName(path))
+            .fontSize(11)
+            .fontColor('#e6f0fa')
+            .layoutWeight(1)
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+          Text('打开→')
+            .fontSize(10)
+            .fontColor('#48c78e')
+            .onClick(() => {
+              // 点击后重建文档：在 EntryAbility 中处理 openRecent
+              postCardAction(this, {
+                action: 'router',
+                abilityName: 'EntryAbility',
+                params: { target: 'openRecent' }
+              });
+            })
+        }
+      })
+    }
+    .width('100%')
+    .padding({ left: 12, right: 12, top: 10, bottom: 10 })
+    .backgroundColor(COLOR_ADJUST_CARD)
+    .borderRadius(14)
+    .border({ width: { left: 4 }, color: COLOR_ADJUST_ACCENT })
+  }
+
+  @Builder
   ExportCard() {
     Column() {
       Row({ space: 8 }) {
@@ -10001,7 +10740,7 @@ struct Index {
       .margin({ bottom: 10 })
 
       Row({ space: 8 }) {
-        ForEach(['png', 'jpeg', 'webp'], (format: string) => {
+        ForEach(['png', 'jpeg', 'webp', 'psd'], (format: string) => {
           Text(this.formatLabel(format))
             .fontSize(11)
             .fontColor(this.exportFormat === format ? '#0d1a14' : '#9fd8bb')
@@ -10057,9 +10796,45 @@ struct Index {
         this.SelectCard()
         this.FilterCard()
         this.ShapeCard()
+        this.PenCard()
         this.TypeCard()
         this.AdjustmentCard()
+        if (this.recentFiles.length > 0) {
+          this.RecentDocsList()
+        }
         this.ExportCard()
+        Row() {
+          Text('关于 ArtsPhoto · v' + this.appVersion + ' · 隐私政策与用户协议')
+            .fontSize(11)
+            .fontColor('#6f8aa6')
+        }
+        .width('100%')
+        .height(36)
+        .justifyContent(FlexAlign.Center)
+        .onClick(() => {
+          this.openLegal();
+        })
+        // 任务 1.2：App 内隐私状态可视化 — 网络权限：无 / 数据：仅本地内存 / 权限申请：0 项
+        Row({ space: 6 }) {
+          Text('网络权限：无')
+            .fontSize(10)
+            .fontColor('#48c78e')
+          Text('|')
+            .fontSize(10)
+            .fontColor('#6f8aa6')
+          Text('数据：仅本地内存')
+            .fontSize(10)
+            .fontColor('#48c78e')
+          Text('|')
+            .fontSize(10)
+            .fontColor('#6f8aa6')
+          Text('权限申请：0 项')
+            .fontSize(10)
+            .fontColor('#48c78e')
+        }
+        .width('100%')
+        .height(24)
+        .justifyContent(FlexAlign.Center)
       }
       .width('100%')
       .padding({ left: 12, right: 12, top: 12, bottom: 12 })
@@ -10069,6 +10844,7 @@ struct Index {
     .scrollBar(BarState.Auto)
     .backgroundColor('#111318')
   }
+
 
   @Builder
   StatusBar() {
@@ -10093,44 +10869,50 @@ struct Index {
   }
 
   build() {
-    Column() {
-      this.TopBar()
-      if (this.isWide) {
-        Row() {
+    Stack({ alignContent: Alignment.Center }) {
+      Column() {
+        this.TopBar()
+        if (this.isWide) {
+          Row() {
+            Column() {
+              this.CanvasPane()
+            }
+            .layoutWeight(1)
+            .height('100%')
+            Column() {
+              this.Panel()
+            }
+            .width(350)
+            .height('100%')
+            .border({ width: { left: 1 }, color: '#232830' })
+          }
+          .width('100%')
+          .layoutWeight(1)
+        } else {
           Column() {
             this.CanvasPane()
           }
+          .width('100%')
           .layoutWeight(1)
-          .height('100%')
           Column() {
             this.Panel()
           }
-          .width(350)
-          .height('100%')
-          .border({ width: { left: 1 }, color: '#232830' })
+          .width('100%')
+          .height(330)
+          .border({ width: { top: 1 }, color: '#232830' })
         }
-        .width('100%')
-        .layoutWeight(1)
-      } else {
-        Column() {
-          this.CanvasPane()
-        }
-        .width('100%')
-        .layoutWeight(1)
-        Column() {
-          this.Panel()
-        }
-        .width('100%')
-        .height(330)
-        .border({ width: { top: 1 }, color: '#232830' })
+        this.StatusBar()
       }
-      this.StatusBar()
+      .width('100%')
+      .height('100%')
+      .backgroundColor(COLOR_ROOT)
+      .onAreaChange((oldValue: Area, newValue: Area) => {
+        this.isWide = Number(newValue.width) > 820;
+      })
+
     }
     .width('100%')
     .height('100%')
     .backgroundColor(COLOR_ROOT)
-    .onAreaChange((oldValue: Area, newValue: Area) => {
-      this.isWide = Number(newValue.width) > 820;
-    })
   }
 }
