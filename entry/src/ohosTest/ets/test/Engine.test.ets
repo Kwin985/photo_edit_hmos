@@ -15,6 +15,7 @@
  */
 import { describe, it, expect } from '@ohos/hypium';
 import { Engine, flattenLayers, visibleRectLeavesTile, LayerInfo } from '../../../main/ets/engine/Engine';
+import { FILTERS, buildFilterArgs } from '../../../main/ets/engine/FilterCatalog';
 
 /** 执行动作并返回其抛出的错误信息；未抛错时返回空串。 */
 function caughtMessage(action: () => void): string {
@@ -612,6 +613,29 @@ export default function engineTest() {
         expect(results.length).assertEqual(2);
         expect(results[0].byteLength > 0).assertTrue();
         expect(results[1].byteLength > 0).assertTrue();
+      } finally {
+        Engine.close(docId);
+      }
+    });
+
+    it('allFilterCatalogEntriesApply', 0, async () => {
+      // 1.3.2 滤镜目录契约：61 个 serde tag 的默认值必须全部能在真机通过 pc_filter_apply，
+      // 防止 UI 出现"点了报错"的假按钮。
+      const created = Engine.newDocument(64, 48, 'filter-catalog');
+      const docId: number = created.id;
+      const failures: string[] = [];
+      try {
+        const layerId: number = Engine.info(docId).layers[0].id;
+        for (const def of FILTERS) {
+          const args: string = buildFilterArgs(def, new Map<string, number>());
+          const message: string = await caughtMessageAsync(async () => {
+            await Engine.filterApply(docId, layerId, args);
+          });
+          if (message.length > 0) {
+            failures.push(def.id + ': ' + message);
+          }
+        }
+        expect(failures.join(' | ')).assertEqual('');
       } finally {
         Engine.close(docId);
       }

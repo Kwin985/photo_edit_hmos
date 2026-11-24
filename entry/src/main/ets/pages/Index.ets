@@ -7,6 +7,7 @@ import { bundleManager, common } from '@kit.AbilityKit';
 import { deviceInfo } from '@kit.BasicServicesKit';
 import { systemShare } from '@kit.ShareKit';
 import { Engine, DocumentInfo, LayerInfo, AdjustmentInfo, SelectionInfo, emptyAdjustment, flattenLayers, visibleRectLeavesTile, LayerEffectInfo, LayerEffectsInfo, FxGradientInfo, FxGradientStop, LayerEditInfo, LayerMaskInfo, GuidesInfo, CutoutOutcome } from '../engine/Engine';
+import { FilterDef, FilterParamDef, FILTER_GROUPS, FILTERS, filtersInGroup, findFilter, buildFilterArgs } from '../engine/FilterCatalog';
 
 const COLOR_ROOT: string = '#0a0b0d';
 const COLOR_CANVAS: string = '#101216';
@@ -163,20 +164,6 @@ interface SelectParams {
   y: number;
   tolerance: number;
   contiguous: boolean;
-}
-
-interface FilterArgs {
-  filter: string;
-  radius: number;
-  angle: number;
-  distance: number;
-  amount: number;
-  cellSize: number;
-  height: number;
-  reduceNoise: number;
-  distribution: string;
-  monochromatic: boolean;
-  seed: number;
 }
 
 interface ShapeParams {
@@ -360,19 +347,10 @@ struct Index {
   @State selX1: number = 0;
   @State selY1: number = 0;
   @State selectionShape: string = 'bounds';
+  // 1.3.2 滤镜目录：61 种引擎滤镜按 6 组呈现，数值参数由 Map 状态驱动。
   @State filterKind: string = 'gaussianBlur';
-  @State filterBlurRadius: number = 4;
-  @State filterMotionAngle: number = 0;
-  @State filterMotionDistance: number = 20;
-  @State filterSharpenAmount: number = 100;
-  @State filterSharpenRadius: number = 2;
-  @State filterNoiseAmount: number = 12;
-  @State filterMono: boolean = true;
-  @State filterCellSize: number = 12;
-  @State filterEmbossAngle: number = 135;
-  @State filterEmbossHeight: number = 3;
-  @State filterEmbossAmount: number = 100;
-  @State filterTwirlAngle: number = 30;
+  @State filterGroup: string = '模糊锐化';
+  @State filterValues: Map<string, number> = new Map<string, number>();
   @State shapeKind: string = 'rect';
   @State shapeFillColor: string = '#e5484d';
   @State shapeFillOpacity: number = 100;
@@ -3865,63 +3843,16 @@ struct Index {
     }
   }
 
-  private filterLabel(): string {
-    switch (this.filterKind) {
-      case 'gaussianBlur':
-        return '高斯模糊';
-      case 'motionBlur':
-        return '动感模糊';
-      case 'smartSharpen':
-        return '智能锐化';
-      case 'addNoise':
-        return '添加杂色';
-      case 'mosaic':
-        return '马赛克';
-      case 'emboss':
-        return '浮雕';
-      case 'twirl':
-        return '旋转扭曲';
-      case 'invert':
-        return '反相';
-      case 'desaturate':
-        return '去色';
-      default:
-        return '查找边缘';
-    }
+  private currentFilterDef(): FilterDef {
+    return findFilter(this.filterKind);
   }
 
-  private currentFilterArgs(): FilterArgs {
-    let radius = 0;
-    let angle = 0;
-    let amount = 0;
-    if (this.filterKind === 'gaussianBlur') {
-      radius = this.filterBlurRadius;
-    } else if (this.filterKind === 'smartSharpen') {
-      radius = this.filterSharpenRadius;
-      amount = this.filterSharpenAmount;
-    } else if (this.filterKind === 'motionBlur') {
-      angle = this.filterMotionAngle;
-    } else if (this.filterKind === 'emboss') {
-      angle = this.filterEmbossAngle;
-      amount = this.filterEmbossAmount;
-    } else if (this.filterKind === 'addNoise') {
-      amount = this.filterNoiseAmount;
-    } else if (this.filterKind === 'twirl') {
-      angle = this.filterTwirlAngle;
-    }
-    return {
-      filter: this.filterKind,
-      radius: radius,
-      angle: angle,
-      distance: this.filterMotionDistance,
-      amount: amount,
-      cellSize: this.filterCellSize,
-      height: this.filterEmbossHeight,
-      reduceNoise: 10,
-      distribution: 'gaussian',
-      monochromatic: this.filterMono,
-      seed: 12345
-    };
+  private filterLabel(): string {
+    return this.currentFilterDef().label;
+  }
+
+  private currentFilterArgs(): string {
+    return buildFilterArgs(this.currentFilterDef(), this.filterValues);
   }
 
   private canFilter(): boolean {
@@ -3951,7 +3882,7 @@ struct Index {
     const label = this.filterLabel();
     try {
       this.busy = true;
-      const info = await Engine.filterApply(this.docId, this.selectedLayerId, JSON.stringify(this.currentFilterArgs()));
+      const info = await Engine.filterApply(this.docId, this.selectedLayerId, this.currentFilterArgs());
       this.info = info;
       this.layers = flattenLayers(info.layers, 0);
       // 滤镜改变了文档内容：先同步版本号，预览缓存键才会正确失效（R8.2）。
@@ -3965,63 +3896,23 @@ struct Index {
     }
   }
 
-  private filterParamValue(name: string): number {
-    switch (name) {
-      case 'blurRadius':
-        return this.filterBlurRadius;
-      case 'motionAngle':
-        return this.filterMotionAngle;
-      case 'motionDistance':
-        return this.filterMotionDistance;
-      case 'sharpenAmount':
-        return this.filterSharpenAmount;
-      case 'sharpenRadius':
-        return this.filterSharpenRadius;
-      case 'noiseAmount':
-        return this.filterNoiseAmount;
-      case 'cellSize':
-        return this.filterCellSize;
-      case 'embossAngle':
-        return this.filterEmbossAngle;
-      case 'embossHeight':
-        return this.filterEmbossHeight;
-      case 'embossAmount':
-        return this.filterEmbossAmount;
-      case 'twirlAngle':
-        return this.filterTwirlAngle;
-      default:
-        return 0;
-    }
+  private filterParamValue(param: FilterParamDef): number {
+    const stored: number | undefined = this.filterValues.get(param.key);
+    return stored === undefined ? param.value : stored;
   }
 
-  private filterParamText(name: string): string {
-    const value = this.filterParamValue(name);
-    return (Math.round(value * 10) / 10).toString();
+  private setFilterParam(param: FilterParamDef, value: number): void {
+    // 换一个 Map 实例，保证 @State 观察到变化并刷新滑杆读数。
+    const next: Map<string, number> = new Map<string, number>(this.filterValues);
+    next.set(param.key, value);
+    this.filterValues = next;
   }
 
-  private setFilterParam(name: string, value: number): void {
-    if (name === 'blurRadius') {
-      this.filterBlurRadius = value;
-    } else if (name === 'motionAngle') {
-      this.filterMotionAngle = value;
-    } else if (name === 'motionDistance') {
-      this.filterMotionDistance = value;
-    } else if (name === 'sharpenAmount') {
-      this.filterSharpenAmount = value;
-    } else if (name === 'sharpenRadius') {
-      this.filterSharpenRadius = value;
-    } else if (name === 'noiseAmount') {
-      this.filterNoiseAmount = value;
-    } else if (name === 'cellSize') {
-      this.filterCellSize = value;
-    } else if (name === 'embossAngle') {
-      this.filterEmbossAngle = value;
-    } else if (name === 'embossHeight') {
-      this.filterEmbossHeight = value;
-    } else if (name === 'embossAmount') {
-      this.filterEmbossAmount = value;
-    } else if (name === 'twirlAngle') {
-      this.filterTwirlAngle = value;
+  private selectFilterGroup(group: string): void {
+    this.filterGroup = group;
+    const list: FilterDef[] = filtersInGroup(group);
+    if (list.length > 0 && findFilter(this.filterKind).group !== group) {
+      this.filterKind = list[0].id;
     }
   }
 
@@ -10410,33 +10301,47 @@ struct Index {
   }
 
   @Builder
-  FilterChip(label: string, kind: string) {
-    Text(label)
+  FilterGroupChip(group: string) {
+    Text(group)
       .fontSize(10)
-      .fontColor(this.filterKind === kind ? '#2a0b18' : '#f7b7d2')
+      .fontColor(this.filterGroup === group ? '#2a0b18' : '#f7b7d2')
       .height(26)
-      .padding({ left: 8, right: 8 })
-      .backgroundColor(this.filterKind === kind ? COLOR_FILTER_ACCENT : '#4a1a30')
+      .padding({ left: 7, right: 7 })
+      .backgroundColor(this.filterGroup === group ? COLOR_FILTER_ACCENT : '#4a1a30')
       .borderRadius(6)
       .onClick(() => {
-        this.filterKind = kind;
+        this.selectFilterGroup(group);
       })
   }
 
   @Builder
-  FilterParam(label: string, name: string, min: number, max: number, step: number) {
+  FilterChip(def: FilterDef) {
+    Text(def.label)
+      .fontSize(10)
+      .fontColor(this.filterKind === def.id ? '#2a0b18' : '#f7b7d2')
+      .height(26)
+      .padding({ left: 8, right: 8 })
+      .backgroundColor(this.filterKind === def.id ? COLOR_FILTER_ACCENT : '#4a1a30')
+      .borderRadius(6)
+      .onClick(() => {
+        this.filterKind = def.id;
+      })
+  }
+
+  @Builder
+  FilterParam(param: FilterParamDef) {
     Row({ space: 8 }) {
-      Text(label)
-        .fontSize(11)
+      Text(param.label)
+        .fontSize(10)
         .fontColor('#f0a8c6')
-        .width(40)
-      Slider({ value: this.filterParamValue(name), min: min, max: max, step: step })
+        .width(52)
+      Slider({ value: this.filterParamValue(param), min: param.min, max: param.max, step: param.step })
         .layoutWeight(1)
         .onChange((value: number, _mode: SliderChangeMode) => {
-          this.setFilterParam(name, value);
+          this.setFilterParam(param, value);
         })
-      Text(this.filterParamText(name))
-        .fontSize(11)
+      Text((Math.round(this.filterParamValue(param) * 10) / 10).toString())
+        .fontSize(10)
         .fontColor('#f0a8c6')
         .width(46)
     }
@@ -10457,7 +10362,7 @@ struct Index {
           .fontSize(14)
           .fontWeight(FontWeight.Bold)
           .fontColor('#ffe4f0')
-        Text(this.filterLabel())
+        Text('61 种 · ' + this.filterLabel())
           .fontSize(10)
           .fontColor('#c98aa8')
           .layoutWeight(1)
@@ -10465,45 +10370,32 @@ struct Index {
       .width('100%')
       .margin({ bottom: 10 })
 
-      Row({ space: 6 }) {
-        this.FilterChip('模糊', 'gaussianBlur')
-        this.FilterChip('动感', 'motionBlur')
-        this.FilterChip('锐化', 'smartSharpen')
-        this.FilterChip('杂色', 'addNoise')
-        this.FilterChip('马赛克', 'mosaic')
+      // 1.3.2：六组分类，组内滤镜芯片可滚动，避免旧版固定 10 个按钮的天花板。
+      Flex({ wrap: FlexWrap.Wrap }) {
+        ForEach(FILTER_GROUPS, (group: string) => {
+          this.FilterGroupChip(group)
+        }, (group: string) => group)
       }
       .width('100%')
 
-      Row({ space: 6 }) {
-        this.FilterChip('浮雕', 'emboss')
-        this.FilterChip('扭曲', 'twirl')
-        this.FilterChip('反相', 'invert')
-        this.FilterChip('去色', 'desaturate')
-        this.FilterChip('查找边缘', 'findEdges')
+      Scroll() {
+        Flex({ wrap: FlexWrap.Wrap }) {
+          ForEach(filtersInGroup(this.filterGroup), (def: FilterDef) => {
+            this.FilterChip(def)
+          }, (def: FilterDef) => def.id)
+        }
+        .width('100%')
       }
-      .width('100%')
+      .height(96)
       .margin({ top: 6 })
+      .scrollBar(BarState.Off)
 
-      if (this.filterKind === 'gaussianBlur') {
-        this.FilterParam('半径', 'blurRadius', 0.1, 50, 0.1)
-      } else if (this.filterKind === 'motionBlur') {
-        this.FilterParam('角度', 'motionAngle', -180, 180, 1)
-        this.FilterParam('距离', 'motionDistance', 1, 200, 1)
-      } else if (this.filterKind === 'smartSharpen') {
-        this.FilterParam('数量', 'sharpenAmount', 1, 300, 1)
-        this.FilterParam('半径', 'sharpenRadius', 0.1, 20, 0.1)
-      } else if (this.filterKind === 'addNoise') {
-        this.FilterParam('数量', 'noiseAmount', 0, 100, 1)
-      } else if (this.filterKind === 'mosaic') {
-        this.FilterParam('单元格', 'cellSize', 2, 100, 1)
-      } else if (this.filterKind === 'emboss') {
-        this.FilterParam('角度', 'embossAngle', -180, 180, 1)
-        this.FilterParam('高度', 'embossHeight', 1, 20, 1)
-        this.FilterParam('数量', 'embossAmount', 1, 500, 1)
-      } else if (this.filterKind === 'twirl') {
-        this.FilterParam('角度', 'twirlAngle', -999, 999, 1)
-      } else {
-        Text('该滤镜没有可调参数')
+      ForEach(this.currentFilterDef().params, (param: FilterParamDef) => {
+        this.FilterParam(param)
+      }, (param: FilterParamDef) => param.key)
+
+      if (this.currentFilterDef().params.length === 0) {
+        Text('该滤镜使用经过验证的默认参数，直接应用即可')
           .fontSize(10)
           .fontColor('#a97189')
           .margin({ top: 8 })
