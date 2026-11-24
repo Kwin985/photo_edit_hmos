@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Instant;
 
 use photocraft_color::blend::{BlendMode, composite};
@@ -137,25 +137,34 @@ impl DocEntry {
 }
 
 pub struct Session {
-    docs: HashMap<u64, DocEntry>,
-    next_id: u64,
+    docs: RwLock<HashMap<u64, Arc<RwLock<DocEntry>>>>,
+    next_id: AtomicU64,
 }
 
 impl Session {
-    fn entry(&self, id: u64) -> Result<&DocEntry, String> {
-        self.docs.get(&id).ok_or_else(|| format!("document {id} is not open"))
+    /// 取文档句柄（克隆 Arc 后即释放 map 锁）；读/写锁由调用方按操作性质选择。
+    /// 锁中毒统一 `into_inner` 恢复：panic 已被 [`guard`] 在边界捕获，与旧版语义一致。
+    fn entry(&self, id: u64) -> Result<Arc<RwLock<DocEntry>>, String> {
+        self.docs
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| format!("document {id} is not open"))
     }
 
-    fn entry_mut(&mut self, id: u64) -> Result<&mut DocEntry, String> {
-        self.docs.get_mut(&id).ok_or_else(|| format!("document {id} is not open"))
+    fn entry_mut(&self, id: u64) -> Result<Arc<RwLock<DocEntry>>, String> {
+        self.entry(id)
     }
 
-    fn add(&mut self, doc: Document, image_name: &str) -> u64 {
-        self.next_id += 1;
-        let id = self.next_id;
+    fn add(&self, doc: Document, image_name: &str) -> u64 {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         let mut entry = DocEntry::new(doc);
         entry.doc.name = image_name.to_string();
-        self.docs.insert(id, entry);
+        self.docs
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, Arc::new(RwLock::new(entry)));
         id
     }
 }
@@ -469,7 +478,7 @@ fn buffer_bytes(buf: Buffer) -> Vec<u8> {
 /// Creates a session. Every session owns its documents and history.
 #[unsafe(no_mangle)]
 pub extern "C" fn pc_session_new() -> *mut Session {
-    Box::into_raw(Box::new(Session { docs: HashMap::new(), next_id: 0 }))
+    Box::into_raw(Box::new(Session { docs: RwLock::new(HashMap::new()), next_id: AtomicU64::new(0) }))
 }
 
 /// Frees a session and every document it holds.
@@ -499,10 +508,10 @@ pub extern "C" fn pc_open(session: *mut Session, name_ptr: *const u8, name_len: 
         match photocraft_io::import(&name, data) {
             Ok(result) => {
                 // SAFETY: session is a live pointer from `pc_session_new`.
-                let s = unsafe { &mut *session };
+                let s = unsafe { &*session };
                 let warnings = result.warnings.clone();
                 let id = s.add(result.document, &name);
-                let info = s.docs.get(&id).map(doc_info).unwrap_or(Value::Null);
+                let info = s.entry(id).map(|e| doc_info(&e.read().unwrap_or_else(|e| e.into_inner()))).unwrap_or(Value::Null);
                 ok(json!({ "id": id, "warnings": warnings, "info": info }))
             }
             Err(e) => fail(format!("{e}")),
@@ -545,9 +554,9 @@ pub extern "C" fn pc_document_new(session: *mut Session, width: u32, height: u32
         }
         doc.layers.push(background);
         // SAFETY: session is a live pointer from `pc_session_new`.
-        let s = unsafe { &mut *session };
+        let s = unsafe { &*session };
         let id = s.add(doc, name);
-        let info = s.docs.get(&id).map(doc_info).unwrap_or(Value::Null);
+        let info = s.entry(id).map(|e| doc_info(&e.read().unwrap_or_else(|e| e.into_inner()))).unwrap_or(Value::Null);
         ok(json!({ "id": id, "warnings": [], "info": info }))
     })
 }
@@ -787,11 +796,13 @@ pub extern "C" fn pc_document_turn(session: *mut Session, id: u64, turn: u32) ->
             None => return fail("invalid turn: expected 0..=4"),
         };
         // SAFETY: live session pointer.
-        let s = unsafe { &mut *session };
+        let s = unsafe { &*session };
         let entry = match s.entry_mut(id) {
             Ok(e) => e,
             Err(e) => return fail(e),
         };
+        let mut entry_guard = entry.write().unwrap_or_else(|e| e.into_inner());
+        let entry = &mut *entry_guard;
 
         entry.checkpoint_named("旋转/翻转");
         turn_document(&mut entry.doc, kind);
@@ -807,8 +818,14 @@ pub extern "C" fn pc_close(session: *mut Session, id: u64) -> *mut PcBuffer {
             return fail("null session");
         }
         // SAFETY: live session pointer.
-        let s = unsafe { &mut *session };
-        s.docs.remove(&id);
+        let s = unsafe { &*session };
+        let mut docs = s.docs.write().unwrap_or_else(|e| e.into_inner());
+        docs.remove(&id);
+        if docs.is_empty() {
+            drop(docs);
+            photocraft_compose::purge_effect_cache();
+            photocraft_raster::scratch::release();
+        }
         ok(Value::Null)
     })
 }
@@ -823,7 +840,7 @@ pub extern "C" fn pc_info(session: *mut Session, id: u64) -> *mut PcBuffer {
         // SAFETY: live session pointer.
         let s = unsafe { &*session };
         match s.entry(id) {
-            Ok(entry) => ok(doc_info(entry)),
+            Ok(entry) => ok(doc_info(&entry.read().unwrap_or_else(|e| e.into_inner()))),
             Err(e) => fail(e),
         }
     })
@@ -842,6 +859,8 @@ pub extern "C" fn pc_preview(session: *mut Session, id: u64, max_side: u32, out:
             Ok(e) => e,
             Err(e) => return fail(e),
         };
+        let entry_guard = entry.read().unwrap_or_else(|e| e.into_inner());
+        let entry = &*entry_guard;
         let side = max_side.clamp(1, MAX_PREVIEW_SIDE);
         let img = photocraft_compose::thumbnail(&entry.doc, side);
         if !out.is_null() {
@@ -866,6 +885,8 @@ pub extern "C" fn pc_layer_thumbnail(session: *mut Session, id: u64, layer: u64,
             Ok(e) => e,
             Err(e) => return fail(e),
         };
+        let entry_guard = entry.read().unwrap_or_else(|e| e.into_inner());
+        let entry = &*entry_guard;
         let Some(target) = find_layer(&entry.doc.layers, layer) else {
             return fail("layer not found");
         };
@@ -932,6 +953,8 @@ pub extern "C" fn pc_render(session: *mut Session, id: u64, x: i32, y: i32, w: i
             Ok(e) => e,
             Err(e) => return fail(e),
         };
+        let entry_guard = entry.read().unwrap_or_else(|e| e.into_inner());
+        let entry = &*entry_guard;
         let rect = Rect::new(x, y, x.saturating_add(w), y.saturating_add(h));
         let buf = photocraft_compose::render(&entry.doc, rect);
         if !out.is_null() {
@@ -962,6 +985,8 @@ pub extern "C" fn pc_render_pixels(session: *mut Session, id: u64, x: i32, y: i3
             Ok(e) => e,
             Err(e) => return fail(e),
         };
+        let entry_guard = entry.read().unwrap_or_else(|e| e.into_inner());
+        let entry = &*entry_guard;
         let rect = Rect::new(x, y, x.saturating_add(w), y.saturating_add(h));
         let img = photocraft_compose::render(&entry.doc, rect).to_rgba8();
         // `compose` returns an empty image when a rectangle is too large to allocate; a size
@@ -1009,7 +1034,7 @@ pub extern "C" fn pc_revision(session: *mut Session, id: u64) -> *mut PcBuffer {
         // SAFETY: live session pointer.
         let s = unsafe { &*session };
         match s.entry(id) {
-            Ok(entry) => ok(json!({ "revision": entry.revision })),
+            Ok(entry) => ok(json!({ "revision": entry.read().unwrap_or_else(|e| e.into_inner()).revision })),
             Err(e) => fail(e),
         }
     })
@@ -1052,11 +1077,13 @@ pub extern "C" fn pc_paint_stroke(
             return fail("stroke has no points");
         }
         // SAFETY: live session pointer.
-        let s = unsafe { &mut *session };
-        let entry = match s.docs.get_mut(&id) {
-            Some(e) => e,
-            None => return fail(format!("document {id} is not open")),
+        let s = unsafe { &*session };
+        let entry = match s.entry_mut(id) {
+            Ok(e) => e,
+            Err(e) => return fail(e),
         };
+        let mut entry_guard = entry.write().unwrap_or_else(|e| e.into_inner());
+        let entry = &mut *entry_guard;
         let selection = entry.doc.selection.clone();
         let format = entry.doc.pixel_format();
         let reusable = layer != 0 && find_layer(&entry.doc.layers, layer).is_some_and(|l| matches!(&l.content, LayerContent::Raster(_)));
@@ -1163,11 +1190,13 @@ pub extern "C" fn pc_select(session: *mut Session, id: u64, params_ptr: *const u
             Err(e) => return fail(format!("invalid selection parameters: {e}")),
         };
         // SAFETY: live session pointer.
-        let s = unsafe { &mut *session };
-        let entry = match s.docs.get_mut(&id) {
-            Some(e) => e,
-            None => return fail(format!("document {id} is not open")),
+        let s = unsafe { &*session };
+        let entry = match s.entry_mut(id) {
+            Ok(e) => e,
+            Err(e) => return fail(e),
         };
+        let mut entry_guard = entry.write().unwrap_or_else(|e| e.into_inner());
+        let entry = &mut *entry_guard;
         let area = entry.doc.bounds();
         if area.is_empty() {
             return fail("document is empty");
@@ -1251,11 +1280,13 @@ pub extern "C" fn pc_filter_apply(session: *mut Session, id: u64, layer: u64, pa
             Err(e) => return fail(format!("invalid filter parameters: {e}")),
         };
         // SAFETY: live session pointer.
-        let s = unsafe { &mut *session };
-        let entry = match s.docs.get_mut(&id) {
-            Some(e) => e,
-            None => return fail(format!("document {id} is not open")),
+        let s = unsafe { &*session };
+        let entry = match s.entry_mut(id) {
+            Ok(e) => e,
+            Err(e) => return fail(e),
         };
+        let mut entry_guard = entry.write().unwrap_or_else(|e| e.into_inner());
+        let entry = &mut *entry_guard;
         let bounds = entry.doc.bounds();
         if bounds.is_empty() {
             return fail("document is empty");
@@ -1366,11 +1397,13 @@ pub extern "C" fn pc_shape_create(session: *mut Session, id: u64, params_ptr: *c
             Err(e) => return fail(format!("invalid shape parameters: {e}")),
         };
         // SAFETY: live session pointer.
-        let s = unsafe { &mut *session };
-        let entry = match s.docs.get_mut(&id) {
-            Some(e) => e,
-            None => return fail(format!("document {id} is not open")),
+        let s = unsafe { &*session };
+        let entry = match s.entry_mut(id) {
+            Ok(e) => e,
+            Err(e) => return fail(e),
         };
+        let mut entry_guard = entry.write().unwrap_or_else(|e| e.into_inner());
+        let entry = &mut *entry_guard;
         let bounds = entry.doc.bounds();
         if bounds.is_empty() {
             return fail("document is empty");
@@ -1430,8 +1463,10 @@ pub extern "C" fn pc_vector_path_create(session: *mut Session, id: u64, params_p
         if session.is_null() { return fail("null session"); }
         let params = match unsafe { slice(params_ptr, params_len) } { Ok(b) => b, Err(e) => return fail(e) };
         let p: serde_json::Value = match serde_json::from_slice(params) { Ok(v) => v, Err(e) => return fail(format!("invalid vector path parameters: {e}")) };
-        let s = unsafe { &mut *session };
-        let entry = match s.docs.get_mut(&id) { Some(e) => e, None => return fail(format!("document {id} is not open")) };
+        let s = unsafe { &*session };
+        let entry = match s.entry_mut(id) { Ok(e) => e, Err(e) => return fail(e) };
+        let mut entry_guard = entry.write().unwrap_or_else(|e| e.into_inner());
+        let entry = &mut *entry_guard;
         let bounds = entry.doc.bounds();
         if bounds.is_empty() { return fail("document is empty"); }
         let fill = p.get("fill").and_then(|v| v.as_array()).map(|arr| {
@@ -1471,8 +1506,10 @@ pub extern "C" fn pc_vector_path_edit(session: *mut Session, id: u64, params_ptr
         let p: serde_json::Value = match serde_json::from_slice(params) { Ok(v) => v, Err(e) => return fail(format!("invalid vector path edit parameters: {e}")) };
         let op = p.get("op").and_then(|v| v.as_str()).unwrap_or("");
         let layer_id = p.get("layerId").and_then(|v| v.as_u64()).unwrap_or(0);
-        let s = unsafe { &mut *session };
-        let entry = match s.docs.get_mut(&id) { Some(e) => e, None => return fail(format!("document {id} is not open")) };
+        let s = unsafe { &*session };
+        let entry = match s.entry_mut(id) { Ok(e) => e, Err(e) => return fail(e) };
+        let mut entry_guard = entry.write().unwrap_or_else(|e| e.into_inner());
+        let entry = &mut *entry_guard;
         let layer = match entry.doc.layers.iter_mut().find(|l| l.id.0 == layer_id) { Some(l) => l, None => return fail(format!("layer {layer_id} not found")) };
         let content = match &mut layer.content { LayerContent::Shape(shape) => shape, _ => return fail("layer is not a vector/shape layer") };
         match op {
@@ -1556,8 +1593,10 @@ pub extern "C" fn pc_vector_path_rasterize(session: *mut Session, id: u64, param
         let params = match unsafe { slice(params_ptr, params_len) } { Ok(b) => b, Err(e) => return fail(e) };
         let p: serde_json::Value = match serde_json::from_slice(params) { Ok(v) => v, Err(e) => return fail(format!("invalid vector path rasterize parameters: {e}")) };
         let layer_id = p.get("layerId").and_then(|v| v.as_u64()).unwrap_or(0);
-        let s = unsafe { &mut *session };
-        let entry = match s.docs.get_mut(&id) { Some(e) => e, None => return fail(format!("document {id} is not open")) };
+        let s = unsafe { &*session };
+        let entry = match s.entry_mut(id) { Ok(e) => e, Err(e) => return fail(e) };
+        let mut entry_guard = entry.write().unwrap_or_else(|e| e.into_inner());
+        let entry = &mut *entry_guard;
         let bounds = entry.doc.bounds();
         let pixel_format = entry.doc.pixel_format();
         let layer = match entry.doc.layers.iter_mut().find(|l| l.id.0 == layer_id) { Some(l) => l, None => return fail(format!("layer {layer_id} not found")) };
@@ -1587,11 +1626,13 @@ pub extern "C" fn pc_cutout_remove_background(session: *mut Session, id: u64, pa
         let layer = p.get("layer").and_then(|v| v.as_u64()).unwrap_or(0);
         let refine = p.get("refine").and_then(|v| v.as_bool()).unwrap_or(true);
         // SAFETY: live session pointer.
-        let s = unsafe { &mut *session };
-        let entry = match s.docs.get_mut(&id) {
-            Some(e) => e,
-            None => return fail(format!("document {id} is not open")),
+        let s = unsafe { &*session };
+        let entry = match s.entry_mut(id) {
+            Ok(e) => e,
+            Err(e) => return fail(e),
         };
+        let mut entry_guard = entry.write().unwrap_or_else(|e| e.into_inner());
+        let entry = &mut *entry_guard;
         let target = match find_layer(&entry.doc.layers, layer) {
             Some(l) => l,
             None => return fail("layer not found"),
@@ -1683,11 +1724,13 @@ pub extern "C" fn pc_vector_path_to_selection(session: *mut Session, id: u64, pa
             return fail("mode must be replace, add, subtract or intersect");
         }
         // SAFETY: live session pointer.
-        let s = unsafe { &mut *session };
-        let entry = match s.docs.get_mut(&id) {
-            Some(e) => e,
-            None => return fail(format!("document {id} is not open")),
+        let s = unsafe { &*session };
+        let entry = match s.entry_mut(id) {
+            Ok(e) => e,
+            Err(e) => return fail(e),
         };
+        let mut entry_guard = entry.write().unwrap_or_else(|e| e.into_inner());
+        let entry = &mut *entry_guard;
         let target = match find_layer(&entry.doc.layers, layer) {
             Some(l) => l,
             None => return fail("layer not found"),
@@ -1787,11 +1830,13 @@ pub extern "C" fn pc_text_create(session: *mut Session, id: u64, params_ptr: *co
             return fail("text is empty");
         }
         // SAFETY: live session pointer.
-        let s = unsafe { &mut *session };
-        let entry = match s.docs.get_mut(&id) {
-            Some(e) => e,
-            None => return fail(format!("document {id} is not open")),
+        let s = unsafe { &*session };
+        let entry = match s.entry_mut(id) {
+            Ok(e) => e,
+            Err(e) => return fail(e),
         };
+        let mut entry_guard = entry.write().unwrap_or_else(|e| e.into_inner());
+        let entry = &mut *entry_guard;
         if entry.doc.bounds().is_empty() {
             return fail("document is empty");
         }
@@ -2249,6 +2294,8 @@ pub extern "C" fn pc_layer_edit_get(session: *mut Session, id: u64, layer: u64) 
             Ok(e) => e,
             Err(e) => return fail(e),
         };
+        let entry_guard = entry.read().unwrap_or_else(|e| e.into_inner());
+        let entry = &*entry_guard;
         match find_layer(&entry.doc.layers, layer) {
             Some(target) => match edit_json(&target.content) {
                 Ok(data) => ok(data),
@@ -2283,11 +2330,13 @@ pub extern "C" fn pc_layer_edit_apply(
             Err(e) => return fail(format!("invalid edit parameters: {e}")),
         };
         // SAFETY: live session pointer.
-        let s = unsafe { &mut *session };
-        let entry = match s.docs.get_mut(&id) {
-            Some(e) => e,
-            None => return fail(format!("document {id} is not open")),
+        let s = unsafe { &*session };
+        let entry = match s.entry_mut(id) {
+            Ok(e) => e,
+            Err(e) => return fail(e),
         };
+        let mut entry_guard = entry.write().unwrap_or_else(|e| e.into_inner());
+        let entry = &mut *entry_guard;
         let kind = match find_layer(&entry.doc.layers, layer) {
             Some(target) => edit_kind(&target.content),
             None => return fail("layer not found"),
@@ -2444,6 +2493,8 @@ pub extern "C" fn pc_layer_mask_get(session: *mut Session, id: u64, layer: u64) 
             Ok(e) => e,
             Err(e) => return fail(e),
         };
+        let entry_guard = entry.read().unwrap_or_else(|e| e.into_inner());
+        let entry = &*entry_guard;
         match find_layer(&entry.doc.layers, layer) {
             Some(target) => ok(layer_mask_json(target)),
             None => fail("layer not found"),
@@ -2470,11 +2521,13 @@ pub extern "C" fn pc_layer_mask_add(
         };
         let fill = String::from_utf8_lossy(fill_bytes).into_owned();
         // SAFETY: live session pointer.
-        let s = unsafe { &mut *session };
-        let entry = match s.docs.get_mut(&id) {
-            Some(e) => e,
-            None => return fail(format!("document {id} is not open")),
+        let s = unsafe { &*session };
+        let entry = match s.entry_mut(id) {
+            Ok(e) => e,
+            Err(e) => return fail(e),
         };
+        let mut entry_guard = entry.write().unwrap_or_else(|e| e.into_inner());
+        let entry = &mut *entry_guard;
         // §D 校验顺序 3（图层存在）→ 4（fill 取值）→ 5（类型）→ 6（尚无蒙版）。
         let (capable, has_mask) = match find_layer(&entry.doc.layers, layer) {
             Some(target) => (mask_capable(&target.content), target.mask.is_some()),
@@ -2531,11 +2584,13 @@ pub extern "C" fn pc_layer_mask_set(
             Err(e) => return fail(e),
         };
         // SAFETY: live session pointer.
-        let s = unsafe { &mut *session };
-        let entry = match s.docs.get_mut(&id) {
-            Some(e) => e,
-            None => return fail(format!("document {id} is not open")),
+        let s = unsafe { &*session };
+        let entry = match s.entry_mut(id) {
+            Ok(e) => e,
+            Err(e) => return fail(e),
         };
+        let mut entry_guard = entry.write().unwrap_or_else(|e| e.into_inner());
+        let entry = &mut *entry_guard;
         // §D 7：已有蒙版。
         let current = match find_layer(&entry.doc.layers, layer) {
             Some(target) => match target.mask.as_ref() {
@@ -2637,11 +2692,13 @@ pub extern "C" fn pc_layer_mask_fill_from_selection(
         };
         let mode = String::from_utf8_lossy(mode_bytes).into_owned();
         // SAFETY: live session pointer.
-        let s = unsafe { &mut *session };
-        let entry = match s.docs.get_mut(&id) {
-            Some(e) => e,
-            None => return fail(format!("document {id} is not open")),
+        let s = unsafe { &*session };
+        let entry = match s.entry_mut(id) {
+            Ok(e) => e,
+            Err(e) => return fail(e),
         };
+        let mut entry_guard = entry.write().unwrap_or_else(|e| e.into_inner());
+        let entry = &mut *entry_guard;
         // §D 校验顺序 3（图层存在）→ 4（mode 取值）→ 5（类型）→ 10（选区存在）。
         let (capable, existing) = match find_layer(&entry.doc.layers, layer) {
             Some(target) => (mask_capable(&target.content), target.mask.clone()),
@@ -2692,11 +2749,13 @@ pub extern "C" fn pc_layer_mask_apply(session: *mut Session, id: u64, layer: u64
             return fail("null session");
         }
         // SAFETY: live session pointer.
-        let s = unsafe { &mut *session };
-        let entry = match s.docs.get_mut(&id) {
-            Some(e) => e,
-            None => return fail(format!("document {id} is not open")),
+        let s = unsafe { &*session };
+        let entry = match s.entry_mut(id) {
+            Ok(e) => e,
+            Err(e) => return fail(e),
         };
+        let mut entry_guard = entry.write().unwrap_or_else(|e| e.into_inner());
+        let entry = &mut *entry_guard;
         // 第 2 步：在克隆上烘焙（不写文档）。§D 7（无蒙版）→ 11（非像素）→ 12（无 alpha）
         // 的校验都在 helper 内，全部发生在 checkpoint 之前。
         let baked = match find_layer(&entry.doc.layers, layer) {
@@ -2728,11 +2787,13 @@ pub extern "C" fn pc_layer_mask_remove(session: *mut Session, id: u64, layer: u6
             return fail("null session");
         }
         // SAFETY: live session pointer.
-        let s = unsafe { &mut *session };
-        let entry = match s.docs.get_mut(&id) {
-            Some(e) => e,
-            None => return fail(format!("document {id} is not open")),
+        let s = unsafe { &*session };
+        let entry = match s.entry_mut(id) {
+            Ok(e) => e,
+            Err(e) => return fail(e),
         };
+        let mut entry_guard = entry.write().unwrap_or_else(|e| e.into_inner());
+        let entry = &mut *entry_guard;
         // §D 3（图层存在）→ 7（已有蒙版）。
         let has_mask = match find_layer(&entry.doc.layers, layer) {
             Some(target) => target.mask.is_some(),
@@ -2761,7 +2822,7 @@ pub extern "C" fn pc_selection_info(session: *mut Session, id: u64) -> *mut PcBu
         // SAFETY: live session pointer.
         let s = unsafe { &*session };
         match s.entry(id) {
-            Ok(entry) => ok(selection_json(&entry.doc)),
+            Ok(entry) => ok(selection_json(&entry.read().unwrap_or_else(|e| e.into_inner()).doc)),
             Err(e) => fail(e),
         }
     })
@@ -2775,11 +2836,13 @@ pub extern "C" fn pc_layer_visible(session: *mut Session, id: u64, layer: u64, v
             return fail("null session");
         }
         // SAFETY: live session pointer.
-        let s = unsafe { &mut *session };
+        let s = unsafe { &*session };
         let entry = match s.entry_mut(id) {
             Ok(e) => e,
             Err(e) => return fail(e),
         };
+        let mut entry_guard = entry.write().unwrap_or_else(|e| e.into_inner());
+        let entry = &mut *entry_guard;
         if find_layer(&entry.doc.layers, layer).is_none() {
             return fail("layer not found");
         }
@@ -2799,11 +2862,13 @@ pub extern "C" fn pc_layer_opacity(session: *mut Session, id: u64, layer: u64, o
             return fail("null session");
         }
         // SAFETY: live session pointer.
-        let s = unsafe { &mut *session };
+        let s = unsafe { &*session };
         let entry = match s.entry_mut(id) {
             Ok(e) => e,
             Err(e) => return fail(e),
         };
+        let mut entry_guard = entry.write().unwrap_or_else(|e| e.into_inner());
+        let entry = &mut *entry_guard;
         if find_layer(&entry.doc.layers, layer).is_none() {
             return fail("layer not found");
         }
@@ -3682,6 +3747,8 @@ pub extern "C" fn pc_layer_effects_get(session: *mut Session, id: u64, layer: u6
             Ok(e) => e,
             Err(e) => return fail(e),
         };
+        let entry_guard = entry.read().unwrap_or_else(|e| e.into_inner());
+        let entry = &*entry_guard;
         match find_layer(&entry.doc.layers, layer) {
             Some(target) => ok(effects_json(target)),
             None => fail("layer not found"),
@@ -3712,11 +3779,13 @@ pub extern "C" fn pc_layer_effects_apply(
             Err(e) => return fail(format!("effects: invalid parameters: {e}")),
         };
         // SAFETY: live session pointer.
-        let s = unsafe { &mut *session };
-        let entry = match s.docs.get_mut(&id) {
-            Some(e) => e,
-            None => return fail(format!("document {id} is not open")),
+        let s = unsafe { &*session };
+        let entry = match s.entry_mut(id) {
+            Ok(e) => e,
+            Err(e) => return fail(e),
         };
+        let mut entry_guard = entry.write().unwrap_or_else(|e| e.into_inner());
+        let entry = &mut *entry_guard;
         if let Err(e) = validate_effect_op(entry, layer, &p) {
             return fail(e);
         }
@@ -3751,11 +3820,13 @@ pub extern "C" fn pc_layer_blend(session: *mut Session, id: u64, layer: u64, mod
             return fail(format!("unsupported blend mode: {mode_name}"));
         };
         // SAFETY: live session pointer.
-        let s = unsafe { &mut *session };
+        let s = unsafe { &*session };
         let entry = match s.entry_mut(id) {
             Ok(e) => e,
             Err(e) => return fail(e),
         };
+        let mut entry_guard = entry.write().unwrap_or_else(|e| e.into_inner());
+        let entry = &mut *entry_guard;
         if find_layer(&entry.doc.layers, layer).is_none() {
             return fail("layer not found");
         }
@@ -3775,11 +3846,13 @@ pub extern "C" fn pc_layer_fill_opacity(session: *mut Session, id: u64, layer: u
             return fail("null session");
         }
         // SAFETY: live session pointer.
-        let s = unsafe { &mut *session };
+        let s = unsafe { &*session };
         let entry = match s.entry_mut(id) {
             Ok(e) => e,
             Err(e) => return fail(e),
         };
+        let mut entry_guard = entry.write().unwrap_or_else(|e| e.into_inner());
+        let entry = &mut *entry_guard;
         if find_layer(&entry.doc.layers, layer).is_none() {
             return fail("layer not found");
         }
@@ -3814,11 +3887,13 @@ pub extern "C" fn pc_layer_create(session: *mut Session, id: u64, above: u64, na
             return fail("layer name is too long");
         }
         // SAFETY: live session pointer.
-        let s = unsafe { &mut *session };
+        let s = unsafe { &*session };
         let entry = match s.entry_mut(id) {
             Ok(e) => e,
             Err(e) => return fail(e),
         };
+        let mut entry_guard = entry.write().unwrap_or_else(|e| e.into_inner());
+        let entry = &mut *entry_guard;
         let index = if above == 0 {
             entry.doc.layers.len()
         } else {
@@ -3862,11 +3937,13 @@ pub extern "C" fn pc_layer_rename(session: *mut Session, id: u64, layer: u64, na
             return fail("layer name is too long");
         }
         // SAFETY: live session pointer.
-        let s = unsafe { &mut *session };
+        let s = unsafe { &*session };
         let entry = match s.entry_mut(id) {
             Ok(e) => e,
             Err(e) => return fail(e),
         };
+        let mut entry_guard = entry.write().unwrap_or_else(|e| e.into_inner());
+        let entry = &mut *entry_guard;
         if find_layer(&entry.doc.layers, layer).is_none() {
             return fail("layer not found");
         }
@@ -3889,11 +3966,13 @@ pub extern "C" fn pc_layer_move(session: *mut Session, id: u64, layer: u64, delt
             return fail("delta must not be zero");
         }
         // SAFETY: live session pointer.
-        let s = unsafe { &mut *session };
+        let s = unsafe { &*session };
         let entry = match s.entry_mut(id) {
             Ok(e) => e,
             Err(e) => return fail(e),
         };
+        let mut entry_guard = entry.write().unwrap_or_else(|e| e.into_inner());
+        let entry = &mut *entry_guard;
         let Some((pos, len)) = layer_position(&entry.doc.layers, layer) else {
             return fail("layer not found");
         };
@@ -3918,11 +3997,13 @@ pub extern "C" fn pc_layer_duplicate(session: *mut Session, id: u64, layer: u64)
             return fail("null session");
         }
         // SAFETY: live session pointer.
-        let s = unsafe { &mut *session };
+        let s = unsafe { &*session };
         let entry = match s.entry_mut(id) {
             Ok(e) => e,
             Err(e) => return fail(e),
         };
+        let mut entry_guard = entry.write().unwrap_or_else(|e| e.into_inner());
+        let entry = &mut *entry_guard;
         if find_layer(&entry.doc.layers, layer).is_none() {
             return fail("layer not found");
         }
@@ -3955,11 +4036,13 @@ pub extern "C" fn pc_layer_duplicate_many(session: *mut Session, id: u64, ids_pt
             return fail("no layer to duplicate");
         }
         // SAFETY: live session pointer.
-        let s = unsafe { &mut *session };
+        let s = unsafe { &*session };
         let entry = match s.entry_mut(id) {
             Ok(e) => e,
             Err(e) => return fail(e),
         };
+        let mut entry_guard = entry.write().unwrap_or_else(|e| e.into_inner());
+        let entry = &mut *entry_guard;
         for layer_id in &ids {
             if find_layer(&entry.doc.layers, *layer_id).is_none() {
                 return fail(format!("layer not found: {layer_id}"));
@@ -4050,11 +4133,13 @@ pub extern "C" fn pc_layer_merge_down(session: *mut Session, id: u64, layer: u64
             return fail("null session");
         }
         // SAFETY: live session pointer.
-        let s = unsafe { &mut *session };
+        let s = unsafe { &*session };
         let entry = match s.entry_mut(id) {
             Ok(e) => e,
             Err(e) => return fail(e),
         };
+        let mut entry_guard = entry.write().unwrap_or_else(|e| e.into_inner());
+        let entry = &mut *entry_guard;
         let Some((pos, _)) = layer_position(&entry.doc.layers, layer) else {
             return fail("layer not found");
         };
@@ -4121,11 +4206,13 @@ pub extern "C" fn pc_copy_visible(session: *mut Session, id: u64) -> *mut PcBuff
         if session.is_null() {
             return fail("null session");
         }
-        let s = unsafe { &mut *session };
+        let s = unsafe { &*session };
         let entry = match s.entry_mut(id) {
             Ok(e) => e,
             Err(e) => return fail(e),
         };
+        let mut entry_guard = entry.write().unwrap_or_else(|e| e.into_inner());
+        let entry = &mut *entry_guard;
         let doc_bounds = entry.doc.bounds();
         if doc_bounds.is_empty() {
             return fail("document is empty");
@@ -4184,11 +4271,13 @@ pub extern "C" fn pc_layer_delete(session: *mut Session, id: u64, layer: u64) ->
             return fail("null session");
         }
         // SAFETY: live session pointer.
-        let s = unsafe { &mut *session };
+        let s = unsafe { &*session };
         let entry = match s.entry_mut(id) {
             Ok(e) => e,
             Err(e) => return fail(e),
         };
+        let mut entry_guard = entry.write().unwrap_or_else(|e| e.into_inner());
+        let entry = &mut *entry_guard;
         entry.checkpoint_named("删除图层");
         if delete_layer(&mut entry.doc.layers, layer) { ok(Value::Null) } else { fail("layer not found") }
     })
@@ -4214,11 +4303,13 @@ pub extern "C" fn pc_adjustment_add(session: *mut Session, id: u64, kind_ptr: *c
             Err(e) => return fail(e),
         };
         // SAFETY: live session pointer.
-        let s = unsafe { &mut *session };
+        let s = unsafe { &*session };
         let entry = match s.entry_mut(id) {
             Ok(e) => e,
             Err(e) => return fail(e),
         };
+        let mut entry_guard = entry.write().unwrap_or_else(|e| e.into_inner());
+        let entry = &mut *entry_guard;
         entry.checkpoint();
         let mut layer = Layer::new(layer_name(&kind), LayerContent::Adjustment(adj));
         layer.opacity = 1.0;
@@ -4239,11 +4330,13 @@ pub extern "C" fn pc_adjustment_update(session: *mut Session, id: u64, layer: u6
             Err(e) => return fail(e),
         };
         // SAFETY: live session pointer.
-        let s = unsafe { &mut *session };
+        let s = unsafe { &*session };
         let entry = match s.entry_mut(id) {
             Ok(e) => e,
             Err(e) => return fail(e),
         };
+        let mut entry_guard = entry.write().unwrap_or_else(|e| e.into_inner());
+        let entry = &mut *entry_guard;
         let kind = match find_layer(&entry.doc.layers, layer).map(|l| l.content.clone()) {
             Some(LayerContent::Adjustment(adj)) => match &adj {
                 Adjustment::BrightnessContrast { .. } => "brightnessContrast",
@@ -4283,6 +4376,8 @@ pub extern "C" fn pc_adjustment_get(session: *mut Session, id: u64, layer: u64) 
             Ok(e) => e,
             Err(e) => return fail(e),
         };
+        let entry_guard = entry.read().unwrap_or_else(|e| e.into_inner());
+        let entry = &*entry_guard;
         match find_layer(&entry.doc.layers, layer).map(|l| &l.content) {
             Some(LayerContent::Adjustment(adj)) => ok(adjustment_json(adj)),
             _ => fail("not an adjustment layer"),
@@ -4298,11 +4393,13 @@ pub extern "C" fn pc_undo(session: *mut Session, id: u64) -> *mut PcBuffer {
             return fail("null session");
         }
         // SAFETY: live session pointer.
-        let s = unsafe { &mut *session };
+        let s = unsafe { &*session };
         let entry = match s.entry_mut(id) {
             Ok(e) => e,
             Err(e) => return fail(e),
         };
+        let mut entry_guard = entry.write().unwrap_or_else(|e| e.into_inner());
+        let entry = &mut *entry_guard;
         match entry.undo.pop() {
             Some(prev) => {
                 let label = entry.undo_labels.pop().unwrap_or_else(|| "编辑".to_string());
@@ -4325,11 +4422,13 @@ pub extern "C" fn pc_redo(session: *mut Session, id: u64) -> *mut PcBuffer {
             return fail("null session");
         }
         // SAFETY: live session pointer.
-        let s = unsafe { &mut *session };
+        let s = unsafe { &*session };
         let entry = match s.entry_mut(id) {
             Ok(e) => e,
             Err(e) => return fail(e),
         };
+        let mut entry_guard = entry.write().unwrap_or_else(|e| e.into_inner());
+        let entry = &mut *entry_guard;
         match entry.redo.pop() {
             Some(next) => {
                 let label = entry.redo_labels.pop().unwrap_or_else(|| "编辑".to_string());
@@ -4357,6 +4456,8 @@ pub extern "C" fn pc_history(session: *mut Session, id: u64) -> *mut PcBuffer {
             Ok(e) => e,
             Err(e) => return fail(e),
         };
+        let entry_guard = entry.read().unwrap_or_else(|e| e.into_inner());
+        let entry = &*entry_guard;
         let undo: Vec<&str> = entry.undo_labels.iter().rev().map(String::as_str).collect();
         let redo: Vec<&str> = entry.redo_labels.iter().rev().map(String::as_str).collect();
         ok(json!({ "undo": undo, "redo": redo }))
@@ -4375,11 +4476,13 @@ pub extern "C" fn pc_undo_steps(session: *mut Session, id: u64, steps: u32) -> *
             return fail("steps must be positive");
         }
         // SAFETY: live session pointer.
-        let s = unsafe { &mut *session };
+        let s = unsafe { &*session };
         let entry = match s.entry_mut(id) {
             Ok(e) => e,
             Err(e) => return fail(e),
         };
+        let mut entry_guard = entry.write().unwrap_or_else(|e| e.into_inner());
+        let entry = &mut *entry_guard;
         if entry.undo.is_empty() {
             return fail("nothing to undo");
         }
@@ -4408,11 +4511,13 @@ pub extern "C" fn pc_redo_steps(session: *mut Session, id: u64, steps: u32) -> *
             return fail("steps must be positive");
         }
         // SAFETY: live session pointer.
-        let s = unsafe { &mut *session };
+        let s = unsafe { &*session };
         let entry = match s.entry_mut(id) {
             Ok(e) => e,
             Err(e) => return fail(e),
         };
+        let mut entry_guard = entry.write().unwrap_or_else(|e| e.into_inner());
+        let entry = &mut *entry_guard;
         if entry.redo.is_empty() {
             return fail("nothing to redo");
         }
@@ -4452,6 +4557,8 @@ pub extern "C" fn pc_export(session: *mut Session, id: u64, format_ptr: *const u
             Ok(e) => e,
             Err(e) => return fail(e),
         };
+        let entry_guard = entry.read().unwrap_or_else(|e| e.into_inner());
+        let entry = &*entry_guard;
         let mut opts = photocraft_io::ExportOptions::default();
         opts.encode.jpeg_quality = quality.clamp(1, 100);
         opts.encode.webp_quality = quality.clamp(1, 100);
@@ -4601,11 +4708,13 @@ pub extern "C" fn pc_layer_group(
             Err(_) => return fail("group name must be UTF-8"),
         };
         // SAFETY: live session pointer.
-        let s = unsafe { &mut *session };
-        let entry = match s.docs.get_mut(&id) {
-            Some(e) => e,
-            None => return fail(format!("document {id} is not open")),
+        let s = unsafe { &*session };
+        let entry = match s.entry_mut(id) {
+            Ok(e) => e,
+            Err(e) => return fail(e),
         };
+        let mut entry_guard = entry.write().unwrap_or_else(|e| e.into_inner());
+        let entry = &mut *entry_guard;
         // 第 1 步：逐个确认存在（错误文本带 id）。
         for &layer in &ids {
             if find_layer(&entry.doc.layers, layer).is_none() {
@@ -4655,11 +4764,13 @@ pub extern "C" fn pc_layer_ungroup(session: *mut Session, id: u64, layer: u64) -
             return fail("null session");
         }
         // SAFETY: live session pointer.
-        let s = unsafe { &mut *session };
-        let entry = match s.docs.get_mut(&id) {
-            Some(e) => e,
-            None => return fail(format!("document {id} is not open")),
+        let s = unsafe { &*session };
+        let entry = match s.entry_mut(id) {
+            Ok(e) => e,
+            Err(e) => return fail(e),
         };
+        let mut entry_guard = entry.write().unwrap_or_else(|e| e.into_inner());
+        let entry = &mut *entry_guard;
         // 校验全部在 checkpoint 之前：目标存在且确实是组。
         let count = match find_layer(&entry.doc.layers, layer) {
             Some(target) if target.is_group() => target.children().map(|c| c.len()).unwrap_or(0),
@@ -4684,11 +4795,13 @@ pub extern "C" fn pc_layer_expanded(session: *mut Session, id: u64, layer: u64, 
             return fail("null session");
         }
         // SAFETY: live session pointer.
-        let s = unsafe { &mut *session };
-        let entry = match s.docs.get_mut(&id) {
-            Some(e) => e,
-            None => return fail(format!("document {id} is not open")),
+        let s = unsafe { &*session };
+        let entry = match s.entry_mut(id) {
+            Ok(e) => e,
+            Err(e) => return fail(e),
         };
+        let mut entry_guard = entry.write().unwrap_or_else(|e| e.into_inner());
+        let entry = &mut *entry_guard;
         let next = expanded != 0;
         let current = match find_layer(&entry.doc.layers, layer) {
             Some(target) => match &target.content {
@@ -4746,11 +4859,13 @@ pub extern "C" fn pc_layer_clipped(session: *mut Session, id: u64, layer: u64, c
             return fail("null session");
         }
         // SAFETY: live session pointer.
-        let s = unsafe { &mut *session };
-        let entry = match s.docs.get_mut(&id) {
-            Some(e) => e,
-            None => return fail(format!("document {id} is not open")),
+        let s = unsafe { &*session };
+        let entry = match s.entry_mut(id) {
+            Ok(e) => e,
+            Err(e) => return fail(e),
         };
+        let mut entry_guard = entry.write().unwrap_or_else(|e| e.into_inner());
+        let entry = &mut *entry_guard;
         let next = clipped != 0;
         let current = match find_layer(&entry.doc.layers, layer) {
             Some(target) => target.clipped,
@@ -4866,11 +4981,13 @@ pub extern "C" fn pc_layer_delete_many(session: *mut Session, id: u64, ids_ptr: 
             return fail("no layer to delete");
         }
         // SAFETY: live session pointer.
-        let s = unsafe { &mut *session };
-        let entry = match s.docs.get_mut(&id) {
-            Some(e) => e,
-            None => return fail(format!("document {id} is not open")),
+        let s = unsafe { &*session };
+        let entry = match s.entry_mut(id) {
+            Ok(e) => e,
+            Err(e) => return fail(e),
         };
+        let mut entry_guard = entry.write().unwrap_or_else(|e| e.into_inner());
+        let entry = &mut *entry_guard;
         // 第 1 步：逐个确认存在（错误文本带 id），全部在 checkpoint 之前。
         for &layer in &ids {
             if find_layer(&entry.doc.layers, layer).is_none() {
@@ -4909,11 +5026,13 @@ pub extern "C" fn pc_document_crop(session: *mut Session, id: u64, x0: i32, y0: 
             return fail("null session");
         }
         // SAFETY: 调用方保证 session 是指向存活 `Session` 的非空指针。
-        let s = unsafe { &mut *session };
+        let s = unsafe { &*session };
         let entry = match s.entry_mut(id) {
             Ok(e) => e,
             Err(e) => return fail(e),
         };
+        let mut entry_guard = entry.write().unwrap_or_else(|e| e.into_inner());
+        let entry = &mut *entry_guard;
         // 变更前快照：撤销栈必须存"裁剪之前的文档"，否则 `pc_undo` 恢复不回原尺寸。
         let before = entry.doc.clone();
         match entry.doc.crop_to(Rect::new(x0, y0, x1, y1)) {
@@ -4940,11 +5059,13 @@ pub extern "C" fn pc_document_resize_canvas(session: *mut Session, id: u64, widt
             return fail("null session");
         }
         // SAFETY: 同上，session 为存活 `Session` 的非空指针。
-        let s = unsafe { &mut *session };
+        let s = unsafe { &*session };
         let entry = match s.entry_mut(id) {
             Ok(e) => e,
             Err(e) => return fail(e),
         };
+        let mut entry_guard = entry.write().unwrap_or_else(|e| e.into_inner());
+        let entry = &mut *entry_guard;
         // 非正尺寸在桥接层先拦（doc 层同样会拒绝，但这里给出统一文案并避免无谓的克隆）。
         if width < 1 || height < 1 {
             return fail("invalid canvas size");
@@ -5029,7 +5150,7 @@ pub extern "C" fn pc_guides_get(session: *mut Session, id: u64) -> *mut PcBuffer
         // SAFETY: live session pointer.
         let s = unsafe { &*session };
         match s.entry(id) {
-            Ok(entry) => ok(guides_json(&entry.doc)),
+            Ok(entry) => ok(guides_json(&entry.read().unwrap_or_else(|e| e.into_inner()).doc)),
             Err(e) => fail(e),
         }
     })
@@ -5057,11 +5178,13 @@ pub extern "C" fn pc_guides_set(
             Err(_) => return fail("invalid guides"),
         };
         // SAFETY: live session pointer.
-        let s = unsafe { &mut *session };
-        let entry = match s.docs.get_mut(&id) {
-            Some(e) => e,
-            None => return fail(format!("document {id} is not open")),
+        let s = unsafe { &*session };
+        let entry = match s.entry_mut(id) {
+            Ok(e) => e,
+            Err(e) => return fail(e),
         };
+        let mut entry_guard = entry.write().unwrap_or_else(|e| e.into_inner());
+        let entry = &mut *entry_guard;
         let invalid = params.horizontal.as_ref().is_some_and(|v| !valid_guide_axis(v))
             || params.vertical.as_ref().is_some_and(|v| !valid_guide_axis(v))
             || params.origin.as_ref().is_some_and(|o| !valid_guide_origin(o));
@@ -5519,11 +5642,13 @@ pub extern "C" fn pc_layer_transform(session: *mut Session, id: u64, layer: u64,
             return fail("invalid transform");
         }
         // SAFETY: live session pointer.
-        let s = unsafe { &mut *session };
-        let entry = match s.docs.get_mut(&id) {
-            Some(e) => e,
-            None => return fail(format!("document {id} is not open")),
+        let s = unsafe { &*session };
+        let entry = match s.entry_mut(id) {
+            Ok(e) => e,
+            Err(e) => return fail(e),
         };
+        let mut entry_guard = entry.write().unwrap_or_else(|e| e.into_inner());
+        let entry = &mut *entry_guard;
         let bounds = match find_layer(&entry.doc.layers, layer) {
             None => return fail("layer not found"),
             Some(target) => {
@@ -5816,7 +5941,8 @@ mod effects_api_tests {
         fn with_layer<R>(&self, f: impl FnOnce(&Layer) -> R) -> R {
             // SAFETY: 测试独占该 session，且没有 C ABI 调用同时进行。
             let session = unsafe { &*self.session };
-            let entry = session.docs.get(&self.doc).unwrap_or_else(|| panic!("文档 {} 不存在", self.doc));
+            let entry = session.entry(self.doc).unwrap_or_else(|_| panic!("文档 {} 不存在", self.doc));
+            let entry = entry.read().unwrap_or_else(|e| e.into_inner());
             let layer = find_layer(&entry.doc.layers, self.layer).unwrap_or_else(|| panic!("图层 {} 不存在", self.layer));
             f(layer)
         }
@@ -5840,8 +5966,9 @@ mod effects_api_tests {
         /// （`C-EFFECTS-API@2` 起内阴影属于可编辑项，会被 `clear` 删除，不能再当保留样本。）
         fn push_pattern_overlay(&self) {
             // SAFETY: 见 `with_layer`；此处需要可变借用。
-            let session = unsafe { &mut *self.session };
-            let entry = session.docs.get_mut(&self.doc).expect("文档必须存在");
+            let session = unsafe { &*self.session };
+            let entry = session.entry_mut(self.doc).expect("文档必须存在");
+            let mut entry = entry.write().unwrap_or_else(|e| e.into_inner());
             let layer = find_layer_mut(&mut entry.doc.layers, self.layer).expect("图层必须存在");
             layer.effects.items.push(Effect::PatternOverlay {
                 common: FxCommon::new(BlendMode::Normal, 1.0),
@@ -5857,8 +5984,9 @@ mod effects_api_tests {
         /// 可变访问文档数据：用于构造桥接层不暴露的样本与预置 `interpolation` 记录。
         fn with_layer_mut<R>(&self, f: impl FnOnce(&mut Layer) -> R) -> R {
             // SAFETY: 测试独占该 session，且没有 C ABI 调用同时进行。
-            let session = unsafe { &mut *self.session };
-            let entry = session.docs.get_mut(&self.doc).unwrap_or_else(|| panic!("文档 {} 不存在", self.doc));
+            let session = unsafe { &*self.session };
+            let entry = session.entry_mut(self.doc).unwrap_or_else(|_| panic!("文档 {} 不存在", self.doc));
+            let mut entry = entry.write().unwrap_or_else(|e| e.into_inner());
             let layer = find_layer_mut(&mut entry.doc.layers, self.layer).unwrap_or_else(|| panic!("图层 {} 不存在", self.layer));
             f(layer)
         }
@@ -7498,8 +7626,9 @@ mod edit_api_tests {
         /// E8 需要构造桥接层不暴露的渐变填充。
         fn with_layer_mut<R>(&self, layer: u64, f: impl FnOnce(&mut Layer) -> R) -> R {
             // SAFETY: 测试独占该 session，且没有 C ABI 调用同时进行。
-            let session = unsafe { &mut *self.session };
-            let entry = session.docs.get_mut(&self.doc).unwrap_or_else(|| panic!("文档 {} 不存在", self.doc));
+            let session = unsafe { &*self.session };
+            let entry = session.entry_mut(self.doc).unwrap_or_else(|_| panic!("文档 {} 不存在", self.doc));
+            let mut entry = entry.write().unwrap_or_else(|e| e.into_inner());
             let target =
                 find_layer_mut(&mut entry.doc.layers, layer).unwrap_or_else(|| panic!("图层 {layer} 不存在"));
             f(target)
@@ -8506,8 +8635,9 @@ mod edit_api_tests {
         let id = created["data"]["id"].as_u64().unwrap_or(0);
         {
             // SAFETY: 测试独占该 session，且没有 C ABI 调用同时进行。
-            let session = unsafe { &mut *ctx.session };
-            let entry = session.docs.get_mut(&id).unwrap_or_else(|| panic!("e24 文档存在"));
+            let session = unsafe { &*ctx.session };
+            let entry = session.entry_mut(id).unwrap_or_else(|_| panic!("e24 文档存在"));
+            let mut entry = entry.write().unwrap_or_else(|e| e.into_inner());
             let layer = &mut entry.doc.layers[0];
             layer.surface_mut().unwrap_or_else(|| panic!("e24 Background surface")).fill_rect(Rect::new(0, 0, 2, 1), &[1.0, 0.0, 0.0, 1.0]);
         }
@@ -11661,8 +11791,9 @@ mod cutout_api_tests {
         let (session, doc, layer) = fixture(w, h);
         // SAFETY: 娴嬭瘯妯″潡涓?Session 鍚?crate锛宻ession 鐢?pc_session_new 鍒嗛厤涓斾粛鏈夋晥銆
         unsafe {
-            let s = &mut *session;
-            let entry = s.docs.get_mut(&doc).expect("doc");
+            let s = &*session;
+            let entry = s.entry_mut(doc).expect("doc");
+            let mut entry = entry.write().unwrap_or_else(|e| e.into_inner());
             let target = find_layer_mut(&mut entry.doc.layers, layer).expect("layer");
             if let LayerContent::Raster(surface) = &mut target.content {
                 surface.fill_rect(Rect::new(30, 30, (w as i32) - 30, (h as i32) - 30), &[0.05, 0.05, 0.08, 1.0]);
@@ -11761,8 +11892,9 @@ mod vector_selection_api_tests {
 
         // 娉ㄥ叆璺緞闇€閫氳繃缂栬緫 ABI锛氱洿鎺ュ啓鍐呴儴璺緞浠ヤ繚璇佺‘瀹氭€э紙娴嬭瘯涓?bridge 鍚?crate锛夈€
         unsafe {
-            let s = &mut *session;
-            let entry = s.docs.get_mut(&doc).expect("doc");
+            let s = &*session;
+            let entry = s.entry_mut(doc).expect("doc");
+            let mut entry = entry.write().unwrap_or_else(|e| e.into_inner());
             let target = find_layer_mut(&mut entry.doc.layers, shape_layer).expect("shape layer");
             if let LayerContent::Shape(shape) = &mut target.content {
                 shape.path = path;
@@ -11787,6 +11919,98 @@ mod vector_selection_api_tests {
             "raster reject",
         );
         assert_eq!(bad["ok"].as_bool(), Some(false), "鍍忕礌鍥惧眰搴旇鎷掔粷");
+        pc_session_free(session);
+    }
+}
+
+#[cfg(test)]
+mod concurrency_tests {
+    //! Session 线程安全契约：纯读并发、写串行、close 竞态（NAPI 异步化前置）。
+    #![allow(clippy::panic, clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+
+    use super::*;
+
+    /// 裸指针跨线程共享的合法性由 Session 内部 RwLock 保证。
+    struct SharedSession(*mut Session);
+    unsafe impl Send for SharedSession {}
+    unsafe impl Sync for SharedSession {}
+
+    fn take_json(buf: *mut PcBuffer, ctx: &str) -> Value {
+        let bytes = PcBuffer::into_vec(buf).unwrap_or_else(|| panic!("{ctx}: no result"));
+        serde_json::from_slice(&bytes).unwrap_or_else(|e| panic!("{ctx}: bad json: {e}"))
+    }
+
+    fn setup() -> (*mut Session, u64, u64) {
+        let session = pc_session_new();
+        let created = take_json(pc_document_new(session, 64, 64, b"conc".as_ptr(), 4), "new");
+        assert_eq!(created["ok"].as_bool(), Some(true), "{created}");
+        let doc = created["data"]["id"].as_u64().expect("doc id");
+        let info = take_json(pc_info(session, doc), "info");
+        let layer = info["data"]["layers"][0]["id"].as_u64().expect("layer id");
+        (session, doc, layer)
+    }
+
+    fn render_ok(session: *mut Session, doc: u64) -> bool {
+        let mut raw: *mut PcBuffer = std::ptr::null_mut();
+        let out = take_json(pc_render(session, doc, 0, 0, 64, 64, &mut raw), "render");
+        if !raw.is_null() {
+            pc_buffer_free(raw);
+        }
+        out["ok"].as_bool() == Some(true)
+    }
+
+    fn export_ok(session: *mut Session, doc: u64) -> bool {
+        let mut bytes: *mut PcBuffer = std::ptr::null_mut();
+        let fmt = b"png";
+        let out = take_json(pc_export(session, doc, fmt.as_ptr(), fmt.len(), 90, &mut bytes), "export");
+        let ok = out["ok"].as_bool() == Some(true) && !bytes.is_null();
+        if !bytes.is_null() {
+            pc_buffer_free(bytes);
+        }
+        ok
+    }
+
+    #[test]
+    fn concurrent_reads_with_serialized_writes() {
+        let (session, doc, layer) = setup();
+        let shared = SharedSession(session);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let s = &shared;
+                scope.spawn(move || {
+                    for _ in 0..25 {
+                        assert!(render_ok(s.0, doc), "render under concurrency");
+                        assert!(export_ok(s.0, doc), "export under concurrency");
+                    }
+                });
+            }
+            let s = &shared;
+            scope.spawn(move || {
+                for i in 0..25 {
+                    let out = take_json(pc_layer_visible(s.0, doc, layer, i % 2 == 0), "visible");
+                    assert_eq!(out["ok"].as_bool(), Some(true), "{out}");
+                }
+            });
+        });
+        pc_session_free(session);
+    }
+
+    #[test]
+    fn close_races_render_without_crash() {
+        let (session, doc, _layer) = setup();
+        let shared = SharedSession(session);
+        std::thread::scope(|scope| {
+            let s = &shared;
+            scope.spawn(move || {
+                for _ in 0..50 {
+                    // close 前 ok，close 后返回 not open；任何时刻都不得崩溃。
+                    let _ = render_ok(s.0, doc);
+                }
+            });
+            pc_close(session, doc);
+        });
+        let out = take_json(pc_render(session, doc, 0, 0, 8, 8, &mut std::ptr::null_mut()), "render after close");
+        assert_eq!(out["ok"].as_bool(), Some(false), "{out}");
         pc_session_free(session);
     }
 }
