@@ -26,6 +26,16 @@ function caughtMessage(action: () => void): string {
   return '';
 }
 
+/** 执行异步动作并返回其抛出的错误信息；未抛错时返回空串。 */
+async function caughtMessageAsync(action: () => Promise<void>): Promise<string> {
+  try {
+    await action();
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
+  return '';
+}
+
 /** 构造最简图层，供 flattenLayers 的结构化断言使用。 */
 function makeLayer(id: number, isGroup: boolean, expanded: boolean, children: LayerInfo[]): LayerInfo {
   return {
@@ -417,14 +427,14 @@ export default function engineTest() {
     // D2 智能抠图（1.0.2）：cutoutRemoveBackground 错误分支
     // ──────────────────────────────────────────────────────────────────────
 
-    it('cutoutRejectsNonRasterLayer', 0, () => {
+    it('cutoutRejectsNonRasterLayer', 0, async () => {
       // 矢量层调抠图报「仅支持像素图层」。
       const created = Engine.newDocument(64, 48, 'cutout-shape');
       const docId: number = created.id;
       try {
         const out = Engine.vectorPathCreate(docId, '{}');
-        const message: string = caughtMessage(() => {
-          Engine.cutoutRemoveBackground(docId, out.layerId, true);
+        const message: string = await caughtMessageAsync(async () => {
+          await Engine.cutoutRemoveBackground(docId, out.layerId, true);
         });
         expect(message.indexOf('像素图层') >= 0).assertTrue();
       } finally {
@@ -432,12 +442,12 @@ export default function engineTest() {
       }
     });
 
-    it('cutoutUnknownDocumentThrows', 0, () => {
+    it('cutoutUnknownDocumentThrows', 0, async () => {
       const created = Engine.newDocument(64, 48, 'cutout-closed');
       const docId: number = created.id;
       Engine.close(docId);
-      const message: string = caughtMessage(() => {
-        Engine.cutoutRemoveBackground(docId, 1, true);
+      const message: string = await caughtMessageAsync(async () => {
+        await Engine.cutoutRemoveBackground(docId, 1, true);
       });
       expect(message.length > 0).assertTrue();
     });
@@ -446,12 +456,12 @@ export default function engineTest() {
     // G1 PSD 导出验证（1.1.0）：证明 PSD 导出链路通（签名检查）
     // ──────────────────────────────────────────────────────────────────────
 
-    it('exportImagePsdSignature', 0, () => {
+    it('exportImagePsdSignature', 0, async () => {
       // PSD 文件以 '8BPS' 签名开头；验证 pc_export 的 psd 分支产出合法 PSD 字节。
       const created = Engine.newDocument(64, 48, 'export-psd');
       const docId: number = created.id;
       try {
-        const bytes = Engine.exportImage(docId, 'psd', 90);
+        const bytes = await Engine.exportImage(docId, 'psd', 90);
         expect(bytes.byteLength > 0).assertTrue();
         const view = new Uint8Array(bytes);
         expect(view[0]).assertEqual(0x38); // '8'
@@ -463,11 +473,11 @@ export default function engineTest() {
       }
     });
 
-    it('exportImagePngNonEmpty', 0, () => {
+    it('exportImagePngNonEmpty', 0, async () => {
       const created = Engine.newDocument(64, 48, 'export-png');
       const docId: number = created.id;
       try {
-        const bytes = Engine.exportImage(docId, 'png', 90);
+        const bytes = await Engine.exportImage(docId, 'png', 90);
         expect(bytes.byteLength > 0).assertTrue();
       } finally {
         Engine.close(docId);
@@ -478,14 +488,14 @@ export default function engineTest() {
     // G2 复制可见验证（1.1.0）：pc_copy_visible 链路
     // ──────────────────────────────────────────────────────────────────────
 
-    it('copyVisibleCreatesNewLayer', 0, () => {
+    it('copyVisibleCreatesNewLayer', 0, async () => {
       // 新建文档默认 1 个可见 Background 层；copyVisible 合成可见内容到新图层。
       const created = Engine.newDocument(64, 48, 'copy-visible');
       const docId: number = created.id;
       try {
         const before = Engine.info(docId);
         expect(before.layers.length).assertEqual(1);
-        const result = Engine.copyVisible(docId);
+        const result = await Engine.copyVisible(docId);
         expect(result.layerId > 0).assertTrue();
         expect(result.info.layers.length >= 2).assertTrue();
       } finally {
@@ -517,14 +527,67 @@ export default function engineTest() {
       expect(visibleRectLeavesTile(50, 250, 400, 550, 100, 200, 500, 600)).assertTrue();
     });
 
-    it('copyVisibleOnClosedDocumentThrows', 0, () => {
+    it('copyVisibleOnClosedDocumentThrows', 0, async () => {
       const created = Engine.newDocument(64, 48, 'copy-visible-closed');
       const docId: number = created.id;
       Engine.close(docId);
-      const message: string = caughtMessage(() => {
-        Engine.copyVisible(docId);
+      const message: string = await caughtMessageAsync(async () => {
+        await Engine.copyVisible(docId);
       });
       expect(message.length > 0).assertTrue();
+    });
+
+    // ──────────────────────────────────────────────────────────────────────
+    // C 异步 NAPI：重操作 Promise 契约
+    // ──────────────────────────────────────────────────────────────────────
+
+    it('exportAsyncResolvesArrayBuffer', 0, async () => {
+      const created = Engine.newDocument(16, 16, 'export-async');
+      const docId: number = created.id;
+      try {
+        const bytes = await Engine.exportImage(docId, 'png', 90);
+        expect(bytes.byteLength > 0).assertTrue();
+        const head = new Uint8Array(bytes);
+        expect(head[0]).assertEqual(0x89);
+        expect(head[1]).assertEqual(0x50);
+      } finally {
+        Engine.close(docId);
+      }
+    });
+
+    it('openAsyncRoundTrip', 0, async () => {
+      // 导出 PNG 字节再经 openImage 打开：异步 open 链路尺寸往返一致。
+      const created = Engine.newDocument(32, 24, 'open-roundtrip-src');
+      const docId: number = created.id;
+      try {
+        const png = await Engine.exportImage(docId, 'png', 90);
+        const opened = await Engine.open('roundtrip.png', png);
+        try {
+          expect(opened.info.width).assertEqual(32);
+          expect(opened.info.height).assertEqual(24);
+        } finally {
+          Engine.close(opened.id);
+        }
+      } finally {
+        Engine.close(docId);
+      }
+    });
+
+    it('concurrentExportsResolve', 0, async () => {
+      // 同 doc 双导出并发（Promise.all）：Session 读锁并发不得死锁或丢结果。
+      const created = Engine.newDocument(24, 24, 'export-concurrent');
+      const docId: number = created.id;
+      try {
+        const results = await Promise.all([
+          Engine.exportImage(docId, 'png', 90),
+          Engine.exportImage(docId, 'jpeg', 80)
+        ]);
+        expect(results.length).assertEqual(2);
+        expect(results[0].byteLength > 0).assertTrue();
+        expect(results[1].byteLength > 0).assertTrue();
+      } finally {
+        Engine.close(docId);
+      }
     });
   });
 }

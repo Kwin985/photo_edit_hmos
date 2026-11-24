@@ -97,7 +97,7 @@ export interface LayerMaskInfo {
 }
 
 declare const native: {
-  openImage(name: string, data: ArrayBuffer): string;
+  openImage(name: string, data: ArrayBuffer): Promise<string>;
   /** 新建空白文档（RGB/8 位、白色 Background）；返回与 openImage 同形的 JSON 字符串。 */
   newDocument(width: number, height: number, name: string): string;
   /** 画布旋转/翻转：turn 0=水平翻转、1=垂直翻转、2=180°、3=顺时针 90°、4=逆时针 90°。 */
@@ -116,7 +116,7 @@ declare const native: {
   paintStroke(documentId: number, layerId: number, paramsJson: string, pointsJson: string): string;
   select(documentId: number, paramsJson: string): string;
   selectionInfo(documentId: number): string;
-  filterApply(documentId: number, layerId: number, paramsJson: string): string;
+  filterApply(documentId: number, layerId: number, paramsJson: string): Promise<string>;
   shapeCreate(documentId: number, paramsJson: string): string;
   fontRegister(data: ArrayBuffer): string;
   textCreate(documentId: number, paramsJson: string): string;
@@ -137,13 +137,13 @@ declare const native: {
   /** 批量删除：idsJson 是 JSON 数组字符串；整批共享一次撤销点，返回 `{"ok":true,"data":{"deleted":N}}` */
   layerDeleteMany(documentId: number, idsJson: string): string;
   /** 复制可见：把所有可见图层合成到新图层，返回 `{layerId, info}`。 */
-  copyVisible(documentId: number): string;
+  copyVisible(documentId: number): Promise<string>;
   addAdjustment(documentId: number, kind: string, paramsJson: string): string;
   updateAdjustment(documentId: number, layerId: number, paramsJson: string): void;
   getAdjustment(documentId: number, layerId: number): string;
   undo(documentId: number): string;
   redo(documentId: number): string;
-  exportImage(documentId: number, format: string, quality: number): ArrayBuffer;
+  exportImage(documentId: number, format: string, quality: number): Promise<ArrayBuffer>;
   layerEffects(documentId: number, layerId: number): string;
   updateLayerEffect(documentId: number, layerId: number, paramsJson: string): string;
   renderPixels(documentId: number, x: number, y: number, w: number, h: number): ArrayBuffer;
@@ -181,7 +181,7 @@ declare const native: {
   /** A1 矢量绘图（1.2.0）：矢量图层路径转选区。paramsJson: {layer, feather?, antiAlias?, mode?}。 */
   vectorPathToSelection(documentId: number, paramsJson: string): string;
   /** D2 智能抠图（1.2.0，传统算法纯离线）：Select Subject + 边缘细化 → 非破坏性图层蒙版。paramsJson: {layer:number, refine?:boolean}。 */
-  cutoutRemoveBackground(documentId: number, paramsJson: string): string;
+  cutoutRemoveBackground(documentId: number, paramsJson: string): Promise<string>;
 };
 
 export default native;

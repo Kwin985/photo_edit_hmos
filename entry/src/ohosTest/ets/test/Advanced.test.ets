@@ -24,6 +24,24 @@ function withDocument(width: number, height: number, name: string, body: (id: nu
   }
 }
 
+async function withDocumentAsync(width: number, height: number, name: string, body: (id: number) => Promise<void>): Promise<void> {
+  const created = Engine.newDocument(width, height, name);
+  try {
+    await body(created.id);
+  } finally {
+    Engine.close(created.id);
+  }
+}
+
+async function messageOfAsync(action: () => Promise<void>): Promise<string> {
+  try {
+    await action();
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
+  return '';
+}
+
 function findInLayers(layers: LayerInfo[], id: number): LayerInfo | null {
   for (const layer of layers) {
     if (layer.id === id) {
@@ -242,9 +260,9 @@ export default function advancedTest() {
       });
     });
 
-    it('exportPngReturnsBytes', 0, () => {
-      withDocument(40, 30, 'export', (id: number) => {
-        const png: ArrayBuffer = Engine.exportImage(id, 'png', 90);
+    it('exportPngReturnsBytes', 0, async () => {
+      await withDocumentAsync(40, 30, 'export', async (id: number) => {
+        const png: ArrayBuffer = await Engine.exportImage(id, 'png', 90);
         expect(png.byteLength > 0).assertTrue();
         // PNG 魔数：89 50 4E 47。
         const head = new Uint8Array(png);
@@ -255,10 +273,10 @@ export default function advancedTest() {
       });
     });
 
-    it('exportUnsupportedFormatThrows', 0, () => {
-      withDocument(40, 30, 'export-bad', (id: number) => {
-        const message = messageOf(() => {
-          Engine.exportImage(id, 'bmp', 90);
+    it('exportUnsupportedFormatThrows', 0, async () => {
+      await withDocumentAsync(40, 30, 'export-bad', async (id: number) => {
+        const message = await messageOfAsync(async () => {
+          await Engine.exportImage(id, 'bmp', 90);
         });
         expect(message.indexOf('unsupported export format: bmp') >= 0).assertTrue();
       });

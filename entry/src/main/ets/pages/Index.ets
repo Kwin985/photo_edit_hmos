@@ -1887,7 +1887,7 @@ struct Index {
         this.docId = 0;
       }
       const name = uri.substring(uri.lastIndexOf('/') + 1);
-      const outcome = Engine.open(name, data);
+      const outcome = await Engine.open(name, data);
       this.docId = outcome.id;
       this.info = outcome.info;
       // 文档被替换：丢弃裁剪框且不恢复视图快照（R1.5）。
@@ -1986,7 +1986,7 @@ struct Index {
       fileIo.closeSync(file);
 
       const name = path.substring(path.lastIndexOf('/') + 1);
-      const outcome = Engine.open(name, data);
+      const outcome = await Engine.open(name, data);
       this.docId = outcome.id;
       this.info = outcome.info;
       if (this.cropMode) { this.cropDiscard(); }
@@ -2028,7 +2028,7 @@ struct Index {
         Engine.close(this.docId);
         this.docId = 0;
       }
-      const outcome = Engine.open('sample.jpg', data);
+      const outcome = await Engine.open('sample.jpg', data);
       this.docId = outcome.id;
       this.info = outcome.info;
       // 文档被替换：丢弃裁剪框且不恢复视图快照（R1.5）。
@@ -3936,6 +3936,9 @@ struct Index {
   }
 
   private async applyFilter(): Promise<void> {
+    if (this.busy) {
+      return;
+    }
     if (this.docId === 0) {
       promptAction.showToast({ message: '请先打开一张图片' });
       return;
@@ -3946,7 +3949,8 @@ struct Index {
     }
     const label = this.filterLabel();
     try {
-      const info = Engine.filterApply(this.docId, this.selectedLayerId, JSON.stringify(this.currentFilterArgs()));
+      this.busy = true;
+      const info = await Engine.filterApply(this.docId, this.selectedLayerId, JSON.stringify(this.currentFilterArgs()));
       this.info = info;
       this.layers = flattenLayers(info.layers, 0);
       // 滤镜改变了文档内容：先同步版本号，预览缓存键才会正确失效（R8.2）。
@@ -3955,6 +3959,8 @@ struct Index {
       this.status = '已应用滤镜：' + label;
     } catch (err) {
       this.status = '滤镜失败：' + this.messageOf(err as Object);
+    } finally {
+      this.busy = false;
     }
   }
 
@@ -4290,11 +4296,12 @@ struct Index {
   }
 
   private async copyVisibleLayer(): Promise<void> {
-    if (this.docId === 0) {
+    if (this.docId === 0 || this.busy) {
       return;
     }
     try {
-      const outcome = Engine.copyVisible(this.docId);
+      this.busy = true;
+      const outcome = await Engine.copyVisible(this.docId);
       this.info = outcome.info;
       this.layers = flattenLayers(outcome.info.layers, 0);
       this.selectedLayerId = outcome.layerId;
@@ -4313,6 +4320,8 @@ struct Index {
       this.status = '已复制可见图层';
     } catch (err) {
       this.status = '复制可见失败：' + this.messageOf(err as Object);
+    } finally {
+      this.busy = false;
     }
   }
 
@@ -5164,14 +5173,15 @@ struct Index {
 
   // 智能抠图：调用离线 Select Subject + 边缘细化生成非破坏性蒙版，成功后统一走 afterEdit。
   private async smartCutout(): Promise<void> {
-    if (!this.maskRasterSupported() || this.docId === 0) {
+    if (!this.maskRasterSupported() || this.docId === 0 || this.busy) {
       return;
     }
     const layerId = this.selectedLayerId;
     try {
+      this.busy = true;
       const startedAt = Date.now();
       const beforeRev = Engine.revision(this.docId);
-      const out: CutoutOutcome = Engine.cutoutRemoveBackground(this.docId, layerId, true);
+      const out: CutoutOutcome = await Engine.cutoutRemoveBackground(this.docId, layerId, true);
       const afterRev = Engine.revision(this.docId);
       this.perf('cutout rev=' + beforeRev + '->' + afterRev +
         ' calls=1 ms=' + (Date.now() - startedAt) +
@@ -5182,6 +5192,8 @@ struct Index {
     } catch (err) {
       this.status = '智能抠图失败：' + this.messageOf(err as Object);
       this.loadMask(layerId);
+    } finally {
+      this.busy = false;
     }
   }
 
@@ -6542,13 +6554,16 @@ struct Index {
   }
 
   private async exportImage(): Promise<void> {
+    if (this.busy) {
+      return;
+    }
     if (this.docId === 0) {
       promptAction.showToast({ message: '请先打开一张图片' });
       return;
     }
     try {
       this.busy = true;
-      const bytes = Engine.exportImage(this.docId, this.exportFormat, this.exportQuality);
+      const bytes = await Engine.exportImage(this.docId, this.exportFormat, this.exportQuality);
       const options = new picker.DocumentSaveOptions();
       options.newFileNames = ['artsphoto-' + Date.now() + '.' + this.exportFormat];
       const uris = await new picker.DocumentViewPicker(getContext(this)).save(options);
@@ -6575,6 +6590,9 @@ struct Index {
   // D3 近场文件流转（经系统分享面板，含 Huawei Share 近场设备；不经公网、零权限）。
   // 导出当前文档到应用沙箱临时文件，再把文件 URI 交给系统分享面板；本应用不访问网络。
   private async nearFieldShare(): Promise<void> {
+    if (this.busy) {
+      return;
+    }
     if (this.docId === 0) {
       promptAction.showToast({ message: '请先打开一张图片' });
       return;
@@ -6582,7 +6600,7 @@ struct Index {
     try {
       this.busy = true;
       const format = (this.exportFormat === 'psd' || this.exportFormat === 'psb') ? 'png' : this.exportFormat;
-      const bytes = Engine.exportImage(this.docId, format, this.exportQuality);
+      const bytes = await Engine.exportImage(this.docId, format, this.exportQuality);
       const ctx = getContext(this) as common.UIAbilityContext;
       const dir = ctx.filesDir + '/share';
       try {
@@ -6631,7 +6649,7 @@ struct Index {
     if (kind === 'redo') {
       return this.info?.canRedo === true;
     }
-    return this.docId !== 0;
+    return this.docId !== 0 && !this.busy;
   }
 
   @Builder
@@ -8974,6 +8992,7 @@ struct Index {
             .fontColor('#9fc4ff')
             .borderRadius(6)
             .layoutWeight(1)
+            .enabled(!this.busy)
             .onClick(() => {
               this.copyVisibleLayer();
             })
@@ -9175,7 +9194,7 @@ struct Index {
               .layoutWeight(1)
               .backgroundColor('#234a5e')
               .fontColor('#d8f2ff')
-              .enabled(this.docId !== 0 && this.selectedLayerId !== 0 && this.maskRasterSupported())
+              .enabled(this.docId !== 0 && this.selectedLayerId !== 0 && this.maskRasterSupported() && !this.busy)
               .onClick(() => {
                 this.smartCutout();
               })
@@ -10489,7 +10508,7 @@ struct Index {
         .backgroundColor(this.canFilter() ? COLOR_FILTER_ACCENT : '#4a1a30')
         .fontColor(this.canFilter() ? '#2a0b18' : '#9d6b80')
         .borderRadius(9)
-        .enabled(this.canFilter())
+        .enabled(this.canFilter() && !this.busy)
         .margin({ top: 10 })
         .onClick(() => {
           this.applyFilter();
@@ -11169,7 +11188,7 @@ struct Index {
             .backgroundColor(COLOR_EXPORT_ACCENT)
             .fontColor('#0d1a14')
             .borderRadius(8)
-            .enabled(this.docId !== 0)
+            .enabled(this.docId !== 0 && !this.busy)
             .onClick(() => {
               this.exportImage();
             })

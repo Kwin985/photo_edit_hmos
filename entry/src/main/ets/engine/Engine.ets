@@ -653,8 +653,8 @@ function normalizeLayerTransform(raw: LayerTransformInfo | undefined): LayerTran
 }
 
 export class Engine {
-  static open(name: string, data: ArrayBuffer): OpenOutcome {
-    const parsed = JSON.parse(native.openImage(name, data)) as ApiResponse;
+  static async open(name: string, data: ArrayBuffer): Promise<OpenOutcome> {
+    const parsed = JSON.parse(await native.openImage(name, data)) as ApiResponse;
     if (!parsed.ok) {
       throw new Error(parsed.error);
     }
@@ -764,8 +764,8 @@ export class Engine {
     };
   }
 
-  static filterApply(documentId: number, layerId: number, paramsJson: string): DocumentInfo {
-    const parsed = JSON.parse(native.filterApply(documentId, layerId, paramsJson)) as InfoResponse;
+  static async filterApply(documentId: number, layerId: number, paramsJson: string): Promise<DocumentInfo> {
+    const parsed = JSON.parse(await native.filterApply(documentId, layerId, paramsJson)) as InfoResponse;
     if (!parsed.ok) {
       throw new Error(parsed.error);
     }
@@ -838,9 +838,9 @@ export class Engine {
   // ──────────────────────────────────────────────────────────────────────
   // D2 智能抠图（1.2.0，传统算法纯离线）
   // ──────────────────────────────────────────────────────────────────────
-  static cutoutRemoveBackground(documentId: number, layerId: number, refine: boolean = true): CutoutOutcome {
+  static async cutoutRemoveBackground(documentId: number, layerId: number, refine: boolean = true): Promise<CutoutOutcome> {
     const params = JSON.stringify({ layer: layerId, refine: refine });
-    const parsed = JSON.parse(native.cutoutRemoveBackground(documentId, params)) as CutoutResponse;
+    const parsed = JSON.parse(await native.cutoutRemoveBackground(documentId, params)) as CutoutResponse;
     if (!parsed.ok) {
       throw new Error(parsed.error);
     }
@@ -952,8 +952,8 @@ export class Engine {
   }
 
   /** 复制可见：把所有可见图层从底到顶合成到一个新像素图层（不改变原图层）。 */
-  static copyVisible(documentId: number): LayerOutcome {
-    const parsed = JSON.parse(native.copyVisible(documentId)) as LayerOutcomeResponse;
+  static async copyVisible(documentId: number): Promise<LayerOutcome> {
+    const parsed = JSON.parse(await native.copyVisible(documentId)) as LayerOutcomeResponse;
     if (!parsed.ok) {
       throw new Error(parsed.error);
     }
@@ -1008,7 +1008,7 @@ export class Engine {
     return normalizeInfo(parsed.data);
   }
 
-  static exportImage(documentId: number, format: string, quality: number): ArrayBuffer {
+  static async exportImage(documentId: number, format: string, quality: number): Promise<ArrayBuffer> {
     return native.exportImage(documentId, format, quality);
   }
 

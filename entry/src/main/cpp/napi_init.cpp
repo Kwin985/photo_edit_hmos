@@ -1,5 +1,6 @@
 #include <cstdint>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -87,11 +88,10 @@ PcBuffer *pc_configure_memory(const uint8_t *dir, size_t dir_len, uint64_t spill
 namespace {
 
 void *g_session = nullptr;
+std::once_flag g_session_once;
 
 void *Session() {
-    if (g_session == nullptr) {
-        g_session = pc_session_new();
-    }
+    std::call_once(g_session_once, [] { g_session = pc_session_new(); });
     return g_session;
 }
 
@@ -199,6 +199,113 @@ uint64_t GetU64(napi_env env, napi_value value) {
     return 0;
 }
 
+enum class AsyncOp { Open, Export, Filter, Cutout, CopyVisible };
+
+// 入参在 JS 线程拷入，execute 线程只调 pc_*（Session 已线程安全），complete 回 JS 线程 resolve/reject。
+struct AsyncWork {
+    AsyncOp op = AsyncOp::Open;
+    napi_deferred deferred = nullptr;
+    napi_async_work work = nullptr;
+    uint64_t id = 0;
+    uint64_t layer = 0;
+    uint8_t quality = 90;
+    std::string name;
+    std::string params;
+    std::string format;
+    std::vector<uint8_t> data;
+    std::string result;
+    PcBuffer *bytes = nullptr;
+};
+
+void AsyncExecute(napi_env env, void *data) {
+    AsyncWork *w = static_cast<AsyncWork *>(data);
+    void *session = Session();
+    switch (w->op) {
+        case AsyncOp::Open:
+            w->result = TakeString(pc_open(session, reinterpret_cast<const uint8_t *>(w->name.data()), w->name.size(),
+                                           w->data.data(), w->data.size()));
+            break;
+        case AsyncOp::Export:
+            w->result = TakeString(pc_export(session, w->id, reinterpret_cast<const uint8_t *>(w->format.data()), w->format.size(),
+                                             w->quality, &w->bytes));
+            break;
+        case AsyncOp::Filter:
+            w->result = TakeString(pc_filter_apply(session, w->id, w->layer,
+                                                   reinterpret_cast<const uint8_t *>(w->params.data()), w->params.size()));
+            break;
+        case AsyncOp::Cutout:
+            w->result = TakeString(pc_cutout_remove_background(session, w->id,
+                                                               reinterpret_cast<const uint8_t *>(w->params.data()), w->params.size()));
+            break;
+        case AsyncOp::CopyVisible:
+            w->result = TakeString(pc_copy_visible(session, w->id));
+            break;
+    }
+}
+
+void AsyncComplete(napi_env env, napi_status status, void *data) {
+    AsyncWork *w = static_cast<AsyncWork *>(data);
+    auto reject = [&](const std::string &message) {
+        napi_value error = nullptr;
+        napi_create_string_utf8(env, message.c_str(), message.size(), &error);
+        napi_reject_deferred(env, w->deferred, error);
+    };
+    if (status != napi_ok) {
+        if (w->bytes != nullptr) {
+            pc_buffer_free(w->bytes);
+        }
+        reject("async work failed");
+    } else if (!IsOk(w->result)) {
+        if (w->bytes != nullptr) {
+            pc_buffer_free(w->bytes);
+        }
+        reject(ErrorOf(w->result));
+    } else if (w->op == AsyncOp::Export) {
+        if (w->bytes == nullptr) {
+            reject("engine returned no bytes");
+        } else {
+            napi_value buffer = nullptr;
+            void *out = nullptr;
+            napi_status alloc = napi_create_arraybuffer(env, w->bytes->len, &out, &buffer);
+            if (alloc != napi_ok || buffer == nullptr) {
+                pc_buffer_free(w->bytes);
+                reject("could not allocate a result buffer");
+            } else {
+                if (w->bytes->len > 0) {
+                    std::memcpy(out, w->bytes->ptr, w->bytes->len);
+                }
+                pc_buffer_free(w->bytes);
+                napi_resolve_deferred(env, w->deferred, buffer);
+            }
+        }
+    } else {
+        napi_value result = nullptr;
+        napi_create_string_utf8(env, w->result.c_str(), w->result.size(), &result);
+        napi_resolve_deferred(env, w->deferred, result);
+    }
+    napi_delete_async_work(env, w->work);
+    delete w;
+}
+
+napi_value QueueAsync(napi_env env, AsyncWork *w) {
+    napi_value promise = nullptr;
+    if (napi_create_promise(env, &w->deferred, &promise) != napi_ok) {
+        delete w;
+        return Throw(env, "could not create a promise");
+    }
+    napi_value resource_name = nullptr;
+    napi_create_string_utf8(env, "pc_async", NAPI_AUTO_LENGTH, &resource_name);
+    if (napi_create_async_work(env, nullptr, resource_name, AsyncExecute, AsyncComplete, w, &w->work) != napi_ok) {
+        napi_value error = nullptr;
+        napi_create_string_utf8(env, "could not create async work", NAPI_AUTO_LENGTH, &error);
+        napi_reject_deferred(env, w->deferred, error);
+        delete w;
+        return promise;
+    }
+    napi_queue_async_work(env, w->work);
+    return promise;
+}
+
 napi_value OpenImage(napi_env env, napi_callback_info info) {
     size_t argc = 2;
     napi_value argv[2] = {nullptr, nullptr};
@@ -206,22 +313,20 @@ napi_value OpenImage(napi_env env, napi_callback_info info) {
     if (argc < 2) {
         return Throw(env, "openImage(name, data) needs two arguments");
     }
-    std::string name;
-    if (!GetString(env, argv[0], name)) {
+    AsyncWork *w = new AsyncWork();
+    w->op = AsyncOp::Open;
+    if (!GetString(env, argv[0], w->name)) {
+        delete w;
         return Throw(env, "openImage: invalid name");
     }
     const uint8_t *data = nullptr;
     size_t len = 0;
     if (!GetBytes(env, argv[1], data, len)) {
+        delete w;
         return Throw(env, "openImage: data must be an ArrayBuffer");
     }
-    std::string result = TakeString(pc_open(Session(), reinterpret_cast<const uint8_t *>(name.data()), name.size(), data, len));
-    if (!IsOk(result)) {
-        return Throw(env, ErrorOf(result));
-    }
-    napi_value out = nullptr;
-    napi_create_string_utf8(env, result.c_str(), result.size(), &out);
-    return out;
+    w->data.assign(data, data + len);
+    return QueueAsync(env, w);
 }
 
 napi_value NewDocument(napi_env env, napi_callback_info info) {
@@ -425,18 +530,15 @@ napi_value FilterApply(napi_env env, napi_callback_info info) {
     if (argc < 3) {
         return Throw(env, "filterApply(documentId, layerId, paramsJson) needs three arguments");
     }
-    std::string params;
-    if (!GetString(env, argv[2], params)) {
+    AsyncWork *w = new AsyncWork();
+    w->op = AsyncOp::Filter;
+    w->id = GetU64(env, argv[0]);
+    w->layer = GetU64(env, argv[1]);
+    if (!GetString(env, argv[2], w->params)) {
+        delete w;
         return Throw(env, "filterApply: paramsJson must be a string");
     }
-    std::string result = TakeString(pc_filter_apply(Session(), GetU64(env, argv[0]), GetU64(env, argv[1]),
-                                                    reinterpret_cast<const uint8_t *>(params.data()), params.size()));
-    if (!IsOk(result)) {
-        return Throw(env, ErrorOf(result));
-    }
-    napi_value out = nullptr;
-    napi_create_string_utf8(env, result.c_str(), result.size(), &out);
-    return out;
+    return QueueAsync(env, w);
 }
 
 napi_value ShapeCreate(napi_env env, napi_callback_info info) {
@@ -616,18 +718,14 @@ napi_value CutoutRemoveBackground(napi_env env, napi_callback_info info) {
     if (argc < 2) {
         return Throw(env, "cutoutRemoveBackground(documentId, paramsJson) needs two arguments");
     }
-    std::string params;
-    if (!GetString(env, argv[1], params)) {
+    AsyncWork *w = new AsyncWork();
+    w->op = AsyncOp::Cutout;
+    w->id = GetU64(env, argv[0]);
+    if (!GetString(env, argv[1], w->params)) {
+        delete w;
         return Throw(env, "cutoutRemoveBackground: paramsJson must be a string");
     }
-    std::string result = TakeString(pc_cutout_remove_background(Session(), GetU64(env, argv[0]),
-        reinterpret_cast<const uint8_t *>(params.data()), params.size()));
-    if (!IsOk(result)) {
-        return Throw(env, ErrorOf(result));
-    }
-    napi_value out = nullptr;
-    napi_create_string_utf8(env, result.c_str(), result.size(), &out);
-    return out;
+    return QueueAsync(env, w);
 }
 
 napi_value LayerEditGet(napi_env env, napi_callback_info info) {
@@ -830,13 +928,10 @@ napi_value CopyVisible(napi_env env, napi_callback_info info) {
     size_t argc = 1;
     napi_value argv[1] = {nullptr};
     napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
-    std::string result = TakeString(pc_copy_visible(Session(), GetU64(env, argv[0])));
-    if (!IsOk(result)) {
-        return Throw(env, ErrorOf(result));
-    }
-    napi_value out = nullptr;
-    napi_create_string_utf8(env, result.c_str(), result.size(), &out);
-    return out;
+    AsyncWork *w = new AsyncWork();
+    w->op = AsyncOp::CopyVisible;
+    w->id = GetU64(env, argv[0]);
+    return QueueAsync(env, w);
 }
 
 napi_value LayerDeleteMany(napi_env env, napi_callback_info info) {
@@ -938,20 +1033,15 @@ napi_value ExportImage(napi_env env, napi_callback_info info) {
     size_t argc = 3;
     napi_value argv[3] = {nullptr, nullptr, nullptr};
     napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
-    std::string format = "png";
+    AsyncWork *w = new AsyncWork();
+    w->op = AsyncOp::Export;
+    w->id = GetU64(env, argv[0]);
+    w->format = "png";
+    GetString(env, argv[1], w->format);
     int32_t quality = 90;
-    GetString(env, argv[1], format);
     napi_get_value_int32(env, argv[2], &quality);
-    PcBuffer *out = nullptr;
-    std::string result = TakeString(pc_export(Session(), GetU64(env, argv[0]), reinterpret_cast<const uint8_t *>(format.data()), format.size(),
-                                              static_cast<uint8_t>(quality), &out));
-    if (!IsOk(result)) {
-        if (out != nullptr) {
-            pc_buffer_free(out);
-        }
-        return Throw(env, ErrorOf(result));
-    }
-    return MakeArrayBuffer(env, out);
+    w->quality = static_cast<uint8_t>(quality);
+    return QueueAsync(env, w);
 }
 
 napi_value LayerEffects(napi_env env, napi_callback_info info) {
