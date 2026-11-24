@@ -132,7 +132,7 @@ struct RecentDocsCard {
                 .height(6)
                 .borderRadius('50%')
                 .backgroundColor('#22d3ee')
-              Text('继续上次创作 →')
+              Text(this.recentDocName.length > 0 ? this.recentDocName + ' →' : '继续上次创作 →')
                 .fontSize(10)
                 .fontColor(Color.White)
                 .layoutWeight(1)
@@ -184,8 +184,6 @@ struct RecentDocsCard {
     .clip(true)
   }
 
-  get hasRecentDocs(): boolean {
-    // 卡片端不持有远程状态；主界面会通过 AppStorage quickAction 通知。
-    return false;
-  }
+  @LocalStorageProp('hasRecentDocs') hasRecentDocs: boolean = false;
+  @LocalStorageProp('recentDocName') recentDocName: string = '';
 }

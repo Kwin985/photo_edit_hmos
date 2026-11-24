@@ -157,6 +157,29 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build-photocraft.ps1
 - **更新内容**：服务卡片（QuickOpenCard 2×2）、insightIntent（CreateNewDocument/OpenSampleImage）、2in1 窗口最大化、C2 条带分块 + C3 只读源包围盒性能优化、B 层交互优化（B1-B7）、D4 内置中文字体、全面审计修复（documentTurn 等）、ArkTS 测试扩容 88 用例（详见上报告）
 - **提审**：上传前确认包名/证书未被改动；隐私政策公网 URL 仍为人工阻断项
 
+## 六（补充 2）、1.1.0 出包记录（2026-11-20）
+
+- **产物**：`build/outputs/default/photocraft-default-signed.app`（30.47 MB）
+- **版本**：versionCode **1000004** / versionName **1.1.0**（1.0.1 上架包 1000002 严格递增）
+- **验签**：`hap-sign-tool verify-app` success
+- **自检**：无 requestPermissions、6 个 .so 齐全、.abc 正常编译代码
+- **更新内容**：PSD 导出（G1）、复制可见（G2）、触屏交互修复（G3）、生态卡位做深（G4）、零权限文案+隐私可视化（G5）、A1 钢笔工具 BUG 修复、D2 smart cutout 验证
+- **注**：1.0.2（versionCode 1000003）已出包验签 PASS 但用户决定不上架（与 1.0.1 间隔太短），直接跳至 1.1.0
+
+## 六（补充 3）、1.2.0 出包记录（2026-11-21）
+
+- **产物**：`build/outputs/default/photocraft-default-signed.app`（29.06 MB）
+- **版本**：versionCode **1000005** / versionName **1.2.0**（1.1.0 严格递增）
+- **验签**：`hap-sign-tool verify-app` success（SHA-256 digest true）
+- **自检**：无 requestPermissions、6 个 .so 齐全（arm64-v8a + x86_64 × libc++_shared/libentry/libphotocraft_core）、.abc 正常编译代码（modules.abc + widgets.abc）
+- **更新内容**：
+  - 批次 2.2 图层样式预设库（G7）：FX 预设保存/套用/删除，preferences 持久化
+  - 批次 2.3 蒙版触屏化（G3/L7）：链接状态指示器（只读）、启用/停用+删除蒙版触控目标 height 24→28、标题行折叠切换 minHeight 48
+  - 批次 2.1 近场文件流转（G5）：nearFieldShare ShareKit 系统分享面板（1.1.0 已含）
+- **构建修复**：release 构建需设置 DevEco 自带 Node 24（`NODE_HOME` + PATH 前置），规避系统 Node 25 与 hvigor 不兼容（`options.recursive` 报错）
+- **测试回归**：ohosTest 31/31 PASS（含 2 PSD 导出 + 2 copyVisible + 8 A1 + 3 D2 + 其他）
+- **NOT_VERIFIED（模拟器限制）**：2.2 预设 UI、2.3 蒙版 UI 在 Panel Scroll 溢出区，模拟器 uitest dump 不捕获；需物理设备验证
+
 ## 五、上架前自检命令
 
 ```powershell

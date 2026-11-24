@@ -30,3 +30,10 @@
 /*.json
 /.merkle-snapshot.json
 /.t6_dump_cache.json
+
+# AI/调试工具缓存与临时目录
+/.ai/
+/.qwen/
+/.workbuddy-ai/
+/.tmp-*
+/build-log.txt

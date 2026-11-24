@@ -312,6 +312,12 @@ interface LayerDuplicateResponse {
   data: LayerOutcome;
 }
 
+interface LayerOutcomeResponse {
+  ok: boolean;
+  error: string;
+  data: LayerOutcome;
+}
+
 export interface LayerBatchOutcome {
   layerIds: number[];
   info: DocumentInfo;
@@ -424,6 +430,26 @@ interface RevisionResponse {
   ok: boolean;
   error: string;
   data: RevisionData;
+}
+
+/** 设备算力档案（`pc_compute_profile`）：CPU SIMD 档位 + GPU/AI 能力。 */
+export interface ComputeProfileInfo {
+  /** `std::env::consts::ARCH`：aarch64 / x86_64。 */
+  arch: string;
+  /** 已探测的 CPU 向量档位：neon / avx2 / sse2 / scalar。 */
+  simd: string;
+  /** 当前档位是否有手写向量内核（无则走标量回落）。 */
+  vectorKernel: boolean;
+  /** 系统 Vulkan loader 是否可用（GPU compute 能力，当前仅上报）。 */
+  vulkan: boolean;
+  /** 系统 Neural Network Runtime loader 是否可用（NPU 能力探测，回落 CPU 的判定入口之一）。 */
+  npu: boolean;
+}
+
+interface ComputeProfileResponse {
+  ok: boolean;
+  error: string;
+  data: ComputeProfileInfo;
 }
 
 interface GuidesResponse {
@@ -915,6 +941,16 @@ export class Engine {
     return parsed.data.deleted ?? 0;
   }
 
+  /** 复制可见：把所有可见图层从底到顶合成到一个新像素图层（不改变原图层）。 */
+  static copyVisible(documentId: number): LayerOutcome {
+    const parsed = JSON.parse(native.copyVisible(documentId)) as LayerOutcomeResponse;
+    if (!parsed.ok) {
+      throw new Error(parsed.error);
+    }
+    const d = parsed.data;
+    return { layerId: d.layerId, info: normalizeInfo(d.info) };
+  }
+
   static addAdjustment(documentId: number, kind: string, paramsJson: string): void {
     native.addAdjustment(documentId, kind, paramsJson);
   }
@@ -993,6 +1029,15 @@ export class Engine {
       throw new Error(parsed.error);
     }
     return parsed.data.revision ?? 0;
+  }
+
+  /** 设备算力档案（native 进程级缓存，仅首次调用探测）。 */
+  static computeProfile(): ComputeProfileInfo {
+    const parsed = JSON.parse(native.computeProfile()) as ComputeProfileResponse;
+    if (!parsed.ok) {
+      throw new Error(parsed.error);
+    }
+    return parsed.data;
   }
 
   static layerMaskGet(documentId: number, layerId: number): LayerMaskInfo {
@@ -1187,4 +1232,16 @@ export function flattenLayers(layers: LayerInfo[], depth: number): LayerInfo[] {
     }
   }
   return out;
+}
+/**
+ * PAN-PREFETCH@1：判断当前可见文档矩形是否越出已渲染的 detail tile。
+ * 纯函数（无 UI/NAPI 依赖），供 Index.ets 的手势预判调用，也便于 hypium 回归测试。
+ * 参数均为文档像素坐标；边界相等视为「未越出」（与 renderDetail 的命中判定一致）。
+ */
+export function visibleRectLeavesTile(
+  visibleX0: number, visibleY0: number, visibleX1: number, visibleY1: number,
+  tileX: number, tileY: number, tileW: number, tileH: number
+): boolean {
+  return visibleX0 < tileX || visibleY0 < tileY ||
+    visibleX1 > tileX + tileW || visibleY1 > tileY + tileH;
 }

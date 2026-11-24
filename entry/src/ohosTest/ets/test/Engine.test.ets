@@ -14,7 +14,7 @@
  *      说明工程缺少 entry/src/ohosTest/ets/testrunner/OpenHarmonyTestRunner.ets。
  */
 import { describe, it, expect } from '@ohos/hypium';
-import { Engine, flattenLayers, LayerInfo } from '../../../main/ets/engine/Engine';
+import { Engine, flattenLayers, visibleRectLeavesTile, LayerInfo } from '../../../main/ets/engine/Engine';
 
 /** 执行动作并返回其抛出的错误信息；未抛错时返回空串。 */
 function caughtMessage(action: () => void): string {
@@ -432,6 +432,91 @@ export default function engineTest() {
       Engine.close(docId);
       const message: string = caughtMessage(() => {
         Engine.cutoutRemoveBackground(docId, 1, true);
+      });
+      expect(message.length > 0).assertTrue();
+    });
+
+    // ──────────────────────────────────────────────────────────────────────
+    // G1 PSD 导出验证（1.1.0）：证明 PSD 导出链路通（签名检查）
+    // ──────────────────────────────────────────────────────────────────────
+
+    it('exportImagePsdSignature', 0, () => {
+      // PSD 文件以 '8BPS' 签名开头；验证 pc_export 的 psd 分支产出合法 PSD 字节。
+      const created = Engine.newDocument(64, 48, 'export-psd');
+      const docId: number = created.id;
+      try {
+        const bytes = Engine.exportImage(docId, 'psd', 90);
+        expect(bytes.byteLength > 0).assertTrue();
+        const view = new Uint8Array(bytes);
+        expect(view[0]).assertEqual(0x38); // '8'
+        expect(view[1]).assertEqual(0x42); // 'B'
+        expect(view[2]).assertEqual(0x50); // 'P'
+        expect(view[3]).assertEqual(0x53); // 'S'
+      } finally {
+        Engine.close(docId);
+      }
+    });
+
+    it('exportImagePngNonEmpty', 0, () => {
+      const created = Engine.newDocument(64, 48, 'export-png');
+      const docId: number = created.id;
+      try {
+        const bytes = Engine.exportImage(docId, 'png', 90);
+        expect(bytes.byteLength > 0).assertTrue();
+      } finally {
+        Engine.close(docId);
+      }
+    });
+
+    // ──────────────────────────────────────────────────────────────────────
+    // G2 复制可见验证（1.1.0）：pc_copy_visible 链路
+    // ──────────────────────────────────────────────────────────────────────
+
+    it('copyVisibleCreatesNewLayer', 0, () => {
+      // 新建文档默认 1 个可见 Background 层；copyVisible 合成可见内容到新图层。
+      const created = Engine.newDocument(64, 48, 'copy-visible');
+      const docId: number = created.id;
+      try {
+        const before = Engine.info(docId);
+        expect(before.layers.length).assertEqual(1);
+        const result = Engine.copyVisible(docId);
+        expect(result.layerId > 0).assertTrue();
+        expect(result.info.layers.length >= 2).assertTrue();
+      } finally {
+        Engine.close(docId);
+      }
+    });
+
+    // ──────────────────────────────────────────────────────────────────────
+    // PAN-PREFETCH@1：平移越界判定纯函数（hypium 无需 UI driver）
+    // ──────────────────────────────────────────────────────────────────────
+
+    it('visibleRectInsideTileDoesNotLeave', 0, () => {
+      // 可见区完全落在 tile 内，含边界相等：不应触发提前重渲染。
+      expect(visibleRectLeavesTile(100, 200, 500, 600, 100, 200, 500, 600)).assertFalse();
+      expect(visibleRectLeavesTile(150, 250, 450, 550, 100, 200, 500, 600)).assertFalse();
+    });
+
+    it('visibleRectOutsideTileLeavesOnEveryEdge', 0, () => {
+      // 四条边分别越出，任一越界即返回 true。
+      expect(visibleRectLeavesTile(99, 200, 500, 600, 100, 200, 500, 600)).assertTrue();
+      expect(visibleRectLeavesTile(100, 199, 500, 600, 100, 200, 500, 600)).assertTrue();
+      // tile 范围 x∈[100,600]、y∈[200,800]，右/下越界需超过该上界。
+      expect(visibleRectLeavesTile(100, 200, 601, 600, 100, 200, 500, 600)).assertTrue();
+      expect(visibleRectLeavesTile(100, 200, 500, 801, 100, 200, 500, 600)).assertTrue();
+    });
+
+    it('visibleRectPartiallyOverlappingTileLeaves', 0, () => {
+      // 部分重叠仍视为越界（露白区的根因）。
+      expect(visibleRectLeavesTile(50, 250, 400, 550, 100, 200, 500, 600)).assertTrue();
+    });
+
+    it('copyVisibleOnClosedDocumentThrows', 0, () => {
+      const created = Engine.newDocument(64, 48, 'copy-visible-closed');
+      const docId: number = created.id;
+      Engine.close(docId);
+      const message: string = caughtMessage(() => {
+        Engine.copyVisible(docId);
       });
       expect(message.length > 0).assertTrue();
     });

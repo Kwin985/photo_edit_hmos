@@ -53,6 +53,7 @@ PcBuffer *pc_layer_duplicate(void *session, uint64_t id, uint64_t layer);
 PcBuffer *pc_layer_duplicate_many(void *session, uint64_t id, const uint8_t *ids, size_t ids_len);
 PcBuffer *pc_layer_merge_down(void *session, uint64_t id, uint64_t layer);
 PcBuffer *pc_layer_delete(void *session, uint64_t id, uint64_t layer);
+PcBuffer *pc_copy_visible(void *session, uint64_t id);
 PcBuffer *pc_adjustment_add(void *session, uint64_t id, const uint8_t *kind, size_t kind_len, const uint8_t *params, size_t params_len);
 PcBuffer *pc_adjustment_update(void *session, uint64_t id, uint64_t layer, const uint8_t *params, size_t params_len);
 PcBuffer *pc_adjustment_get(void *session, uint64_t id, uint64_t layer);
@@ -79,6 +80,7 @@ PcBuffer *pc_document_resize_canvas(void *session, uint64_t id, int32_t width, i
 PcBuffer *pc_guides_get(void *session, uint64_t id);
 PcBuffer *pc_guides_set(void *session, uint64_t id, const uint8_t *params, size_t params_len);
 PcBuffer *pc_layer_transform(void *session, uint64_t id, uint64_t layer, const uint8_t *params, size_t params_len);
+PcBuffer *pc_compute_profile();
 }
 
 namespace {
@@ -823,6 +825,19 @@ napi_value LayerDelete(napi_env env, napi_callback_info info) {
     return nullptr;
 }
 
+napi_value CopyVisible(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    std::string result = TakeString(pc_copy_visible(Session(), GetU64(env, argv[0])));
+    if (!IsOk(result)) {
+        return Throw(env, ErrorOf(result));
+    }
+    napi_value out = nullptr;
+    napi_create_string_utf8(env, result.c_str(), result.size(), &out);
+    return out;
+}
+
 napi_value LayerDeleteMany(napi_env env, napi_callback_info info) {
     size_t argc = 2;
     napi_value argv[2] = {nullptr, nullptr};
@@ -1006,6 +1021,17 @@ napi_value Revision(napi_env env, napi_callback_info info) {
     napi_value argv[1] = {nullptr};
     napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
     std::string result = TakeString(pc_revision(Session(), GetU64(env, argv[0])));
+    if (!IsOk(result)) {
+        return Throw(env, ErrorOf(result));
+    }
+    napi_value out = nullptr;
+    napi_create_string_utf8(env, result.c_str(), result.size(), &out);
+    return out;
+}
+
+// 设备算力档案：{arch, simd, vectorKernel, vulkan, npu}。ArkTS 侧用于「有算力用算力、无算力回落」展示。
+napi_value ComputeProfile(napi_env env, napi_callback_info info) {
+    std::string result = TakeString(pc_compute_profile());
     if (!IsOk(result)) {
         return Throw(env, ErrorOf(result));
     }
@@ -1364,6 +1390,7 @@ napi_value Init(napi_env env, napi_value exports) {
         {"mergeLayer", nullptr, LayerMerge, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"deleteLayer", nullptr, LayerDelete, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"layerDeleteMany", nullptr, LayerDeleteMany, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"copyVisible", nullptr, CopyVisible, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"addAdjustment", nullptr, AdjustmentAdd, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"updateAdjustment", nullptr, AdjustmentUpdate, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"getAdjustment", nullptr, AdjustmentGet, nullptr, nullptr, nullptr, napi_default, nullptr},
@@ -1374,6 +1401,7 @@ napi_value Init(napi_env env, napi_value exports) {
         {"updateLayerEffect", nullptr, UpdateLayerEffect, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"renderPixels", nullptr, RenderPixels, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"revision", nullptr, Revision, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"computeProfile", nullptr, ComputeProfile, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"layerMaskGet", nullptr, LayerMaskGet, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"layerMaskAdd", nullptr, LayerMaskAdd, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"layerMaskSet", nullptr, LayerMaskSet, nullptr, nullptr, nullptr, napi_default, nullptr},

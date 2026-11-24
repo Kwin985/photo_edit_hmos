@@ -22,6 +22,9 @@
         "startWindowIcon": "$media:app_icon",
         "startWindowBackground": "$color:start_window_background",
         "exported": true,
+        // 阔直板适配：默认 unspecified 会被系统锁定竖屏，横屏左右分栏永不触发；
+        // auto_rotation 让应用跟随设备旋转，横屏（约 744x440vp）自动切到左右分栏。
+        "orientation": "auto_rotation",
         "skills": [
           {
             "entities": [

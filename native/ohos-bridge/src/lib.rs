@@ -977,6 +977,27 @@ pub extern "C" fn pc_render_pixels(session: *mut Session, id: u64, x: i32, y: i3
     })
 }
 
+/// Device compute profile: CPU SIMD tier + GPU/AI capability flags.
+///
+/// ArkTS 侧据此显示加速状态，并作为「有算力用算力、无算力回落 CPU」的判定入口：
+/// `simd` 是已探测到的 CPU 向量档位（neon/avx2/sse2/scalar），`vectorKernel` 表示当前
+/// 是否存在该档位的手写向量内核（否则走标量回落），`vulkan` 表示系统 Vulkan loader 可用，
+/// `npu` 表示系统 Neural Network Runtime loader 可用（NPU 能力探测，回落 CPU 的判定入口之一）。
+/// 返回 `{"ok":true,"data":{"arch":..,"simd":..,"vectorKernel":..,"vulkan":..,"npu":..}}`。
+#[unsafe(no_mangle)]
+pub extern "C" fn pc_compute_profile() -> *mut PcBuffer {
+    guard(move || {
+        let p = photocraft_compute::profile();
+        ok(json!({
+            "arch": p.arch,
+            "simd": p.simd.label(),
+            "vectorKernel": p.simd.has_vector_kernel(),
+            "vulkan": p.vulkan,
+            "npu": p.npu,
+        }))
+    })
+}
+
 /// Document version: changes whenever a successful operation may have changed the document
 /// (`checkpoint`, undo, redo).
 #[unsafe(no_mangle)]
@@ -1521,7 +1542,7 @@ pub extern "C" fn pc_vector_path_edit(session: *mut Session, id: u64, params_ptr
             _ => return fail(format!("unsupported vector path op: {op}")),
         }
         entry.checkpoint();
-        ok(json!({ "ok": true, "info": doc_info(entry) }))
+        ok(doc_info(entry))
     })
 }
 
@@ -1544,7 +1565,7 @@ pub extern "C" fn pc_vector_path_rasterize(session: *mut Session, id: u64, param
         let cache = render_shape(content, pixel_format, bounds);
         content.cache = Some(cache);
         entry.checkpoint();
-        ok(json!({ "ok": true, "info": doc_info(entry) }))
+        ok(doc_info(entry))
     })
 }
 
@@ -4092,6 +4113,69 @@ pub extern "C" fn pc_layer_merge_down(session: *mut Session, id: u64, layer: u64
     })
 }
 
+/// 复制可见：把所有可见图层从底到顶合成到一个新图层（不改变原图层）。
+/// 对应 Photoshop「复制可见」——生成一个拼合所有可见内容的新像素图层。
+#[unsafe(no_mangle)]
+pub extern "C" fn pc_copy_visible(session: *mut Session, id: u64) -> *mut PcBuffer {
+    guard(move || {
+        if session.is_null() {
+            return fail("null session");
+        }
+        let s = unsafe { &mut *session };
+        let entry = match s.entry_mut(id) {
+            Ok(e) => e,
+            Err(e) => return fail(e),
+        };
+        let doc_bounds = entry.doc.bounds();
+        if doc_bounds.is_empty() {
+            return fail("document is empty");
+        }
+        let format = entry.doc.pixel_format();
+        let channels = format.channels();
+        let pixel_count = (doc_bounds.width() as usize) * (doc_bounds.height() as usize);
+        if pixel_count == 0 {
+            return fail("document is empty");
+        }
+        // 从底到顶合成可见图层（layers[0] = 底，与 doc_info 的 rev 顺序一致）。
+        let mut acc: Vec<[f32; 4]> = vec![[0.0; 4]; pixel_count];
+        let mut any = false;
+        for layer in entry.doc.layers.iter() {
+            if !layer.visible {
+                continue;
+            }
+            let opacity = (layer.opacity * layer.fill_opacity).clamp(0.0, 1.0);
+            if opacity <= 0.0 {
+                continue;
+            }
+            let buf = render_layer_in(&entry.doc, layer, doc_bounds);
+            if buf.rect.is_empty() || buf.px.len() != pixel_count {
+                continue;
+            }
+            any = true;
+            for i in 0..pixel_count {
+                acc[i] = composite(layer.blend, acc[i], buf.px[i], opacity);
+            }
+        }
+        if !any {
+            return fail("no visible layers to copy");
+        }
+        // 把 f32 RGBA 累积 buffer 转成 format 的 channel 布局，写入新图层 surface。
+        let mut samples = vec![0.0f32; pixel_count * channels];
+        let mut tmp = [0.0f32; 8];
+        for i in 0..pixel_count {
+            let len = from_rgba_into(&format, acc[i], &mut tmp);
+            samples[i * channels..i * channels + len].copy_from_slice(&tmp[..len]);
+        }
+        let mut surface = Surface::new(format);
+        surface.write_region(doc_bounds, &samples);
+        entry.checkpoint_named("复制可见");
+        let layer = Layer::new("复制可见", LayerContent::Raster(surface));
+        let layer_id = layer.id.0;
+        entry.doc.layers.push(layer);
+        ok(json!({ "layerId": layer_id, "info": doc_info(entry) }))
+    })
+}
+
 /// Deletes a layer.
 #[unsafe(no_mangle)]
 pub extern "C" fn pc_layer_delete(session: *mut Session, id: u64, layer: u64) -> *mut PcBuffer {
@@ -4357,7 +4441,9 @@ pub extern "C" fn pc_export(session: *mut Session, id: u64, format_ptr: *const u
             Ok(b) => String::from_utf8_lossy(b).to_lowercase(),
             Err(e) => return fail(e),
         };
-        if !matches!(format.as_str(), "png" | "jpeg" | "jpg" | "webp" | "tiff" | "tif" | "psd") {
+        // 格式出口闭环（FMT-EXPORT@1）：显式接受 psb；io 层把 .psb 映射为 force_psb=true，
+        // 与 psd 超出 2GB 自动降级 PSB 共用同一条编码路径。
+        if !matches!(format.as_str(), "png" | "jpeg" | "jpg" | "webp" | "tiff" | "tif" | "psd" | "psb") {
             return fail(format!("unsupported export format: {format}"));
         }
         // SAFETY: live session pointer.
@@ -10770,6 +10856,42 @@ mod canvas_api_tests {
 
         eprintln!("e10 export 2400x1500 -> 320x300 -> 2400x1500 -> 2600x1700 ok=true");
     }
+
+    // E11 / 格式出口闭环（FMT-EXPORT@1）：UI 宣称的六种格式都应编码成功，
+    // PSD/PSB 由 8BPS 头后的版本字段区分（1=PSD, 2=PSB）。
+    #[test]
+    fn e11_all_export_formats_have_expected_magic() {
+        let c = Ctx::open("e11");
+        assert_ok(&c.crop(CROP_RECT, "e11 crop"), "e11: crop");
+        let cases: &[(&str, &[u8])] = &[
+            ("png", &[0x89, b'P', b'N', b'G']),
+            ("jpeg", &[0xFF, 0xD8, 0xFF]),
+            ("webp", b"RIFF"),
+            ("tiff", b"II*\x00"),
+            ("psd", b"8BPS\x00\x01"),
+            ("psb", b"8BPS\x00\x02"),
+        ];
+        for (format, magic) in cases {
+            let mut out: *mut PcBuffer = std::ptr::null_mut();
+            let ctx = format!("e11 export {format}");
+            let state = read_json(
+                pc_export(c.session, c.doc, format.as_ptr(), format.len(), 20, &mut out),
+                &ctx,
+            );
+            assert_ok(&state, &ctx);
+            assert!(!out.is_null(), "{ctx}: out 不应为 null");
+            let bytes = take_bytes(out, &ctx);
+            assert!(bytes.len() >= magic.len(), "{ctx}: 字节过短 {}", bytes.len());
+            if *format == "tiff" {
+                // TIFF 端序可能是 II 或 MM，两种头都合法。
+                assert!(&bytes[0..4] == b"II*\x00" || &bytes[0..4] == b"MM\x00*", "{ctx}: TIFF 头不符");
+            } else {
+                assert_eq!(&bytes[0..magic.len()], *magic, "{ctx}: 文件头不符");
+            }
+            eprintln!("e11 export {format} ok bytes={}", bytes.len());
+        }
+    }
+
 }
 /// 图层自由变换（`C-XFORM-API@1`）像素级回归（计划 X3）。
 ///

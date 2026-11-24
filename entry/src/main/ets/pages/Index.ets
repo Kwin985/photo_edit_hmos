@@ -5,7 +5,7 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 import { preferences, uniformTypeDescriptor as utd } from '@kit.ArkData';
 import { bundleManager, common } from '@kit.AbilityKit';
 import { systemShare } from '@kit.ShareKit';
-import { Engine, DocumentInfo, LayerInfo, AdjustmentInfo, SelectionInfo, emptyAdjustment, flattenLayers, LayerEffectInfo, LayerEffectsInfo, FxGradientInfo, FxGradientStop, LayerEditInfo, LayerMaskInfo, GuidesInfo, CutoutOutcome } from '../engine/Engine';
+import { Engine, DocumentInfo, LayerInfo, AdjustmentInfo, SelectionInfo, emptyAdjustment, flattenLayers, visibleRectLeavesTile, LayerEffectInfo, LayerEffectsInfo, FxGradientInfo, FxGradientStop, LayerEditInfo, LayerMaskInfo, GuidesInfo, CutoutOutcome } from '../engine/Engine';
 
 const COLOR_ROOT: string = '#0a0b0d';
 const COLOR_CANVAS: string = '#101216';
@@ -38,6 +38,8 @@ const PREF_KEY_RULERS: string = 'rulers';
 const PREF_KEY_GRID_SIZE: string = 'gridSize';
 const PREF_KEY_GUIDES: string = 'guides';
 const PREF_KEY_DEFAULT_ZOOM: string = 'defaultZoom';
+const PREF_KEY_RECENT_FILES: string = 'recentFiles';
+const PREF_KEY_FX_PRESETS: string = 'fxPresets';
 
 
 const PERF_DOMAIN: number = 0x0A01;
@@ -80,6 +82,15 @@ const RULER_TICK: string = '#8b98a8';
 const RULER_TEXT: string = '#a9b7c6';
 // 主刻度屏幕间距下限：低于该值时相邻数字会挤在一起，需升到下一档步长。
 const RULER_MIN_SPACING: number = 60;
+// 设备形态断点（HarmonyOS 响应式标准：sm <600vp、md 600-840vp、lg >=840vp）。
+// 阔直板是 phone 形态的宽屏直板机（长宽比约 1:1.69，竖屏约 440x744vp）。
+// 旧阈值 820vp 只覆盖 lg 断点：阔直板横屏约 744vp 仍走上下布局，
+// 画布高度被 330vp 底栏挤到不足 30vp；下调到 md 断点下沿后横屏自动左右分栏。
+const WIDE_BREAKPOINT_VP: number = 600;
+const LG_BREAKPOINT_VP: number = 840;
+// 左右分栏时右侧面板宽度：md 断点收窄到 300vp，把宽度让给画布；lg 断点保持 350vp。
+const PANEL_WIDTH_MD_VP: number = 300;
+const PANEL_WIDTH_LG_VP: number = 350;
 
 interface AdjustPatch {
   brightness?: number;
@@ -240,6 +251,11 @@ interface FxUpdateParams {
   shadowOpacity?: number;
 }
 
+// 图层样式预设：命名的 LayerEffectsInfo 组合，可保存/套用（G7）。
+interface FxPreset {
+  name: string;
+  data: LayerEffectsInfo;
+}
 
 const FX_CARD_BG: string = '#1b2836';
 const FX_GROUP_BG: string = '#22303f';
@@ -308,6 +324,7 @@ struct Index {
   @State busy: boolean = false;
   @State status: string = '打开一张图片开始编辑';
   @State isWide: boolean = false;
+  @State screenWidth: number = 0;
   @State exportFormat: string = 'png';
   @State exportQuality: number = 90;
   @State layerOpacity: number = 100;
@@ -401,6 +418,10 @@ struct Index {
   @State fxBevelHighlightOpacity: number = 75;
   @State fxBevelShadowColor: string = '#000000';
   @State fxBevelShadowOpacity: number = 75;
+  // 图层样式预设：保存/套用/删除组合样式（G7）。
+  @State fxPresets: FxPreset[] = [];
+  @State fxPresetOpen: boolean = false;
+  @State fxPresetName: string = '';
   // 图层蒙版（C-MASK-UI@1 §B）：数据由 loadMask 回填，MaskCard 内一律直接读 this.*，不用形参传状态。
   @State maskInfo: LayerMaskInfo = { present: false, enabled: true, linked: true, density: 1, feather: 0 };
   @State maskOpen: boolean = true;
@@ -497,6 +518,10 @@ struct Index {
 
   private renderTimer: number = -1;
   private renderToken: number = 0;
+  // PAN-PREFETCH@1：手势中可见区越出当前 detail tile 时，提前以 0 延迟调度重渲染，
+  // 避免「手势结束 + 140ms debounce + 异步 createPixelMap」期间露出空白底色（分块拖影）。
+  // 该标志保证一次越界手势只提前调度一次，不违背 R7.3「每帧不触发引擎渲染」。
+  private panTileMissScheduled: boolean = false;
   // 渲染调度与缓存度量：全部为普通字段（非 @State），避免计数变化触发 UI 重组。
   private docRevision: number = 0;
   private detailKey: string = '';
@@ -1666,7 +1691,19 @@ struct Index {
     // 首选项在既有初始化之后读取：读不到时保持默认值，不影响字体/渲染初始化。
     this.loadPrefs();
     this.loadAppVersion();
+    this.logComputeProfile();
     this.handleQuickAction();
+  }
+
+  /** 设备算力档案：有向量内核走加速路径，否则标量回落；PERF 日志用于真机取证。 */
+  private logComputeProfile(): void {
+    try {
+      const p = Engine.computeProfile();
+      this.perf('compute arch=' + p.arch + ' simd=' + p.simd + ' vectorKernel=' + p.vectorKernel +
+        ' vulkan=' + p.vulkan + ' npu=' + p.npu);
+    } catch (err) {
+      this.perf('compute profile failed: ' + String(err));
+    }
   }
 
   onPageShow(): void {
@@ -1688,8 +1725,12 @@ struct Index {
       // 任务 2.2 / 1.3.0：打开最近编辑 — 打开最近保存的最近文件
       this.openRecent();
     } else if (action === 'continueLast') {
-      // 任务 2.2：继续上次编辑 — 当前无持久化最近文档，降级为新建文档
-      this.newDocument();
+      // 继续上次编辑 — 有持久化最近文档则打开，否则降级为新建文档
+      if (this.recentFiles.length > 0) {
+        this.openRecent();
+      } else {
+        this.newDocument();
+      }
     }
     AppStorage.setOrCreate<string>('quickAction', '');
   }
@@ -1882,7 +1923,14 @@ struct Index {
     const filtered = list.filter(p => p !== path);
     filtered.unshift(path);
     // 限制最多 5 项
-    this.recentFiles = filtered.slice(0, 5);
+    const recent = filtered.slice(0, 5);
+    AppStorage.setOrCreate<string[]>('recentFiles', recent);
+    // 持久化到 preferences（服务卡片 onUpdateForm 读取，使 RecentDocsCard 可感知价值）
+    try {
+      const store = preferences.getPreferencesSync(getContext(this), { name: PREFS_NAME });
+      store.putSync(PREF_KEY_RECENT_FILES, recent);
+      store.flush().catch(() => {});
+    } catch (err) {}
   }
 
   /** 打开最近编辑的文档（不弹文件选择器，直接打开最近保存路径） */
@@ -2141,6 +2189,42 @@ struct Index {
     }, DETAIL_DELAY_MS);
   }
 
+  /** PAN-PREFETCH@1：手势中检测可见区是否越出已渲染的 detail tile。 */
+  private panLeavesDetailTile(): boolean {
+    const info = this.info;
+    if (!this.usingDetail || info === undefined || this.detailPixels === undefined || this.detailKey === '') {
+      return false;
+    }
+    const scale = this.displayScale();
+    if (scale <= 0) {
+      return false;
+    }
+    const visibleW = this.viewportW / scale;
+    const visibleH = this.viewportH / scale;
+    const centerX = info.width / 2 - this.panX / scale;
+    const centerY = info.height / 2 - this.panY / scale;
+    return visibleRectLeavesTile(
+      centerX - visibleW / 2, centerY - visibleH / 2,
+      centerX + visibleW / 2, centerY + visibleH / 2,
+      this.regionX, this.regionY, this.regionW, this.regionH);
+  }
+
+  /** PAN-PREFETCH@1：越界时立即调度一次重渲染（0 延迟），一次手势只触发一次。 */
+  private prefetchDetailOnPan(): void {
+    if (this.panTileMissScheduled || !this.panLeavesDetailTile()) {
+      return;
+    }
+    this.panTileMissScheduled = true;
+    if (this.renderTimer !== -1) {
+      clearTimeout(this.renderTimer);
+    }
+    this.renderTimer = setTimeout(() => {
+      this.renderTimer = -1;
+      this.renderDetail();
+    }, 0);
+    this.perf('panPrefetch key=- hit=false calls=' + this.renderCalls + ' ms=0');
+  }
+
   private onViewportChanged(width: number, height: number): void {
     if (Math.abs(this.viewportW - width) < 0.5 && Math.abs(this.viewportH - height) < 0.5) {
       return;
@@ -2285,6 +2369,18 @@ struct Index {
 
   // 命中缓存后只用缓存字节重建 PixelMap：不请求引擎（renderCalls 不增），画面与首次 miss 完全一致（R8.1 / R11.3③）。
   private rebuildDetail(key: string, source: ArrayBuffer, x0: number, y0: number, regionW: number, regionH: number): void {
+    // PERF-OPT@1：当前显示的细节 PixelMap 若已属于同一键/同一区域（平移后回到原区域），
+    // 直接复用对象，省掉一次异步 createPixelMap；不新增缓存槽，所有权链保持原样。
+    if (this.usingDetail && this.pixelMap !== undefined && key === this.detailKey &&
+        this.regionX === x0 && this.regionY === y0 && this.regionW === regionW && this.regionH === regionH) {
+      this.detailHits++;
+      this.displayPixels = source;
+      this.redrawCanvas();
+      this.perf('renderDetail rev=' + this.docRevision + ' key=' + key + ' hit=true calls=' + this.renderCalls +
+        ' ms=0 hits=' + this.detailHits + ' w=' + regionW + ' h=' + regionH + ' bytes=' + source.byteLength +
+        ' mapReuse=true');
+      return;
+    }
     const token = ++this.renderToken;
     const options: image.InitializationOptions = {
       size: { width: regionW, height: regionH },
@@ -2555,6 +2651,16 @@ struct Index {
   }
 
   private selectTool(tool: string): void {
+    // BUGFIX(TOOL-CLEAN@1)：文字草稿坐标未清理，若 Up 在没有新 Down 的情况下到达，
+    // 会在旧坐标落字（幽灵文字）；切工具时统一复位。
+    this.textMultiTouch = false;
+    this.textTapX = 0;
+    this.textTapY = 0;
+    // 待执行的细节渲染定时器随工具切换取消，避免旧视图的渲染在新工具下落地。
+    if (this.renderTimer !== -1) {
+      clearTimeout(this.renderTimer);
+      this.renderTimer = -1;
+    }
     // 裁剪模式是画布态：切工具视为放弃裁剪（R1.6），退出后再按既有语义切换。
     if (this.cropMode) {
       this.cropCancel();
@@ -4159,6 +4265,33 @@ struct Index {
     }
   }
 
+  private async copyVisibleLayer(): Promise<void> {
+    if (this.docId === 0) {
+      return;
+    }
+    try {
+      const outcome = Engine.copyVisible(this.docId);
+      this.info = outcome.info;
+      this.layers = flattenLayers(outcome.info.layers, 0);
+      this.selectedLayerId = outcome.layerId;
+      this.clearLayerThumbCache(outcome.layerId);
+      this.loadLayerThumb(outcome.layerId);
+      for (const layer of this.layers) {
+        if (layer.id === outcome.layerId) {
+          this.layerNameDraft = layer.name;
+          this.layerOpacity = Math.round(layer.opacity * 100);
+          this.layerFillOpacity = Math.round((layer.fillOpacity ?? layer.opacity) * 100);
+          this.layerBlend = layer.blend ?? 'Normal';
+          break;
+        }
+      }
+      await this.refreshPreview();
+      this.status = '已复制可见图层';
+    } catch (err) {
+      this.status = '复制可见失败：' + this.messageOf(err as Object);
+    }
+  }
+
   private async setLayerBlendMode(mode: string): Promise<void> {
     if (this.docId === 0 || this.selectedLayerId === 0) {
       return;
@@ -5703,6 +5836,107 @@ struct Index {
     }
   }
 
+  // ===== 图层样式预设（G7）=====
+  private fxLoadPresets(): void {
+    try {
+      const store = preferences.getPreferencesSync(getContext(this), { name: PREFS_NAME });
+      const raw = store.getSync(PREF_KEY_FX_PRESETS, '[]') as string;
+      this.fxPresets = JSON.parse(raw) as FxPreset[];
+    } catch (err) {
+      this.fxPresets = [];
+    }
+  }
+
+  private fxPersistPresets(): void {
+    try {
+      const store = preferences.getPreferencesSync(getContext(this), { name: PREFS_NAME });
+      store.putSync(PREF_KEY_FX_PRESETS, JSON.stringify(this.fxPresets));
+      store.flush().catch(() => {});
+    } catch (err) {}
+  }
+
+  private fxSavePreset(): void {
+    const name = this.fxPresetName.trim();
+    if (name.length === 0) {
+      this.status = '请输入预设名称';
+      return;
+    }
+    const preset: FxPreset = { name: name, data: this.fxInfo };
+    const existing = this.fxPresets.findIndex(p => p.name === name);
+    const updated = this.fxPresets.slice();
+    if (existing >= 0) {
+      updated[existing] = preset;
+    } else {
+      updated.push(preset);
+    }
+    this.fxPresets = updated;
+    this.fxPresetName = '';
+    this.fxPersistPresets();
+    this.status = '已保存预设：' + name;
+  }
+
+  private fxPresetItemToParams(item: LayerEffectInfo): FxUpdateParams {
+    const params: FxUpdateParams = {
+      op: 'add',
+      kind: item.kind,
+      blend: item.blend,
+      opacity: item.opacity,
+      color: item.color,
+      angle: item.angle,
+      distance: item.distance,
+      spread: item.spread,
+      size: item.size,
+      position: item.position,
+      technique: item.technique,
+      knocksOut: item.knocksOut,
+      antiAlias: item.antiAlias,
+    };
+    if (item.source !== undefined) params.source = item.source;
+    if (item.style !== undefined) params.bevelStyle = item.style;
+    if (item.bevelTechnique !== undefined) params.bevelTechnique = item.bevelTechnique;
+    if (item.depth !== undefined) params.depth = item.depth;
+    if (item.up !== undefined) params.up = item.up;
+    if (item.soften !== undefined) params.soften = item.soften;
+    if (item.altitude !== undefined) params.altitude = item.altitude;
+    if (item.highlightColor !== undefined) params.highlightColor = item.highlightColor;
+    if (item.highlightOpacity !== undefined) params.highlightOpacity = item.highlightOpacity;
+    if (item.shadowColor !== undefined) params.shadowColor = item.shadowColor;
+    if (item.shadowOpacity !== undefined) params.shadowOpacity = item.shadowOpacity;
+    if (item.dither !== undefined) params.dither = item.dither;
+    if (item.gradient !== undefined) {
+      params.gradientStops = item.gradient.stops;
+      params.gradientStyle = item.gradient.style;
+      params.gradientScale = item.gradient.scale;
+      params.reverse = item.gradient.reverse;
+      params.align = item.gradient.align;
+    }
+    return params;
+  }
+
+  private async fxApplyPreset(name: string): Promise<void> {
+    if (this.docId === 0 || this.selectedLayerId === 0) {
+      return;
+    }
+    const preset = this.fxPresets.find(p => p.name === name);
+    if (preset === undefined) {
+      return;
+    }
+    await this.fxClear();
+    await this.fxMaster(preset.data.enabled);
+    for (const item of preset.data.items) {
+      const params = this.fxPresetItemToParams(item);
+      await this.fxApply(params);
+    }
+    this.fxSyncDraft();
+    this.status = '已套用预设：' + name;
+  }
+
+  private fxDeletePreset(name: string): void {
+    this.fxPresets = this.fxPresets.filter(p => p.name !== name);
+    this.fxPersistPresets();
+    this.status = '已删除预设：' + name;
+  }
+
   // 颜色直接经 hexToRgba 原样传入 color 字段，任何一层都不交换通道。
   private async fxSetColor(kind: string, hex: string): Promise<void> {
     this.fxColor = hex;
@@ -6323,7 +6557,7 @@ struct Index {
     }
     try {
       this.busy = true;
-      const format = this.exportFormat === 'psd' ? 'png' : this.exportFormat;
+      const format = (this.exportFormat === 'psd' || this.exportFormat === 'psb') ? 'png' : this.exportFormat;
       const bytes = Engine.exportImage(this.docId, format, this.exportQuality);
       const ctx = getContext(this) as common.UIAbilityContext;
       const dir = ctx.filesDir + '/share';
@@ -6383,11 +6617,29 @@ struct Index {
       .fontColor(this.barEnabled(kind) ? COLOR_TEXT : '#4d5663')
       .backgroundColor('#22262e')
       .height(32)
-      .padding({ left: 12, right: 12 })
+      .constraintSize({ minWidth: 48 })
+      .flexShrink(0)
+      // 窄屏（<600vp）内边距 12→10，为顶栏 5 个按钮常显腾出空间。
+      .padding({ left: this.screenWidth < WIDE_BREAKPOINT_VP ? 10 : 12, right: this.screenWidth < WIDE_BREAKPOINT_VP ? 10 : 12 })
       .borderRadius(8)
       .enabled(this.barEnabled(kind))
       .onClick(() => {
         action();
+      })
+  }
+
+  /** 导出格式芯片（FMT-EXPORT@1）：六种格式共用同一套视觉与点击链路。 */
+  @Builder
+  ExportChip(format: string) {
+    Text(this.formatLabel(format))
+      .fontSize(11)
+      .fontColor(this.exportFormat === format ? '#0d1a14' : '#9fd8bb')
+      .height(28)
+      .padding({ left: 10, right: 10 })
+      .backgroundColor(this.exportFormat === format ? COLOR_EXPORT_ACCENT : '#22352b')
+      .borderRadius(7)
+      .onClick(() => {
+        this.exportFormat = format;
       })
   }
 
@@ -6402,9 +6654,11 @@ struct Index {
           .onClick(() => {
             this.openLegal();
           })
-        Text('零权限 · 纯本地处理 · 不收集信息')
+        // 阔直板/手机竖屏（<600vp）顶栏空间不足：隐私副标题收短，保证 5 个按钮全部常显。
+        Text(this.screenWidth < WIDE_BREAKPOINT_VP ? '零权限 · 纯本地' : '零权限 · 纯本地处理 · 不收集信息')
           .fontSize(10)
           .fontColor(COLOR_MUTED)
+          .maxLines(1)
       }
       Text(this.info?.name ?? '图像编辑器')
         .fontSize(11)
@@ -6416,7 +6670,8 @@ struct Index {
       // 真机（360vp 宽）验证发现 5 个按钮总宽超出行宽，「近场分享」被推出屏外不可达；
       // 改为横向 Scroll 兜底：空间不足时可左右滑动触达全部按钮（R-BAR-SCROLL@1）。
       Scroll() {
-        Row({ space: 8 }) {
+        // 窄屏（<600vp）按钮间距 8→6，配合收窄的内边距让 5 个按钮全部常显。
+        Row({ space: this.screenWidth < WIDE_BREAKPOINT_VP ? 6 : 8 }) {
           this.BarButton('打开', 'open', () => {
             this.openFile();
           })
@@ -6489,6 +6744,7 @@ struct Index {
           Text('隐私政策 · 用户协议')
             .fontSize(11)
             .fontColor('#6f8aa6')
+            .padding({ top: 2, bottom: 2 })
             .onClick(() => {
               this.openLegal();
             })
@@ -6870,6 +7126,7 @@ struct Index {
             this.panStartX = this.panX;
             this.panStartY = this.panY;
             this.gestureUpdates = 0;
+            this.panTileMissScheduled = false;
           })
           .onActionUpdate((event: GestureEvent) => {
             if (this.trMode) { return; }
@@ -6878,10 +7135,12 @@ struct Index {
             if (this.tool !== 'pan' || this.pinchActive || this.info === undefined) {
               return;
             }
-            // 手势进行中只移动视图与重绘叠加层，绝不触发引擎渲染（R7.3）。
+            // 手势进行中只移动视图与重绘叠加层，绝不逐帧触发引擎渲染（R7.3）；
+            // 仅在首次越出 detail tile 时提前调度一次重渲染（PAN-PREFETCH@1），消除分块拖影。
             this.panX = this.panStartX + event.offsetX;
             this.panY = this.panStartY + event.offsetY;
             this.noteGestureUpdate('pan');
+            this.prefetchDetailOnPan();
             this.redrawCanvas();
           })
           .onActionEnd(() => {
@@ -7407,7 +7666,10 @@ struct Index {
       this.gridSize = storedGridSize;
       this.showGuides = storedGuides;
       this.defaultZoom = storedZoom;
+      const storedRecent = store.getSync(PREF_KEY_RECENT_FILES, []) as string[];
+      AppStorage.setOrCreate<string[]>('recentFiles', storedRecent);
       this.redrawCanvas();
+      this.fxLoadPresets();
     } catch (err) {
       // 读取失败：全部保持默认值，不改变任何 @State。
     }
@@ -8681,6 +8943,16 @@ struct Index {
             .onClick(() => {
               this.mergeSelectedLayer();
             })
+          Button('复制可见')
+            .fontSize(11)
+            .height(28)
+            .backgroundColor('#22303f')
+            .fontColor('#9fc4ff')
+            .borderRadius(6)
+            .layoutWeight(1)
+            .onClick(() => {
+              this.copyVisibleLayer();
+            })
         }
         .width('100%')
         .margin({ bottom: 6 })
@@ -8850,6 +9122,7 @@ struct Index {
             .textOverflow({ overflow: TextOverflow.Ellipsis })
         }
         .layoutWeight(1)
+        .constraintSize({ minHeight: 48 })
         .onClick(() => {
           this.maskOpen = !this.maskOpen;
         })
@@ -8920,7 +9193,7 @@ struct Index {
               Text(this.maskInfo.enabled ? '启用 ●' : '停用 ○')
                 .fontSize(10)
                 .fontColor(this.maskInfo.enabled ? '#7ee787' : '#55606d')
-                .height(24)
+                .height(28)
                 .padding({ left: 9, right: 9 })
                 .backgroundColor(COLOR_MASK_GROUP)
                 .borderRadius(5)
@@ -8930,7 +9203,7 @@ struct Index {
               Text('删除蒙版')
                 .fontSize(10)
                 .fontColor(COLOR_MASK_DANGER)
-                .height(24)
+                .height(28)
                 .padding({ left: 9, right: 9 })
                 .backgroundColor('#3a2026')
                 .borderRadius(5)
@@ -8941,6 +9214,24 @@ struct Index {
                 })
             }
             .width('100%')
+
+            // 链接行：只读状态指示（本轮 linked 恒为 true，不可切换）。
+            Row({ space: 8 }) {
+              Text('链接')
+                .fontSize(9)
+                .fontColor(COLOR_MASK_MUTED)
+                .width(34)
+              Text(this.maskInfo.linked ? '已锁定 · 随图层移动' : '未链接')
+                .fontSize(9)
+                .fontColor(COLOR_MASK_MUTED)
+                .layoutWeight(1)
+              Text(this.maskInfo.linked ? '🔗' : '⛓')
+                .fontSize(11)
+                .width(22)
+                .textAlign(TextAlign.Center)
+            }
+            .width('100%')
+            .constraintSize({ minHeight: 48 })
 
             // 密度行：拖动只写草稿；End/Click 才提交一次（R4.4）。
             Row({ space: 8 }) {
@@ -9299,6 +9590,94 @@ struct Index {
           this.FxGroup('内发光', 'innerGlow')
           this.FxGroup('渐变叠加', 'gradientOverlay')
           this.FxGroup('斜面与浮雕', 'bevelEmboss')
+
+          // 图层样式预设（G7）：保存当前组合 / 套用 / 删除
+          Row({ space: 6 }) {
+            Column()
+              .width(6)
+              .height(6)
+              .backgroundColor('#b9a4ff')
+              .borderRadius(3)
+            Text('预设')
+              .fontSize(11)
+              .fontWeight(FontWeight.Medium)
+              .fontColor(FX_TEXT)
+              .layoutWeight(1)
+              .onClick(() => {
+                this.fxPresetOpen = !this.fxPresetOpen;
+              })
+            Text(this.fxPresetOpen ? '▾' : '▸')
+              .fontSize(11)
+              .fontColor(FX_TEXT_MUTED)
+              .onClick(() => {
+                this.fxPresetOpen = !this.fxPresetOpen;
+              })
+          }
+          .width('100%')
+
+          if (this.fxPresetOpen) {
+            Column({ space: 6 }) {
+              Row({ space: 6 }) {
+                TextInput({ placeholder: '预设名称', text: this.fxPresetName })
+                  .fontSize(10)
+                  .height(28)
+                  .layoutWeight(1)
+                  .onChange((value: string) => {
+                    this.fxPresetName = value;
+                  })
+                Text('保存')
+                  .fontSize(10)
+                  .fontColor('#0b1220')
+                  .height(28)
+                  .padding({ left: 10, right: 10 })
+                  .backgroundColor(FX_ENABLED)
+                  .borderRadius(5)
+                  .onClick(() => {
+                    this.fxSavePreset();
+                  })
+              }
+              .width('100%')
+
+              if (this.fxPresets.length === 0) {
+                Text('暂无预设')
+                  .fontSize(9)
+                  .fontColor(FX_TEXT_MUTED)
+              } else {
+                ForEach(this.fxPresets, (preset: FxPreset) => {
+                  Row({ space: 6 }) {
+                    Text(preset.name)
+                      .fontSize(10)
+                      .fontColor(FX_TEXT)
+                      .layoutWeight(1)
+                      .maxLines(1)
+                      .textOverflow({ overflow: TextOverflow.Ellipsis })
+                    Text('套用')
+                      .fontSize(9)
+                      .fontColor('#0b1220')
+                      .height(20)
+                      .padding({ left: 8, right: 8 })
+                      .backgroundColor(FX_ENABLED)
+                      .borderRadius(5)
+                      .onClick(() => {
+                        this.fxApplyPreset(preset.name);
+                      })
+                    Text('删除')
+                      .fontSize(9)
+                      .fontColor('#ff8b8b')
+                      .height(20)
+                      .padding({ left: 8, right: 8 })
+                      .backgroundColor('#3a2026')
+                      .borderRadius(5)
+                      .onClick(() => {
+                        this.fxDeletePreset(preset.name);
+                      })
+                  }
+                  .width('100%')
+                }, (preset: FxPreset) => 'fx-preset-' + preset.name)
+              }
+            }
+            .width('100%')
+          }
 
           if (this.fxUnsupported().length > 0) {
             Column({ space: 4 }) {
@@ -10172,7 +10551,8 @@ struct Index {
           .backgroundColor(this.tool === 'pen' ? COLOR_SHAPE_ACCENT : '#22352b')
           .borderRadius(7)
           .onClick(() => {
-            this.tool = 'pen';
+            // BUGFIX(PEN-BUILD@1)：与「按点构建」统一走 selectTool，取消其他工具草稿。
+            this.selectTool('pen');
             this.penStart(this.docId);
           })
       }
@@ -10625,7 +11005,12 @@ struct Index {
           .fontColor(this.tool === 'pan' ? '#64748b' : '#334155')
           .margin({ right: 4 })
           .onClick(() => {
-            if (this.docId !== 0) { this.penStart(this.docId); }
+            // BUGFIX(PEN-BUILD@1)：此前只 penStart 未切 tool，导致画布点击不落锚点、
+            // 「路径」提交按钮（要求 tool==='pen'）永远无效。走 selectTool 取消其他草稿。
+            if (this.docId !== 0) {
+              this.selectTool('pen');
+              this.penStart(this.docId);
+            }
           })
         Text('路径')
           .fontSize(11)
@@ -10739,32 +11124,34 @@ struct Index {
       .width('100%')
       .margin({ bottom: 10 })
 
-      Row({ space: 8 }) {
-        ForEach(['png', 'jpeg', 'webp', 'psd'], (format: string) => {
-          Text(this.formatLabel(format))
-            .fontSize(11)
-            .fontColor(this.exportFormat === format ? '#0d1a14' : '#9fd8bb')
-            .height(28)
-            .padding({ left: 12, right: 12 })
-            .backgroundColor(this.exportFormat === format ? COLOR_EXPORT_ACCENT : '#22352b')
-            .borderRadius(7)
+      // FMT-EXPORT@1：两行排布六种格式，360vp 宽度下不与「导出文件」按钮挤在一起。
+      Column({ space: 8 }) {
+        Row({ space: 8 }) {
+          ForEach(['png', 'jpeg', 'webp', 'psd'], (format: string) => {
+            this.ExportChip(format)
+          }, (format: string) => format)
+          Blank()
+        }
+        .width('100%')
+
+        Row({ space: 8 }) {
+          ForEach(['tiff', 'psb'], (format: string) => {
+            this.ExportChip(format)
+          }, (format: string) => format)
+          Blank()
+          Button('导出文件')
+            .fontSize(12)
+            .height(30)
+            .backgroundColor(COLOR_EXPORT_ACCENT)
+            .fontColor('#0d1a14')
+            .borderRadius(8)
+            .enabled(this.docId !== 0)
             .onClick(() => {
-              this.exportFormat = format;
+              this.exportImage();
             })
-        }, (format: string) => format)
-        Blank()
-        Button('导出文件')
-          .fontSize(12)
-          .height(30)
-          .backgroundColor(COLOR_EXPORT_ACCENT)
-          .fontColor('#0d1a14')
-          .borderRadius(8)
-          .enabled(this.docId !== 0)
-          .onClick(() => {
-            this.exportImage();
-          })
+        }
+        .width('100%')
       }
-      .width('100%')
 
       if (this.exportFormat === 'jpeg' || this.exportFormat === 'webp') {
         Row({ space: 8 }) {
@@ -10849,6 +11236,16 @@ struct Index {
   @Builder
   StatusBar() {
     Row() {
+      // 窄屏（<600vp）顶栏文件名被压缩成省略号，这里补显完整文件名；宽屏顶栏已显示，不重复。
+      if (this.screenWidth < WIDE_BREAKPOINT_VP && this.info !== undefined) {
+        Text(this.info.name)
+          .fontSize(11)
+          .fontColor(COLOR_TEXT)
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .constraintSize({ maxWidth: '45%' })
+          .margin({ right: 10 })
+      }
       Text(this.status)
         .fontSize(11)
         .fontColor(COLOR_MUTED)
@@ -10882,7 +11279,7 @@ struct Index {
             Column() {
               this.Panel()
             }
-            .width(350)
+            .width(this.screenWidth >= LG_BREAKPOINT_VP ? PANEL_WIDTH_LG_VP : PANEL_WIDTH_MD_VP)
             .height('100%')
             .border({ width: { left: 1 }, color: '#232830' })
           }
@@ -10907,7 +11304,9 @@ struct Index {
       .height('100%')
       .backgroundColor(COLOR_ROOT)
       .onAreaChange((oldValue: Area, newValue: Area) => {
-        this.isWide = Number(newValue.width) > 820;
+        const width = Number(newValue.width);
+        this.screenWidth = width;
+        this.isWide = width > WIDE_BREAKPOINT_VP;
       })
 
     }

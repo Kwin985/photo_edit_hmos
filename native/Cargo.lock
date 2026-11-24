@@ -1900,6 +1900,7 @@ dependencies = [
  "criterion",
  "photocraft-cms",
  "photocraft-color",
+ "photocraft-compute",
  "photocraft-doc",
  "photocraft-geom",
  "photocraft-paint",
@@ -1908,6 +1909,10 @@ dependencies = [
  "proptest",
  "rayon",
 ]
+
+[[package]]
+name = "photocraft-compute"
+version = "0.20.1"
 
 [[package]]
 name = "photocraft-doc"
@@ -2004,6 +2009,7 @@ dependencies = [
  "photocraft-codecs",
  "photocraft-color",
  "photocraft-compose",
+ "photocraft-compute",
  "photocraft-doc",
  "photocraft-geom",
  "photocraft-io",

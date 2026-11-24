@@ -9,6 +9,7 @@ name = "photocraft_core"
 crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
+photocraft-compute = { workspace = true }
 photocraft-doc = { workspace = true }
 photocraft-compose = { workspace = true }
 

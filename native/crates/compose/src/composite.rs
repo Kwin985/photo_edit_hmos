@@ -49,11 +49,10 @@ pub fn adjustment_quantum(depth: photocraft_color::SampleType) -> Option<f32> {
 }
 
 pub(crate) fn quantize(b: &mut Buffer, q: f32) {
-    for p in &mut b.px {
-        for v in p.iter_mut() {
-            *v = branchless_floor(*v * q + 0.5) / q;
-        }
-    }
+    // Dispatched through `photocraft-compute`: on x86_64 the SSE2 kernel takes over (four pixels
+    // per iteration) and the scalar reference remains the fallback (and the bit-exact tail), so
+    // every device keeps identical output bytes. aarch64 runs the NEON kernel.
+    photocraft_compute::quantize_floor_rgba8(&mut b.px, q);
 }
 
 /// `x.floor()`, bit for bit (signed zeros, infinities and NaNs included), without a call: baseline

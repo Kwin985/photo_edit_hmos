@@ -124,6 +124,27 @@ struct LegalPage {
       .backgroundColor('#18232f')
       .borderRadius(12)
 
+      Column({ space: 8 }) {
+        Text('权限概览')
+          .fontSize(14)
+          .fontWeight(FontWeight.Medium)
+          .fontColor('#ffffff')
+        Text('网络权限：无')
+          .fontSize(13)
+          .fontColor('#c7d0dc')
+        Text('数据：仅本地内存')
+          .fontSize(13)
+          .fontColor('#c7d0dc')
+        Text('权限申请：0 项')
+          .fontSize(13)
+          .fontColor('#c7d0dc')
+      }
+      .width('100%')
+      .alignItems(HorizontalAlign.Start)
+      .padding(14)
+      .backgroundColor('#18232f')
+      .borderRadius(12)
+
       Row({ space: 10 }) {
         Text('查看隐私政策')
           .fontSize(13)

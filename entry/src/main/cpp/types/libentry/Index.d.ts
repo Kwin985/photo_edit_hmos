@@ -136,6 +136,8 @@ declare const native: {
   deleteLayer(documentId: number, layerId: number): void;
   /** 批量删除：idsJson 是 JSON 数组字符串；整批共享一次撤销点，返回 `{"ok":true,"data":{"deleted":N}}` */
   layerDeleteMany(documentId: number, idsJson: string): string;
+  /** 复制可见：把所有可见图层合成到新图层，返回 `{layerId, info}`。 */
+  copyVisible(documentId: number): string;
   addAdjustment(documentId: number, kind: string, paramsJson: string): string;
   updateAdjustment(documentId: number, layerId: number, paramsJson: string): void;
   getAdjustment(documentId: number, layerId: number): string;
@@ -146,6 +148,8 @@ declare const native: {
   updateLayerEffect(documentId: number, layerId: number, paramsJson: string): string;
   renderPixels(documentId: number, x: number, y: number, w: number, h: number): ArrayBuffer;
   revision(documentId: number): string;
+  /** 设备算力档案：`{"ok":true,"data":{"arch","simd","vectorKernel","vulkan","npu"}}` JSON 字符串。 */
+  computeProfile(): string;
   layerMaskGet(documentId: number, layerId: number): string;
   layerMaskAdd(documentId: number, layerId: number, fill: string): string;
   layerMaskSet(documentId: number, layerId: number, paramsJson: string): string;

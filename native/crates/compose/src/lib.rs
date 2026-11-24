@@ -127,35 +127,31 @@ impl Buffer {
     }
     pub fn to_rgba8(&self) -> Rgba8Image {
         let mut img = Rgba8Image::new(self.rect.width(), self.rect.height());
-        let quantize = |out: &mut [[u8; 4]], src: &[[f32; 4]]| {
-            for (o, p) in out.iter_mut().zip(src) {
-                for (dst, v) in o.iter_mut().zip(p) {
-                    *dst = (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-                }
-            }
-        };
         let out = img.pixels.as_chunks_mut::<4>().0;
         // In parallel off wasm: a 24 MP composite took 120 ms on one core (the CPU canvas,
         // previews, thumbnails and 8-bit exports all come through here).
+        //
+        // Quantisation is dispatched through `photocraft-compute`: on aarch64 the NEON kernel
+        // takes over and the scalar reference remains the fallback (and the bit-exact tail), so
+        // every device keeps identical output bytes.
         #[cfg(not(target_arch = "wasm32"))]
         {
             use rayon::prelude::*;
-            out.par_chunks_mut(16 * 1024).zip(self.px.par_chunks(16 * 1024)).for_each(|(o, p)| quantize(o, p));
+            out.par_chunks_mut(16 * 1024)
+                .zip(self.px.par_chunks(16 * 1024))
+                .for_each(|(o, p)| photocraft_compute::quantize_rgba8(o, p));
         }
         #[cfg(target_arch = "wasm32")]
-        quantize(out, &self.px);
+        photocraft_compute::quantize_rgba8(out, &self.px);
         img
     }
     /// Flatten over an opaque background colour.
     pub fn over_background(&self, bg: [f32; 3]) -> Buffer {
         let mut out = self.clone();
-        for p in &mut out.px {
-            let a = p[3];
-            for i in 0..3 {
-                p[i] = p[i] * a + bg[i] * (1.0 - a);
-            }
-            p[3] = 1.0;
-        }
+        // Dispatched through `photocraft-compute`: x86_64 uses the SSE2 kernel and aarch64 the
+        // NEON kernel (four pixels per iteration); the scalar reference remains the fallback and
+        // the bit-exact tail, so every device keeps identical output bytes.
+        photocraft_compute::over_background_rgba8(&mut out.px, bg);
         out
     }
 }

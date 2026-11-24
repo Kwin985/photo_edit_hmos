@@ -110,7 +110,7 @@ pub fn apply_depth(adj: &Adjustment, buf: &mut Buffer, transfer: Transfer, depth
 /// see [`float_tone_extrapolates`]).
 fn apply_depth_mode(adj: &Adjustment, buf: &mut Buffer, transfer: Transfer, depth: Option<SampleType>, mode: ColorMode) {
     match adj {
-        Adjustment::Invert => map_rgb(buf, |c| [1.0 - c[0], 1.0 - c[1], 1.0 - c[2]]),
+        Adjustment::Invert => photocraft_compute::invert_rgba8(&mut buf.px),
         Adjustment::Threshold { level } => map_rgb(buf, |c| [if threshold_white(c, *level, depth) { 1.0 } else { 0.0 }; 3]),
         Adjustment::Posterize { levels } => map_rgb(buf, |c| c.map(|v| posterize_in(v, *levels, depth))),
         Adjustment::BrightnessContrast { brightness, contrast, legacy: true } => {
@@ -211,22 +211,23 @@ fn apply_depth_mode(adj: &Adjustment, buf: &mut Buffer, transfer: Transfer, dept
                 if *monochrome { [mix(&m[0]); 3] } else { [mix(&m[0]), mix(&m[1]), mix(&m[2])] }
             })
         }
-        Adjustment::ChannelMixer { matrix, monochrome } => map_rgb(buf, |c| {
-            let mix = |row: &[f32; 4]| (row[0] * c[0] + row[1] * c[1] + row[2] * c[2] + row[3]).clamp(0.0, 1.0);
-            if *monochrome { [mix(&matrix[0]); 3] } else { [mix(&matrix[0]), mix(&matrix[1]), mix(&matrix[2])] }
-        }),
+        Adjustment::ChannelMixer { matrix, monochrome } => {
+            photocraft_compute::channel_mixer_rgba8(&mut buf.px, *matrix, *monochrome);
+        }
         Adjustment::PhotoFilter { color, density, preserve_luminosity } => {
             let linear_doc = depth == Some(SampleType::F32);
             let m = photo_filter_matrix(*color, *density, *preserve_luminosity && linear_doc);
-            let set_lum = *preserve_luminosity && !linear_doc;
-            map_rgb(buf, |c| {
-                // 32-bit samples are linear already, and may go negative.
-                let f = if linear_doc { mat3_mul(&m, c) } else { mat3_mul(&m, c.map(|v| transfer.decode(v))).map(|v| transfer.encode(v)) };
-                let f = if set_lum { photocraft_color::blend::set_lum(f, photocraft_color::blend::lum(c)) } else { f };
-                // 32-bit results aren't clipped (photoshop corpus rgb32 photo-filter.psd: white
-                // filters to 1.19 red).
-                if linear_doc { f } else { f.map(|v| v.clamp(0.0, 1.0)) }
-            })
+            if linear_doc {
+                // 32-bit: clean mat3_mul, no decode/encode, no set_lum, no clamp (superwhites kept).
+                photocraft_compute::mat3_mul_rgba8(&mut buf.px, m);
+            } else {
+                let set_lum = *preserve_luminosity && !linear_doc;
+                map_rgb(buf, |c| {
+                    let f = mat3_mul(&m, c.map(|v| transfer.decode(v))).map(|v| transfer.encode(v));
+                    let f = if set_lum { photocraft_color::blend::set_lum(f, photocraft_color::blend::lum(c)) } else { f };
+                    f.map(|v| v.clamp(0.0, 1.0))
+                })
+            }
         }
         Adjustment::BlackWhite { weights, tint } => {
             let hdr = depth == Some(SampleType::F32);
