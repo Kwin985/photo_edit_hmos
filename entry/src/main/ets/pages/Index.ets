@@ -8,6 +8,7 @@ import { deviceInfo } from '@kit.BasicServicesKit';
 import { systemShare } from '@kit.ShareKit';
 import { Engine, DocumentInfo, LayerInfo, AdjustmentInfo, SelectionInfo, emptyAdjustment, flattenLayers, visibleRectLeavesTile, LayerEffectInfo, LayerEffectsInfo, FxGradientInfo, FxGradientStop, LayerEditInfo, LayerMaskInfo, GuidesInfo, CutoutOutcome } from '../engine/Engine';
 import { FilterDef, FilterParamDef, FILTER_GROUPS, FILTERS, filtersInGroup, findFilter, buildFilterArgs } from '../engine/FilterCatalog';
+import { GalleryParamDef, GalleryPresetDef, GALLERY_CATEGORIES, GALLERY_PRESETS, galleryPresetsInCategory, findGalleryPreset, buildGalleryArgs } from '../engine/GalleryCatalog';
 
 const COLOR_ROOT: string = '#0a0b0d';
 const COLOR_CANVAS: string = '#101216';
@@ -351,6 +352,10 @@ struct Index {
   @State filterKind: string = 'gaussianBlur';
   @State filterGroup: string = '模糊锐化';
   @State filterValues: Map<string, number> = new Map<string, number>();
+  // 1.3.3 画廊子目录：47 种预设按 6 类呈现，参数与主滤镜分开存放。
+  @State galleryCategory: string = '艺术效果';
+  @State galleryKind: string = 'coloredPencil';
+  @State galleryValues: Map<string, number> = new Map<string, number>();
   @State shapeKind: string = 'rect';
   @State shapeFillColor: string = '#e5484d';
   @State shapeFillOpacity: number = 100;
@@ -3847,11 +3852,21 @@ struct Index {
     return findFilter(this.filterKind);
   }
 
+  private currentGalleryPreset(): GalleryPresetDef {
+    return findGalleryPreset(this.galleryKind);
+  }
+
   private filterLabel(): string {
+    if (this.filterKind === 'filterGallery') {
+      return '画廊 · ' + this.currentGalleryPreset().label;
+    }
     return this.currentFilterDef().label;
   }
 
   private currentFilterArgs(): string {
+    if (this.filterKind === 'filterGallery') {
+      return buildGalleryArgs(this.currentGalleryPreset(), this.galleryValues);
+    }
     return buildFilterArgs(this.currentFilterDef(), this.filterValues);
   }
 
@@ -3914,6 +3929,34 @@ struct Index {
     if (list.length > 0 && findFilter(this.filterKind).group !== group) {
       this.filterKind = list[0].id;
     }
+  }
+
+  private galleryParamValue(param: GalleryParamDef): number {
+    const stored: number | undefined = this.galleryValues.get(param.key);
+    return stored === undefined ? param.value : stored;
+  }
+
+  private setGalleryParam(param: GalleryParamDef, value: number): void {
+    const next: Map<string, number> = new Map<string, number>(this.galleryValues);
+    next.set(param.key, value);
+    this.galleryValues = next;
+  }
+
+  private selectGalleryCategory(category: string): void {
+    this.galleryCategory = category;
+    const list: GalleryPresetDef[] = galleryPresetsInCategory(category);
+    if (list.length > 0 && findGalleryPreset(this.galleryKind).category !== category) {
+      this.galleryKind = list[0].id;
+    }
+  }
+
+  private galleryParamText(param: GalleryParamDef): string {
+    const value: number = this.galleryParamValue(param);
+    if (param.choices.length > 0) {
+      const index: number = Math.min(param.choices.length - 1, Math.max(0, Math.round(value)));
+      return param.choices[index];
+    }
+    return (Math.round(value * 10) / 10).toString();
   }
 
   private scheduleThumbRefresh(): void {
@@ -10350,6 +10393,55 @@ struct Index {
   }
 
   @Builder
+  GalleryCategoryChip(category: string) {
+    Text(category)
+      .fontSize(10)
+      .fontColor(this.galleryCategory === category ? '#2a0b18' : '#f7b7d2')
+      .height(26)
+      .padding({ left: 7, right: 7 })
+      .backgroundColor(this.galleryCategory === category ? COLOR_FILTER_ACCENT : '#4a1a30')
+      .borderRadius(6)
+      .onClick(() => {
+        this.selectGalleryCategory(category);
+      })
+  }
+
+  @Builder
+  GalleryPresetChip(preset: GalleryPresetDef) {
+    Text(preset.label)
+      .fontSize(10)
+      .fontColor(this.galleryKind === preset.id ? '#2a0b18' : '#f7b7d2')
+      .height(26)
+      .padding({ left: 8, right: 8 })
+      .backgroundColor(this.galleryKind === preset.id ? COLOR_FILTER_ACCENT : '#4a1a30')
+      .borderRadius(6)
+      .onClick(() => {
+        this.galleryKind = preset.id;
+      })
+  }
+
+  @Builder
+  GalleryParam(param: GalleryParamDef) {
+    Row({ space: 8 }) {
+      Text(param.label)
+        .fontSize(10)
+        .fontColor('#f0a8c6')
+        .width(52)
+      Slider({ value: this.galleryParamValue(param), min: param.min, max: param.max, step: param.step })
+        .layoutWeight(1)
+        .onChange((value: number, _mode: SliderChangeMode) => {
+          this.setGalleryParam(param, value);
+        })
+      Text(this.galleryParamText(param))
+        .fontSize(10)
+        .fontColor('#f0a8c6')
+        .width(46)
+    }
+    .width('100%')
+    .margin({ top: 6 })
+  }
+
+  @Builder
   FilterCard() {
     Column() {
       Row({ space: 8 }) {
@@ -10362,7 +10454,7 @@ struct Index {
           .fontSize(14)
           .fontWeight(FontWeight.Bold)
           .fontColor('#ffe4f0')
-        Text('61 种 · ' + this.filterLabel())
+        Text((this.filterKind === 'filterGallery' ? '画廊 47 预设 · ' : '61 种 · ') + this.filterLabel())
           .fontSize(10)
           .fontColor('#c98aa8')
           .layoutWeight(1)
@@ -10392,9 +10484,42 @@ struct Index {
 
       ForEach(this.currentFilterDef().params, (param: FilterParamDef) => {
         this.FilterParam(param)
-      }, (param: FilterParamDef) => param.key)
+      }, (param: FilterParamDef) => param.key + '|' + this.filterParamValue(param))
 
-      if (this.currentFilterDef().params.length === 0) {
+      if (this.filterKind === 'filterGallery') {
+        // 47 种 Filter Gallery 预设：两层芯片（分类 → 预设）+ 预设自己的参数滑杆。
+        Column() {
+          Text('画廊分类').fontSize(10).fontColor('#f0a8c6').margin({ top: 6 })
+          Flex({ wrap: FlexWrap.Wrap }) {
+            ForEach(GALLERY_CATEGORIES, (category: string) => {
+              this.GalleryCategoryChip(category)
+            }, (category: string) => category)
+          }
+          .width('100%')
+
+          Scroll() {
+            Flex({ wrap: FlexWrap.Wrap }) {
+              ForEach(galleryPresetsInCategory(this.galleryCategory), (preset: GalleryPresetDef) => {
+                this.GalleryPresetChip(preset)
+              }, (preset: GalleryPresetDef) => preset.id)
+            }
+            .width('100%')
+          }
+          .height(96)
+          .margin({ top: 6 })
+          .scrollBar(BarState.Off)
+
+          ForEach(this.currentGalleryPreset().params, (param: GalleryParamDef) => {
+            this.GalleryParam(param)
+          }, (param: GalleryParamDef) => param.key + '|' + this.galleryParamValue(param))
+
+          Text('共 47 种画廊预设 · 当前：' + this.currentGalleryPreset().label)
+            .fontSize(10)
+            .fontColor('#a97189')
+            .margin({ top: 8 })
+        }
+        .width('100%')
+      } else if (this.currentFilterDef().params.length === 0) {
         Text('该滤镜使用经过验证的默认参数，直接应用即可')
           .fontSize(10)
           .fontColor('#a97189')

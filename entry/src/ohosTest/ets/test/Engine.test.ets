@@ -16,6 +16,7 @@
 import { describe, it, expect } from '@ohos/hypium';
 import { Engine, flattenLayers, visibleRectLeavesTile, LayerInfo } from '../../../main/ets/engine/Engine';
 import { FILTERS, buildFilterArgs } from '../../../main/ets/engine/FilterCatalog';
+import { GALLERY_PRESETS, buildGalleryArgs } from '../../../main/ets/engine/GalleryCatalog';
 
 /** 执行动作并返回其抛出的错误信息；未抛错时返回空串。 */
 function caughtMessage(action: () => void): string {
@@ -633,6 +634,28 @@ export default function engineTest() {
           });
           if (message.length > 0) {
             failures.push(def.id + ': ' + message);
+          }
+        }
+        expect(failures.join(' | ')).assertEqual('');
+      } finally {
+        Engine.close(docId);
+      }
+    });
+
+    it('allGalleryPresetsApply', 0, async () => {
+      // 1.3.3 画廊契约：47 种 Filter Gallery 预设用生成目录的默认值逐个应用，须零报错。
+      const created = Engine.newDocument(64, 48, 'gallery-catalog');
+      const docId: number = created.id;
+      const failures: string[] = [];
+      try {
+        const layerId: number = Engine.info(docId).layers[0].id;
+        for (const preset of GALLERY_PRESETS) {
+          const args: string = buildGalleryArgs(preset, new Map<string, number>());
+          const message: string = await caughtMessageAsync(async () => {
+            await Engine.filterApply(docId, layerId, args);
+          });
+          if (message.length > 0) {
+            failures.push(preset.id + ': ' + message);
           }
         }
         expect(failures.join(' | ')).assertEqual('');
