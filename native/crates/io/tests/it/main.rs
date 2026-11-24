@@ -29,6 +29,7 @@ mod flat;
 mod gif_frames;
 mod guides_v2;
 mod heif;
+mod heif_fixture;
 mod heif_unsupported;
 mod krita_corpus;
 mod lab16;

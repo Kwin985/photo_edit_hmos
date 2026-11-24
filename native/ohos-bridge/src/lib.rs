@@ -12105,3 +12105,41 @@ mod memory_tests {
         assert_eq!(photocraft_compose::effect_cache_budget(), photocraft_compose::DEFAULT_FX_CACHE_BUDGET);
     }
 }
+
+#[cfg(test)]
+mod heic_open_tests {
+    //! HEIC 打开契约：桥接层必须在 Cargo.toml 开启 photocraft-io/heif，否则 pc_open
+    //! 对 iPhone 照片只会返回 "isn't included in this build"。样本取自 heic-rs
+    //! （`tests/fixtures/rgb-strips-96.heic`，MIT OR Apache-2.0），无需外挂 corpus。
+    #![allow(clippy::panic, clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+
+    use super::*;
+
+    const HEIC: &[u8] = include_bytes!("../../crates/io/tests/fixtures/rgb-strips-96.heic");
+
+    fn open(name: &str, bytes: &[u8]) -> Value {
+        let session = pc_session_new();
+        assert!(!session.is_null(), "pc_session_new: 期望非空 session");
+        let buf = pc_open(session, name.as_ptr(), name.len(), bytes.as_ptr(), bytes.len());
+        let json = serde_json::from_slice::<Value>(&PcBuffer::into_vec(buf).expect("pc_open: 无返回"))
+            .expect("pc_open: 非法 JSON");
+        pc_session_free(session);
+        json
+    }
+
+    #[test]
+    fn pc_open_decodes_heic_with_the_bridge_heif_feature() {
+        let out = open("IMG_0001.HEIC", HEIC);
+        assert_eq!(out["ok"].as_bool(), Some(true), "{out}");
+        assert_eq!(out["data"]["info"]["width"].as_u64(), Some(96), "{out}");
+        assert_eq!(out["data"]["info"]["height"].as_u64(), Some(32), "{out}");
+    }
+
+    #[test]
+    fn pc_open_rejects_truncated_heic_without_crash() {
+        for cut in [0, 12, 40, HEIC.len() / 2, HEIC.len() - 1] {
+            let out = open("x.heic", &HEIC[..cut]);
+            assert_eq!(out["ok"].as_bool(), Some(false), "cut={cut}: {out}");
+        }
+    }
+}

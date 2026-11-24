@@ -14,7 +14,9 @@ photocraft-doc = { workspace = true }
 photocraft-compose = { workspace = true }
 
 photocraft-codecs = { workspace = true }
-photocraft-io = { workspace = true }
+# HEIC/HEIF 打开走 codecs 的可选 heif 解码（纯 Rust heic-rs）；官方构建必须带上，
+# 否则 pc_open 对 iPhone 照片只会报 "isn't included in this build"。
+photocraft-io = { workspace = true, features = ["heif"] }
 photocraft-geom = { workspace = true }
 photocraft-color = { workspace = true }
 photocraft-raster = { workspace = true }

@@ -1868,7 +1868,8 @@ struct Index {
     try {
       const options = new picker.DocumentSelectOptions();
       options.maxSelectNumber = 1;
-      options.fileSuffixFilters = ['图片|.png,.jpg,.jpeg,.webp,.bmp,.tif,.tiff,.psd,.psb'];
+      // HEIC/HEIF 打开：桥接层已启用纯 Rust heic-rs 解码，选择器同步放行 iPhone 照片后缀。
+      options.fileSuffixFilters = ['图片|.png,.jpg,.jpeg,.webp,.bmp,.tif,.tiff,.psd,.psb,.heic,.heif'];
       const uris = await new picker.DocumentViewPicker(getContext(this)).select(options);
       if (uris.length === 0) {
         return;
@@ -6571,8 +6572,12 @@ struct Index {
         return;
       }
       const file = fileIo.openSync(uris[0], fileIo.OpenMode.READ_WRITE | fileIo.OpenMode.CREATE | fileIo.OpenMode.TRUNC);
-      fileIo.writeSync(file.fd, bytes);
-      fileIo.closeSync(file);
+      // 写盘失败也要关 fd，否则导出异常后文件描述符泄漏（异步导出引入后的真实错误路径）。
+      try {
+        fileIo.writeSync(file.fd, bytes);
+      } finally {
+        fileIo.closeSync(file);
+      }
       this.status = '已导出 ' + this.exportFormat.toUpperCase();
       promptAction.showToast({ message: '导出成功' });
     } catch (err) {
@@ -6610,8 +6615,11 @@ struct Index {
       }
       const path = dir + '/artsphoto-' + Date.now() + '.' + format;
       const file = fileIo.openSync(path, fileIo.OpenMode.READ_WRITE | fileIo.OpenMode.CREATE | fileIo.OpenMode.TRUNC);
-      fileIo.writeSync(file.fd, bytes);
-      fileIo.closeSync(file);
+      try {
+        fileIo.writeSync(file.fd, bytes);
+      } finally {
+        fileIo.closeSync(file);
+      }
 
       const utdType = format === 'png' ? utd.UniformDataType.PNG :
         (format === 'jpeg' || format === 'jpg') ? utd.UniformDataType.JPEG : utd.UniformDataType.FILE;
@@ -6763,7 +6771,7 @@ struct Index {
           Text('还没有打开图片')
             .fontSize(16)
             .fontColor(COLOR_MUTED)
-          Text('支持 PNG · JPEG · WebP · TIFF · PSD / PSB')
+          Text('支持 PNG · JPEG · WebP · TIFF · PSD / PSB · HEIC / HEIF')
             .fontSize(12)
             .fontColor('#5d6673')
           Button('打开图片')
