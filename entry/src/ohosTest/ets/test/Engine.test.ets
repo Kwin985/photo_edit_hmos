@@ -484,6 +484,33 @@ export default function engineTest() {
       }
     });
 
+    it('webpExportRespectsQuality', 0, async () => {
+      const created = Engine.newDocument(64, 48, 'export-webp-q');
+      const docId: number = created.id;
+      try {
+        // 纯色白底的有损编码在高低质量下可能同尺寸，加两个色块制造纹理。
+        Engine.shapeCreate(docId, '{"kind":"rect","x":4,"y":4,"w":24,"h":18,"fill":[1,0,0,1]}');
+        Engine.shapeCreate(docId, '{"kind":"rect","x":30,"y":20,"w":28,"h":22,"fill":[0,0,1,1]}');
+        const low = new Uint8Array(await Engine.exportImage(docId, 'webp', 20));
+        const high = new Uint8Array(await Engine.exportImage(docId, 'webp', 90));
+        const hasChunk = (b: Uint8Array, tag: string): boolean => {
+          for (let i = 0; i + 4 <= b.length; i++) {
+            if (b[i] === tag.charCodeAt(0) && b[i + 1] === tag.charCodeAt(1)
+              && b[i + 2] === tag.charCodeAt(2) && b[i + 3] === tag.charCodeAt(3)) {
+              return true;
+            }
+          }
+          return false;
+        };
+        expect(hasChunk(low, 'VP8 ')).assertTrue();
+        expect(hasChunk(low, 'VP8L')).assertFalse();
+        expect(hasChunk(high, 'VP8 ')).assertTrue();
+        expect(low.length !== high.length).assertTrue();
+      } finally {
+        Engine.close(docId);
+      }
+    });
+
     // ──────────────────────────────────────────────────────────────────────
     // G2 复制可见验证（1.1.0）：pc_copy_visible 链路
     // ──────────────────────────────────────────────────────────────────────

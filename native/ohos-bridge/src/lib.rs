@@ -4594,6 +4594,8 @@ pub extern "C" fn pc_export(session: *mut Session, id: u64, format_ptr: *const u
         let mut opts = photocraft_io::ExportOptions::default();
         opts.encode.jpeg_quality = quality.clamp(1, 100);
         opts.encode.webp_quality = quality.clamp(1, 100);
+        // codecs 默认 lossless=true 会让质量滑块空转；应用导出统一走有损 VP8。
+        opts.encode.webp_lossless = false;
         let name = format!("export.{format}");
         match photocraft_io::export(&entry.doc, &name, &opts) {
             Ok(result) => {
@@ -11052,6 +11054,27 @@ mod canvas_api_tests {
             }
             eprintln!("e11 export {format} ok bytes={}", bytes.len());
         }
+    }
+
+    // E12 / WebP 质量滑块生效：导出走有损 VP8（而非默认 VP8L 无损），
+    // 低质量产物必须小于高质量，证明 quality 参数真正参与编码。
+    #[test]
+    fn e12_webp_quality_is_lossy_and_effective() {
+        let c = Ctx::open("e12");
+        assert_ok(&c.crop(CROP_RECT, "e12 crop"), "e12: crop");
+        let mut low: *mut PcBuffer = std::ptr::null_mut();
+        let mut high: *mut PcBuffer = std::ptr::null_mut();
+        let s_low = read_json(pc_export(c.session, c.doc, b"webp".as_ptr(), 4, 20, &mut low), "e12 webp q20");
+        assert_ok(&s_low, "e12 webp q20");
+        let s_high = read_json(pc_export(c.session, c.doc, b"webp".as_ptr(), 4, 90, &mut high), "e12 webp q90");
+        assert_ok(&s_high, "e12 webp q90");
+        let low_bytes = take_bytes(low, "e12 q20");
+        let high_bytes = take_bytes(high, "e12 q90");
+        let has_chunk = |b: &[u8], tag: &[u8]| b.windows(4).any(|w| w == tag);
+        assert!(has_chunk(&low_bytes, b"VP8 ") && !has_chunk(&low_bytes, b"VP8L"), "e12: q20 应为有损 VP8");
+        assert!(has_chunk(&high_bytes, b"VP8 ") && !has_chunk(&high_bytes, b"VP8L"), "e12: q90 应为有损 VP8");
+        assert!(low_bytes.len() < high_bytes.len(), "e12: q20({}) 应小于 q90({})", low_bytes.len(), high_bytes.len());
+        eprintln!("e12 webp q20={} q90={} lossy ok", low_bytes.len(), high_bytes.len());
     }
 
 }
