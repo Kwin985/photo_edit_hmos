@@ -150,6 +150,8 @@ declare const native: {
   revision(documentId: number): string;
   /** 设备算力档案：`{"ok":true,"data":{"arch","simd","vectorKernel","vulkan","npu"}}` JSON 字符串。 */
   computeProfile(): string;
+  /** 进程级内存预算（MB，0 = 恢复 crate 默认；dir 空 = 关闭溢写）。返回 `{"ok":true,"data":{"warnings":[..]}}`。 */
+  configureMemory(dir: string, spillMB: number, fxMB: number, scratchMB: number): string;
   layerMaskGet(documentId: number, layerId: number): string;
   layerMaskAdd(documentId: number, layerId: number, fill: string): string;
   layerMaskSet(documentId: number, layerId: number, paramsJson: string): string;

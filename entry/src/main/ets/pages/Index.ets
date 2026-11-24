@@ -4,6 +4,7 @@ import { font, promptAction, router } from '@kit.ArkUI';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { preferences, uniformTypeDescriptor as utd } from '@kit.ArkData';
 import { bundleManager, common } from '@kit.AbilityKit';
+import { deviceInfo } from '@kit.BasicServicesKit';
 import { systemShare } from '@kit.ShareKit';
 import { Engine, DocumentInfo, LayerInfo, AdjustmentInfo, SelectionInfo, emptyAdjustment, flattenLayers, visibleRectLeavesTile, LayerEffectInfo, LayerEffectsInfo, FxGradientInfo, FxGradientStop, LayerEditInfo, LayerMaskInfo, GuidesInfo, CutoutOutcome } from '../engine/Engine';
 
@@ -1692,7 +1693,30 @@ struct Index {
     this.loadPrefs();
     this.loadAppVersion();
     this.logComputeProfile();
+    this.configureMemoryTier();
     this.handleQuickAction();
+  }
+
+  /**
+   * 内存预算分档（打开任何文档前调用一次）：phone 256/96/128 MB，tablet/2in1 512/256/512 MB
+   * （spill/fx/scratch）。失败只记 PERF 日志不阻断——引擎回落 crate 默认，功能不受影响。
+   */
+  private configureMemoryTier(): void {
+    try {
+      const big = deviceInfo.deviceType === 'tablet' || deviceInfo.deviceType === '2in1';
+      const spillMB = big ? 512 : 256;
+      const fxMB = big ? 256 : 96;
+      const scratchMB = big ? 512 : 128;
+      const dir = (getContext(this) as common.UIAbilityContext).cacheDir + '/scratch';
+      const warnings = Engine.configureMemory(dir, spillMB, fxMB, scratchMB);
+      this.perf('configureMemory device=' + deviceInfo.deviceType + ' spillMB=' + spillMB + ' fxMB=' + fxMB +
+        ' scratchMB=' + scratchMB + ' warnings=' + warnings.length);
+      for (const w of warnings) {
+        this.perf('configureMemory warning: ' + w);
+      }
+    } catch (err) {
+      this.perf('configureMemory failed: ' + String(err));
+    }
   }
 
   /** 设备算力档案：有向量内核走加速路径，否则标量回落；PERF 日志用于真机取证。 */

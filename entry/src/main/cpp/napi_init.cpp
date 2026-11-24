@@ -81,6 +81,7 @@ PcBuffer *pc_guides_get(void *session, uint64_t id);
 PcBuffer *pc_guides_set(void *session, uint64_t id, const uint8_t *params, size_t params_len);
 PcBuffer *pc_layer_transform(void *session, uint64_t id, uint64_t layer, const uint8_t *params, size_t params_len);
 PcBuffer *pc_compute_profile();
+PcBuffer *pc_configure_memory(const uint8_t *dir, size_t dir_len, uint64_t spill_budget, uint64_t fx_budget, uint64_t scratch_budget);
 }
 
 namespace {
@@ -1040,6 +1041,36 @@ napi_value ComputeProfile(napi_env env, napi_callback_info info) {
     return out;
 }
 
+napi_value ConfigureMemory(napi_env env, napi_callback_info info) {
+    size_t argc = 4;
+    napi_value argv[4] = {nullptr, nullptr, nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 4) {
+        return Throw(env, "configureMemory(dir, spillMB, fxMB, scratchMB) needs four arguments");
+    }
+    std::string dir;
+    if (!GetString(env, argv[0], dir)) {
+        return Throw(env, "configureMemory: dir must be a string");
+    }
+    double spill_mb = 0;
+    double fx_mb = 0;
+    double scratch_mb = 0;
+    napi_get_value_double(env, argv[1], &spill_mb);
+    napi_get_value_double(env, argv[2], &fx_mb);
+    napi_get_value_double(env, argv[3], &scratch_mb);
+    const double mb = 1024.0 * 1024.0;
+    uint64_t spill = spill_mb > 0 ? static_cast<uint64_t>(spill_mb * mb) : 0;
+    uint64_t fx = fx_mb > 0 ? static_cast<uint64_t>(fx_mb * mb) : 0;
+    uint64_t scratch = scratch_mb > 0 ? static_cast<uint64_t>(scratch_mb * mb) : 0;
+    std::string result = TakeString(pc_configure_memory(reinterpret_cast<const uint8_t *>(dir.data()), dir.size(), spill, fx, scratch));
+    if (!IsOk(result)) {
+        return Throw(env, ErrorOf(result));
+    }
+    napi_value out = nullptr;
+    napi_create_string_utf8(env, result.c_str(), result.size(), &out);
+    return out;
+}
+
 napi_value LayerMaskGet(napi_env env, napi_callback_info info) {
     size_t argc = 2;
     napi_value argv[2] = {nullptr, nullptr};
@@ -1402,6 +1433,7 @@ napi_value Init(napi_env env, napi_value exports) {
         {"renderPixels", nullptr, RenderPixels, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"revision", nullptr, Revision, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"computeProfile", nullptr, ComputeProfile, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"configureMemory", nullptr, ConfigureMemory, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"layerMaskGet", nullptr, LayerMaskGet, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"layerMaskAdd", nullptr, LayerMaskAdd, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"layerMaskSet", nullptr, LayerMaskSet, nullptr, nullptr, nullptr, napi_default, nullptr},

@@ -89,6 +89,12 @@ export default function engineTest() {
       expect(message.indexOf('document 0 is not open') >= 0).assertTrue();
     });
 
+    it('configureMemoryZeroRestoresDefaults', 0, () => {
+      // 全 0 + 空目录 = 恢复 crate 默认（回退点）：不抛错、无 warning，进程级预算回到默认档。
+      const warnings: string[] = Engine.configureMemory('', 0, 0, 0);
+      expect(warnings.length).assertEqual(0);
+    });
+
     it('flattenLayersEmptyStaysEmpty', 0, () => {
       expect(flattenLayers([], 0).length).assertEqual(0);
     });

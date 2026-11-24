@@ -490,6 +490,38 @@ pub extern "C" fn pc_session_free(ptr: *mut Session) {
     }
 }
 
+/// 配置进程级内存预算（打开任何文档前调用一次）。`dir` 为溢写目录（空 = 关闭溢写），
+/// 三个预算单位字节；0 = 恢复 crate 默认（回退点）。溢写目录不可用只降级为 warning，
+/// 不阻断 fx/scratch 预算生效。返回 `{"ok":true,"data":{"warnings":[..]}}`。
+#[unsafe(no_mangle)]
+pub extern "C" fn pc_configure_memory(dir_ptr: *const u8, dir_len: usize, spill_budget: u64, fx_budget: u64, scratch_budget: u64) -> *mut PcBuffer {
+    guard(move || {
+        let dir_bytes = match unsafe { slice(dir_ptr, dir_len) } {
+            Ok(b) => b,
+            Err(e) => return fail(e),
+        };
+        let dir = String::from_utf8_lossy(dir_bytes).to_string();
+        let mut warnings: Vec<String> = Vec::new();
+        let spill = usize::try_from(spill_budget).unwrap_or(usize::MAX);
+        let spill_dir = (!dir.is_empty() && spill > 0).then(|| std::path::PathBuf::from(&dir));
+        if let Err(e) = photocraft_raster::spill::configure(spill_dir.as_deref(), spill) {
+            warnings.push(format!("spill disabled: {e}"));
+        }
+        let fx = usize::try_from(fx_budget).unwrap_or(usize::MAX);
+        photocraft_compose::set_effect_cache_budget(if fx == 0 { photocraft_compose::DEFAULT_FX_CACHE_BUDGET } else { fx });
+        let scratch = usize::try_from(scratch_budget).unwrap_or(usize::MAX);
+        if scratch == 0 {
+            photocraft_raster::scratch::set_budget(photocraft_raster::scratch::DEFAULT_BUDGET);
+            photocraft_raster::scratch::set_miss_floor(photocraft_raster::scratch::DEFAULT_MISS_FLOOR);
+        } else {
+            photocraft_raster::scratch::set_budget(scratch);
+            // miss floor 默认 256MB：不随预算下调则小预算档形同虚设。
+            photocraft_raster::scratch::set_miss_floor(scratch / 2);
+        }
+        ok(json!({ "warnings": warnings }))
+    })
+}
+
 /// Opens an image from memory. Returns `{"ok":true,"data":{"id":..,"info":{..}}}`.
 #[unsafe(no_mangle)]
 pub extern "C" fn pc_open(session: *mut Session, name_ptr: *const u8, name_len: usize, data_ptr: *const u8, data_len: usize) -> *mut PcBuffer {
@@ -12012,5 +12044,41 @@ mod concurrency_tests {
         let out = take_json(pc_render(session, doc, 0, 0, 8, 8, &mut std::ptr::null_mut()), "render after close");
         assert_eq!(out["ok"].as_bool(), Some(false), "{out}");
         pc_session_free(session);
+    }
+}
+
+#[cfg(test)]
+mod memory_tests {
+    //! pc_configure_memory 契约：预算生效、0 恢复默认、坏目录只告警。
+    //! 预算是进程级全局，全部场景放在一个测试里顺序执行，末尾恢复默认。
+    #![allow(clippy::panic, clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+
+    use super::*;
+
+    fn call(dir: &str, spill: u64, fx: u64, scratch: u64) -> Value {
+        let buf = pc_configure_memory(dir.as_ptr(), dir.len(), spill, fx, scratch);
+        let bytes = PcBuffer::into_vec(buf).unwrap_or_else(|| panic!("configure: no result"));
+        serde_json::from_slice(&bytes).unwrap_or_else(|e| panic!("configure: bad json: {e}"))
+    }
+
+    #[test]
+    fn configure_memory_budgets() {
+        let out = call("", 0, 96 << 20, 128 << 20);
+        assert_eq!(out["ok"].as_bool(), Some(true), "{out}");
+        assert_eq!(out["data"]["warnings"].as_array().map(Vec::len), Some(0), "{out}");
+        assert_eq!(photocraft_compose::effect_cache_budget(), 96 << 20);
+
+        // 溢写目录指向一个普通文件：prepare 失败 → warning，但 fx/scratch 预算仍生效。
+        let bad_dir = std::env::temp_dir().join("pc_configure_memory_not_a_dir");
+        std::fs::write(&bad_dir, b"x").unwrap();
+        let out = call(&bad_dir.to_string_lossy(), 64 << 20, 96 << 20, 128 << 20);
+        assert_eq!(out["ok"].as_bool(), Some(true), "{out}");
+        assert!(out["data"]["warnings"].as_array().is_some_and(|w| !w.is_empty()), "{out}");
+        let _ = std::fs::remove_file(&bad_dir);
+
+        // 全 0：恢复 crate 默认（回退点）。
+        let out = call("", 0, 0, 0);
+        assert_eq!(out["ok"].as_bool(), Some(true), "{out}");
+        assert_eq!(photocraft_compose::effect_cache_budget(), photocraft_compose::DEFAULT_FX_CACHE_BUDGET);
     }
 }

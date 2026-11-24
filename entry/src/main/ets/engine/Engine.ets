@@ -452,6 +452,16 @@ interface ComputeProfileResponse {
   data: ComputeProfileInfo;
 }
 
+interface ConfigureMemoryData {
+  warnings: string[];
+}
+
+interface ConfigureMemoryResponse {
+  ok: boolean;
+  error: string;
+  data: ConfigureMemoryData;
+}
+
 interface GuidesResponse {
   ok: boolean;
   error: string;
@@ -1038,6 +1048,18 @@ export class Engine {
       throw new Error(parsed.error);
     }
     return parsed.data;
+  }
+
+  /**
+   * 进程级内存预算（打开任何文档前调用一次）。单位 MB；0 = 恢复 crate 默认（回退点），
+   * dir 空 = 关闭溢写。溢写目录不可用只产生 warning，fx/scratch 预算仍生效。
+   */
+  static configureMemory(dir: string, spillMB: number, fxMB: number, scratchMB: number): string[] {
+    const parsed = JSON.parse(native.configureMemory(dir, spillMB, fxMB, scratchMB)) as ConfigureMemoryResponse;
+    if (!parsed.ok) {
+      throw new Error(parsed.error);
+    }
+    return parsed.data.warnings ?? [];
   }
 
   static layerMaskGet(documentId: number, layerId: number): LayerMaskInfo {
