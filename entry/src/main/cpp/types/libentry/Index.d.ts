@@ -116,7 +116,12 @@ declare const native: {
   paintStroke(documentId: number, layerId: number, paramsJson: string, pointsJson: string): string;
   select(documentId: number, paramsJson: string): string;
   selectionInfo(documentId: number): string;
-  filterApply(documentId: number, layerId: number, paramsJson: string): Promise<string>;
+  /** 应用像素滤镜；onJobId 在任务入队前同步回调，可用于查询进度或取消。 */
+  filterApply(documentId: number, layerId: number, paramsJson: string, onJobId?: (jobId: number) => void): Promise<string>;
+  /** 取消活动滤镜作业；jobId 未知或作业已结束时返回 false。 */
+  filterCancel(jobId: number): boolean;
+  /** 活动滤镜进度 0..1；jobId 未知或作业已结束时返回 -1。 */
+  filterProgress(jobId: number): number;
   shapeCreate(documentId: number, paramsJson: string): string;
   fontRegister(data: ArrayBuffer): string;
   textCreate(documentId: number, paramsJson: string): string;
@@ -138,6 +143,10 @@ declare const native: {
   layerDeleteMany(documentId: number, idsJson: string): string;
   /** 复制可见：把所有可见图层合成到新图层，返回 `{layerId, info}`。 */
   copyVisible(documentId: number): Promise<string>;
+  /** 合成结果 RGB 直方图（每通道 256 桶）：返回 `{width,height,samples,transparent,invalid,shadows,highlights,rgb,ms}`。 */
+  histogram(documentId: number): Promise<string>;
+  /** 图像信息：尺寸/模式/位深/DPI/图层数/选区/ICC/XMP/EXIF（无 EXIF 时 exif=null）。 */
+  metadata(documentId: number): string;
   addAdjustment(documentId: number, kind: string, paramsJson: string): string;
   updateAdjustment(documentId: number, layerId: number, paramsJson: string): void;
   getAdjustment(documentId: number, layerId: number): string;
@@ -146,6 +155,7 @@ declare const native: {
   exportImage(documentId: number, format: string, quality: number): Promise<ArrayBuffer>;
   layerEffects(documentId: number, layerId: number): string;
   updateLayerEffect(documentId: number, layerId: number, paramsJson: string): string;
+  updateLayerEffectsBatch(documentId: number, layerId: number, paramsJson: string): string;
   renderPixels(documentId: number, x: number, y: number, w: number, h: number): ArrayBuffer;
   revision(documentId: number): string;
   /** 设备算力档案：`{"ok":true,"data":{"arch","simd","vectorKernel","vulkan","npu"}}` JSON 字符串。 */

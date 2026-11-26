@@ -18,17 +18,17 @@ use photocraft_color::{Color, ColorMode, SampleType};
 use photocraft_compose::masks::{combined_mask, feather_sigma};
 use photocraft_compose::{Buffer, render_layer_in};
 use photocraft_raster::{from_rgba_into, to_rgba, Rgba8Image, Surface};
-use photocraft_doc::adjust::HueRange;
+use photocraft_doc::adjust::{CurvePoint, HueRange, LevelsChannel, ToneSpace};
 use photocraft_doc::text::{AntiAlias, TextShape};
 use photocraft_doc::vector::{LiveShape, ShapeLayer, ShapeStroke, Subpath};
 use photocraft_doc::{
-    Adjustment, Bevel, BevelStyle, BevelTechnique, Contour, Document, Effect, Fill, FxCommon, FxPaint, Glow, GlowSource, GlowTechnique, Gradient, GradientStyle,
+    Adjustment, Bevel, BevelStyle, BevelTechnique, Contour, Document, Effect, Effects, Fill, FxCommon, FxPaint, Glow, GlowSource, GlowTechnique, Gradient, GradientStyle,
     Knot, Layer, LayerContent, LayerMask, Path, PathOp, StrokeFx, StrokePosition, TextLayer,
 };
 use photocraft_geom::{Affine, Point, Rect};
 
 use photocraft_algo::selection::{self, SelectionMode};
-use photocraft_algo::{FilterParams, apply_in, output_area};
+use photocraft_algo::{FilterParams, apply_in_with, output_area};
 use photocraft_paint::{apply_stroke, BrushSettings, Stroke, StrokePoint};
 use photocraft_text::TextEngine;
 use photocraft_vector::{flatten::validate_shape, render_shape, shapes::live_path};
@@ -282,10 +282,10 @@ fn layer_position(layers: &[Layer], id: u64) -> Option<(usize, usize)> {
     None
 }
 
-fn move_layer(layers: &mut Vec<Layer>, id: u64, delta: i32) -> bool {
+fn move_layer(layers: &mut Vec<Layer>, id: u64, delta: i64) -> bool {
     if let Some(pos) = layers.iter().position(|l| l.id.0 == id) {
-        let target = pos as i32 + delta;
-        if target < 0 || target >= layers.len() as i32 {
+        let target = pos as i64 + delta;
+        if target < 0 || target >= layers.len() as i64 {
             return false;
         }
         // remove + insert（而非 swap）：跨步移动时其余图层顺序保持，delta=±1 与 swap 等价。
@@ -358,6 +358,21 @@ fn adjustment_json(adj: &Adjustment) -> Value {
         Adjustment::BrightnessContrast { brightness, contrast, legacy } => {
             json!({ "type": "brightnessContrast", "brightness": brightness, "contrast": contrast, "legacy": legacy })
         }
+        Adjustment::Levels { master, per_channel, space, black } => json!({
+            "type": "levels",
+            "master": levels_channel_json(master),
+            "perChannel": per_channel.iter().map(levels_channel_json).collect::<Vec<_>>(),
+            "space": tone_space_label(*space),
+            "black": levels_channel_json(black)
+        }),
+        Adjustment::Curves { master, per_channel, space, black, pencil } => json!({
+            "type": "curves",
+            "master": curve_points_json(master),
+            "perChannel": per_channel.iter().map(|points| curve_points_json(points)).collect::<Vec<_>>(),
+            "space": tone_space_label(*space),
+            "black": curve_points_json(black),
+            "pencil": pencil
+        }),
         Adjustment::Exposure { exposure, offset, gamma } => {
             json!({ "type": "exposure", "exposure": exposure, "offset": offset, "gamma": gamma })
         }
@@ -372,6 +387,28 @@ fn adjustment_json(adj: &Adjustment) -> Value {
         Adjustment::Posterize { levels } => json!({ "type": "posterize", "levels": levels }),
         Adjustment::Threshold { level } => json!({ "type": "threshold", "level": level }),
         other => json!({ "type": "other", "label": format!("{other:?}") }),
+    }
+}
+
+fn levels_channel_json(channel: &LevelsChannel) -> Value {
+    json!({
+        "inBlack": channel.in_black,
+        "inWhite": channel.in_white,
+        "gamma": channel.gamma,
+        "outBlack": channel.out_black,
+        "outWhite": channel.out_white
+    })
+}
+
+fn curve_points_json(points: &[CurvePoint]) -> Value {
+    Value::Array(points.iter().map(|point| json!({ "input": point.input, "output": point.output })).collect())
+}
+
+fn tone_space_label(space: ToneSpace) -> &'static str {
+    match space {
+        ToneSpace::Rgb => "rgb",
+        ToneSpace::Cmyk => "cmyk",
+        ToneSpace::Lab => "lab",
     }
 }
 
@@ -415,13 +452,167 @@ fn number(params: &Value, key: &str, default: f32) -> f32 {
     params.get(key).and_then(Value::as_f64).map(|v| v as f32).unwrap_or(default)
 }
 
+fn finite_number(params: &Value, key: &str, default: f32) -> Result<f32, String> {
+    match params.get(key) {
+        None => Ok(default),
+        Some(value) => value
+            .as_f64()
+            .filter(|v| v.is_finite())
+            .map(|v| v as f32)
+            .filter(|v| v.is_finite())
+            .ok_or_else(|| format!("adjustment {key} must be a finite number")),
+    }
+}
+
+fn unit_number(params: &Value, key: &str, default: f32) -> Result<f32, String> {
+    finite_number(params, key, default).and_then(|value| {
+        if (0.0..=1.0).contains(&value) {
+            Ok(value)
+        } else {
+            Err(format!("adjustment {key} must be between 0 and 1"))
+        }
+    })
+}
+
+fn parse_tone_space(params: &Value) -> Result<ToneSpace, String> {
+    match params.get("space") {
+        None => Ok(ToneSpace::Rgb),
+        Some(Value::String(space)) => match space.as_str() {
+            "rgb" => Ok(ToneSpace::Rgb),
+            "cmyk" => Ok(ToneSpace::Cmyk),
+            "lab" => Ok(ToneSpace::Lab),
+            _ => Err("adjustment space must be rgb, cmyk or lab".to_string()),
+        },
+        Some(_) => Err("adjustment space must be rgb, cmyk or lab".to_string()),
+    }
+}
+
+fn parse_levels_channel(value: Option<&Value>) -> Result<LevelsChannel, String> {
+    let Some(params) = value else {
+        return Ok(LevelsChannel::default());
+    };
+    if !params.is_object() {
+        return Err("levels channel must be an object".to_string());
+    }
+    let channel = LevelsChannel {
+        in_black: unit_number(params, "inBlack", 0.0)?,
+        in_white: unit_number(params, "inWhite", 1.0)?,
+        gamma: finite_number(params, "gamma", 1.0)?,
+        out_black: unit_number(params, "outBlack", 0.0)?,
+        out_white: unit_number(params, "outWhite", 1.0)?,
+    };
+    if channel.in_black >= channel.in_white {
+        return Err("levels inBlack must be less than inWhite".to_string());
+    }
+    if !(0.01..=100.0).contains(&channel.gamma) {
+        return Err("levels gamma must be between 0.01 and 100".to_string());
+    }
+    if channel.out_black > channel.out_white {
+        return Err("levels outBlack must not exceed outWhite".to_string());
+    }
+    Ok(channel)
+}
+
+fn parse_levels_channels(params: &Value, key: &str) -> Result<[LevelsChannel; 3], String> {
+    match params.get(key) {
+        None => Ok(Default::default()),
+        Some(Value::Array(items)) if items.len() == 3 => {
+            let parsed = items.iter().map(|item| parse_levels_channel(Some(item))).collect::<Result<Vec<_>, _>>()?;
+            parsed.try_into().map_err(|_| "levels perChannel must contain three channels".to_string())
+        }
+        Some(_) => Err("levels perChannel must contain three channels".to_string()),
+    }
+}
+
+fn identity_curve() -> Vec<CurvePoint> {
+    vec![CurvePoint { input: 0.0, output: 0.0 }, CurvePoint { input: 1.0, output: 1.0 }]
+}
+
+fn parse_curve_points(value: Option<&Value>) -> Result<Vec<CurvePoint>, String> {
+    let Some(value) = value else {
+        return Ok(identity_curve());
+    };
+    let Value::Array(items) = value else {
+        return Err("curve must be an array".to_string());
+    };
+    if items.len() > 256 {
+        return Err("curve must contain at most 256 points".to_string());
+    }
+    if items.is_empty() {
+        return Ok(Vec::new());
+    }
+    if items.len() < 2 {
+        return Err("curve must contain at least two points".to_string());
+    }
+    let mut points = Vec::with_capacity(items.len());
+    for item in items {
+        if !item.is_object() {
+            return Err("curve point must be an object".to_string());
+        }
+        let input = item
+            .get("input")
+            .and_then(Value::as_f64)
+            .filter(|v| v.is_finite())
+            .ok_or_else(|| "curve input must be a finite number".to_string())?;
+        let output = item
+            .get("output")
+            .and_then(Value::as_f64)
+            .filter(|v| v.is_finite())
+            .ok_or_else(|| "curve output must be a finite number".to_string())?;
+        if !(0.0..=1.0).contains(&input) || !(0.0..=1.0).contains(&output) {
+            return Err("curve input and output must be between 0 and 1".to_string());
+        }
+        let input = input as f32;
+        let output = output as f32;
+        points.push(CurvePoint { input, output });
+    }
+    if points.windows(2).any(|pair| pair[0].input >= pair[1].input) {
+        return Err("curve inputs must be strictly increasing".to_string());
+    }
+    Ok(points)
+}
+
+fn parse_curve_channels(params: &Value, key: &str) -> Result<[Vec<CurvePoint>; 3], String> {
+    match params.get(key) {
+        None => Ok([identity_curve(), identity_curve(), identity_curve()]),
+        Some(Value::Array(items)) if items.len() == 3 => {
+            let parsed = items.iter().map(|item| parse_curve_points(Some(item))).collect::<Result<Vec<_>, _>>()?;
+            parsed.try_into().map_err(|_| "curves perChannel must contain three channels".to_string())
+        }
+        Some(_) => Err("curves perChannel must contain three channels".to_string()),
+    }
+}
+
 fn build_adjustment(kind: &str, p: &Value) -> Result<Adjustment, String> {
+    if !p.is_object() {
+        return Err("adjustment parameters must be an object".to_string());
+    }
     match kind {
         "brightnessContrast" => Ok(Adjustment::BrightnessContrast {
             brightness: number(p, "brightness", 0.0),
             contrast: number(p, "contrast", 0.0),
             legacy: false,
         }),
+        "levels" => Ok(Adjustment::Levels {
+            master: parse_levels_channel(p.get("master"))?,
+            per_channel: parse_levels_channels(p, "perChannel")?,
+            space: parse_tone_space(p)?,
+            black: parse_levels_channel(p.get("black"))?,
+        }),
+        "curves" => {
+            let pencil = match p.get("pencil") {
+                None => false,
+                Some(Value::Bool(value)) => *value,
+                Some(_) => return Err("curve pencil must be a boolean".to_string()),
+            };
+            Ok(Adjustment::Curves {
+                master: parse_curve_points(p.get("master"))?,
+                per_channel: parse_curve_channels(p, "perChannel")?,
+                space: parse_tone_space(p)?,
+                black: parse_curve_points(p.get("black"))?,
+                pencil,
+            })
+        },
         "exposure" => Ok(Adjustment::Exposure {
             exposure: number(p, "exposure", 0.0),
             offset: number(p, "offset", 0.0),
@@ -443,8 +634,12 @@ fn build_adjustment(kind: &str, p: &Value) -> Result<Adjustment, String> {
             tint: None,
         }),
         "invert" => Ok(Adjustment::Invert),
-        "posterize" => Ok(Adjustment::Posterize { levels: number(p, "levels", 4.0).clamp(2.0, 255.0) as u32 }),
-        "threshold" => Ok(Adjustment::Threshold { level: number(p, "level", 0.5).clamp(0.0, 1.0) }),
+        "posterize" => Ok(Adjustment::Posterize {
+            levels: number(p, "levels", 4.0).clamp(2.0, 255.0) as u32,
+        }),
+        "threshold" => Ok(Adjustment::Threshold {
+            level: number(p, "level", 0.5).clamp(0.0, 1.0),
+        }),
         other => Err(format!("unsupported adjustment: {other}")),
     }
 }
@@ -452,6 +647,8 @@ fn build_adjustment(kind: &str, p: &Value) -> Result<Adjustment, String> {
 fn layer_name(kind: &str) -> &'static str {
     match kind {
         "brightnessContrast" => "Brightness/Contrast",
+        "levels" => "Levels",
+        "curves" => "Curves",
         "exposure" => "Exposure",
         "vibrance" => "Vibrance",
         "hueSaturation" => "Hue/Saturation",
@@ -878,12 +1075,54 @@ pub extern "C" fn pc_info(session: *mut Session, id: u64) -> *mut PcBuffer {
     })
 }
 
-/// Renders a downscaled preview into `out` as `[width u32][height u32][RGBA8]`.
+/// Reports the exact byte layout size of [`pc_preview`] without rendering pixels.
 #[unsafe(no_mangle)]
-pub extern "C" fn pc_preview(session: *mut Session, id: u64, max_side: u32, out: *mut *mut PcBuffer) -> *mut PcBuffer {
+pub extern "C" fn pc_preview_size(
+    session: *mut Session,
+    id: u64,
+    max_side: u32,
+    width: *mut u32,
+    height: *mut u32,
+) -> *mut PcBuffer {
     guard(move || {
         if session.is_null() {
             return fail("null session");
+        }
+        if width.is_null() || height.is_null() {
+            return fail("null preview size output");
+        }
+        // SAFETY: live session pointer and caller-provided size slots.
+        let s = unsafe { &*session };
+        let entry = match s.entry(id) {
+            Ok(e) => e,
+            Err(e) => return fail(e),
+        };
+        let entry_guard = entry.read().unwrap_or_else(|e| e.into_inner());
+        let side = max_side.clamp(1, MAX_PREVIEW_SIDE);
+        let (w, h) = photocraft_compose::thumbnail_size(&entry_guard.doc, side);
+        unsafe {
+            *width = w;
+            *height = h;
+        }
+        ok(json!({ "width": w, "height": h }))
+    })
+}
+
+/// Renders a downscaled preview directly into caller-owned `[width u32][height u32][RGBA8]` storage.
+#[unsafe(no_mangle)]
+pub extern "C" fn pc_preview(
+    session: *mut Session,
+    id: u64,
+    max_side: u32,
+    out: *mut u8,
+    capacity: usize,
+) -> *mut PcBuffer {
+    guard(move || {
+        if session.is_null() {
+            return fail("null session");
+        }
+        if out.is_null() {
+            return fail("null preview output");
         }
         // SAFETY: live session pointer.
         let s = unsafe { &*session };
@@ -895,11 +1134,22 @@ pub extern "C" fn pc_preview(session: *mut Session, id: u64, max_side: u32, out:
         let entry = &*entry_guard;
         let side = max_side.clamp(1, MAX_PREVIEW_SIDE);
         let img = photocraft_compose::thumbnail(&entry.doc, side);
-        if !out.is_null() {
-            // SAFETY: out is a caller-provided slot.
-            unsafe { *out = PcBuffer::from_vec(preview_bytes(img)) };
+        let width = img.width;
+        let height = img.height;
+        let required = match 8usize.checked_add(img.pixels.len()) {
+            Some(required) => required,
+            None => return fail("preview is too large"),
+        };
+        if capacity < required {
+            return fail("preview output buffer is too small");
         }
-        ok(json!({ "width": side, "height": side }))
+        // SAFETY: the caller reserved `capacity` bytes and `required` stays within that allocation.
+        unsafe {
+            std::ptr::copy_nonoverlapping(width.to_le_bytes().as_ptr(), out, 4);
+            std::ptr::copy_nonoverlapping(height.to_le_bytes().as_ptr(), out.add(4), 4);
+            std::ptr::copy_nonoverlapping(img.pixels.as_ptr(), out.add(8), img.pixels.len());
+        }
+        ok(json!({ "width": width, "height": height }))
     })
 }
 
@@ -1034,6 +1284,290 @@ pub extern "C" fn pc_render_pixels(session: *mut Session, id: u64, x: i32, y: i3
     })
 }
 
+/// RGB histogram of the composited document (256 bins per channel, straight alpha).
+///
+/// Bands keep peak memory at one tile-aligned band instead of a full-canvas f32 buffer; the
+/// count runs through the same compositor as `pc_render_pixels`, so adjustment layers, masks
+/// and layer effects are included. Zero-alpha pixels are counted in `transparent` (not in the
+/// bins) and non-finite samples in `invalid`, matching `algo::histogram`.
+#[unsafe(no_mangle)]
+pub extern "C" fn pc_histogram(session: *mut Session, id: u64) -> *mut PcBuffer {
+    guard(move || {
+        if session.is_null() {
+            return fail("null session");
+        }
+        // SAFETY: live session pointer.
+        let s = unsafe { &*session };
+        let entry = match s.entry(id) {
+            Ok(e) => e,
+            Err(e) => return fail(e),
+        };
+        let doc = {
+            let entry_guard = entry.read().unwrap_or_else(|e| e.into_inner());
+            entry_guard.doc.clone()
+        };
+        let started = Instant::now();
+        let rect = Rect::new(0, 0, doc.size.width as i32, doc.size.height as i32);
+        let mut total = photocraft_algo::histogram::RgbHistogram::default();
+        // 256 行/条带：10000px 宽时峰值约 41 MB，且超宽画布不会让默认条带高度摊到 1 行以下。
+        let rendered = photocraft_compose::render_bands(&doc, rect, 256, |band| {
+            let part = photocraft_algo::histogram::RgbHistogram::from_rgba(&band.px);
+            for (dst, src) in total.channels.iter_mut().zip(&part.channels) {
+                for (a, b) in dst.iter_mut().zip(src) {
+                    *a = a.saturating_add(*b);
+                }
+            }
+            for (dst, src) in total.underflow.iter_mut().zip(&part.underflow) {
+                *dst = dst.saturating_add(*src);
+            }
+            for (dst, src) in total.overflow.iter_mut().zip(&part.overflow) {
+                *dst = dst.saturating_add(*src);
+            }
+            for (dst, src) in total.shadows.iter_mut().zip(&part.shadows) {
+                *dst = dst.saturating_add(*src);
+            }
+            for (dst, src) in total.highlights.iter_mut().zip(&part.highlights) {
+                *dst = dst.saturating_add(*src);
+            }
+            total.samples = total.samples.saturating_add(part.samples);
+            total.transparent = total.transparent.saturating_add(part.transparent);
+            total.invalid = total.invalid.saturating_add(part.invalid);
+            Ok::<(), ()>(())
+        });
+        if rendered.is_err() {
+            return fail("histogram render failed");
+        }
+        ok(json!({
+            "width": doc.size.width,
+            "height": doc.size.height,
+            "samples": total.samples,
+            "transparent": total.transparent,
+            "invalid": total.invalid,
+            "shadows": total.shadows,
+            "highlights": total.highlights,
+            "rgb": total.channels.iter().map(|c| c.to_vec()).collect::<Vec<_>>(),
+            "ms": started.elapsed().as_millis() as u64,
+        }))
+    })
+}
+
+/// Document/image metadata for the Info panel: canvas basics plus camera settings parsed from the
+/// EXIF payload stored on the document. Read-only; malformed or absent EXIF yields `exif: null`.
+#[unsafe(no_mangle)]
+pub extern "C" fn pc_metadata(session: *mut Session, id: u64) -> *mut PcBuffer {
+    guard(move || {
+        if session.is_null() {
+            return fail("null session");
+        }
+        // SAFETY: live session pointer.
+        let s = unsafe { &*session };
+        let entry = match s.entry(id) {
+            Ok(e) => e,
+            Err(e) => return fail(e),
+        };
+        let entry_guard = entry.read().unwrap_or_else(|e| e.into_inner());
+        let doc = &entry_guard.doc;
+        let camera = doc.metadata.exif.as_ref().map(|bytes| photocraft_algo::exif::read(bytes.as_slice()));
+        let exif = match camera {
+            Some(info) if camera_has_fields(&info) => json!({
+                "make": info.make,
+                "model": info.model,
+                "lens": info.lens,
+                "exposureTime": info.exposure_time,
+                "fNumber": info.f_number,
+                "iso": info.iso,
+                "focalLength": info.focal_length,
+                "focalLength35mm": info.focal_length_35mm,
+                "dateTaken": info.date_taken,
+            }),
+            _ => Value::Null,
+        };
+        ok(json!({
+            "name": doc.name,
+            "width": doc.size.width,
+            "height": doc.size.height,
+            "mode": mode_label(doc.mode),
+            "depth": depth_label(doc.depth),
+            "resolution": doc.resolution_dpi,
+            "layers": count_doc_layers(&doc.layers),
+            "selection": doc.selection.is_some(),
+            "iccBytes": doc.icc_profile.as_ref().map(|p| p.len()).unwrap_or(0),
+            "xmp": doc.metadata.xmp.is_some(),
+            "exif": exif,
+        }))
+    })
+}
+
+fn camera_has_fields(info: &photocraft_algo::exif::CameraInfo) -> bool {
+    info.make.is_some()
+        || info.model.is_some()
+        || info.lens.is_some()
+        || info.exposure_time.is_some()
+        || info.f_number.is_some()
+        || info.iso.is_some()
+        || info.focal_length.is_some()
+        || info.focal_length_35mm.is_some()
+        || info.date_taken.is_some()
+}
+
+fn count_doc_layers(layers: &[Layer]) -> usize {
+    layers.iter().map(|l| 1 + l.children().map(count_doc_layers).unwrap_or(0)).sum()
+}
+
+/// `pc_metadata` 的只读契约：基础字段与 EXIF 缺失路径，且未知文档失败。
+#[cfg(test)]
+mod metadata_api_tests {
+    use super::*;
+
+    fn take_bytes(buf: *mut PcBuffer, ctx: &str) -> Vec<u8> {
+        assert!(!buf.is_null(), "{ctx}: 期望非空 PcBuffer, 实际 null");
+        // SAFETY: `buf` 由桥接层分配，读取后立即释放且只释放一次。
+        let bytes = unsafe {
+            let b = &*buf;
+            std::slice::from_raw_parts(b.ptr, b.len).to_vec()
+        };
+        pc_buffer_free(buf);
+        bytes
+    }
+
+    fn read_json(buf: *mut PcBuffer, ctx: &str) -> Value {
+        let bytes = take_bytes(buf, ctx);
+        serde_json::from_slice::<Value>(&bytes).unwrap_or_else(|e| panic!("{ctx}: 非法 JSON ({e})"))
+    }
+
+    #[test]
+    fn metadata_reports_document_basics_and_missing_exif() {
+        let session = pc_session_new();
+        let created = read_json(pc_document_new(session, 64, 48, b"meta".as_ptr(), 4), "new");
+        assert_eq!(created["ok"].as_bool(), Some(true), "{created}");
+        let doc = created["data"]["id"].as_u64().unwrap_or(0);
+        assert_ne!(doc, 0, "文档 id");
+
+        let state = read_json(pc_metadata(session, doc), "metadata");
+        assert_eq!(state["ok"].as_bool(), Some(true), "{state}");
+        let data = &state["data"];
+        assert_eq!(data["width"].as_u64(), Some(64), "宽度");
+        assert_eq!(data["height"].as_u64(), Some(48), "高度");
+        assert_eq!(data["layers"].as_u64(), Some(1), "图层数");
+        assert_eq!(data["selection"].as_bool(), Some(false), "默认无选区");
+        assert_eq!(data["iccBytes"].as_u64(), Some(0), "默认无 ICC");
+        assert_eq!(data["xmp"].as_bool(), Some(false), "默认无 XMP");
+        assert!(data["exif"].is_null(), "无 EXIF 时必须是 null");
+        assert_eq!(read_json(pc_metadata(session, 999_999), "missing")["ok"].as_bool(), Some(false), "未知文档失败");
+
+        pc_close(session, doc);
+        pc_session_free(session);
+    }
+
+    #[test]
+    fn metadata_reads_camera_fields_from_exif_payload() {
+        let session = pc_session_new();
+        let created = read_json(pc_document_new(session, 32, 24, b"exif".as_ptr(), 4), "new");
+        assert_eq!(created["ok"].as_bool(), Some(true), "{created}");
+        let doc = created["data"]["id"].as_u64().unwrap_or(0);
+
+        let camera = photocraft_algo::exif::CameraInfo {
+            make: Some("HUAWEI".to_string()),
+            model: Some("BRE-AL80".to_string()),
+            lens: Some("Main Camera".to_string()),
+            exposure_time: Some(1.0 / 200.0),
+            f_number: Some(2.8),
+            iso: Some(100.0),
+            focal_length: Some(5.4),
+            focal_length_35mm: Some(24.0),
+            date_taken: Some("2026:11:26 10:00:00".to_string()),
+        };
+        let payload = photocraft_algo::exif::build(&camera);
+        // 桥接层没有元数据写入 ABI；测试直接写文档内部状态，验证读取路径。
+        {
+            let s = unsafe { &*session };
+            let entry = s.entry_mut(doc).expect("entry");
+            let mut guard = entry.write().unwrap_or_else(|e| e.into_inner());
+            guard.doc.metadata.exif = Some(std::sync::Arc::new(payload));
+        }
+
+        let state = read_json(pc_metadata(session, doc), "metadata exif");
+        assert_eq!(state["ok"].as_bool(), Some(true), "{state}");
+        let exif = &state["data"]["exif"];
+        assert_eq!(exif["make"].as_str(), Some("HUAWEI"), "相机厂商");
+        assert_eq!(exif["model"].as_str(), Some("BRE-AL80"), "相机型号");
+        assert_eq!(exif["lens"].as_str(), Some("Main Camera"), "镜头");
+        assert_eq!(exif["iso"].as_f64(), Some(100.0), "ISO");
+        assert!((exif["fNumber"].as_f64().unwrap_or(0.0) - 2.8).abs() < 0.001, "光圈");
+        assert!((exif["exposureTime"].as_f64().unwrap_or(0.0) - 0.005).abs() < 1e-9, "曝光");
+        assert_eq!(exif["focalLength35mm"].as_f64(), Some(24.0), "等效焦距");
+        assert_eq!(exif["dateTaken"].as_str(), Some("2026:11:26 10:00:00"), "拍摄时间");
+
+        pc_close(session, doc);
+        pc_session_free(session);
+    }
+}
+
+/// `pc_histogram` 的只读契约：合成结果逐通道计数、透明像素不入桶、读操作不产生撤销点。
+#[cfg(test)]
+mod histogram_api_tests {
+    use super::*;
+
+    const SIDE: u32 = 64;
+    const RECT: &str = r#"{"kind":"rect","x":16,"y":16,"w":16,"h":16,"fill":[1,0,0,1],"strokeWidth":0}"#;
+
+    fn take_bytes(buf: *mut PcBuffer, ctx: &str) -> Vec<u8> {
+        assert!(!buf.is_null(), "{ctx}: 期望非空 PcBuffer, 实际 null");
+        // SAFETY: `buf` 由桥接层分配，读取后立即释放且只释放一次。
+        let bytes = unsafe {
+            let b = &*buf;
+            std::slice::from_raw_parts(b.ptr, b.len).to_vec()
+        };
+        pc_buffer_free(buf);
+        bytes
+    }
+
+    fn read_json(buf: *mut PcBuffer, ctx: &str) -> Value {
+        let bytes = take_bytes(buf, ctx);
+        serde_json::from_slice::<Value>(&bytes).unwrap_or_else(|e| panic!("{ctx}: 非法 JSON ({e})"))
+    }
+
+    #[test]
+    fn histogram_counts_composited_bins_and_stays_read_only() {
+        let session = pc_session_new();
+        let created = read_json(pc_document_new(session, SIDE, SIDE, b"histogram".as_ptr(), 9), "new");
+        assert_eq!(created["ok"].as_bool(), Some(true), "{created}");
+        let doc = created["data"]["id"].as_u64().unwrap_or(0);
+        assert_ne!(doc, 0, "文档 id");
+
+        let shape = read_json(pc_shape_create(session, doc, RECT.as_ptr(), RECT.len()), "shape");
+        assert_eq!(shape["ok"].as_bool(), Some(true), "{shape}");
+        let revision = read_json(pc_revision(session, doc), "revision")["data"]["revision"].as_u64().unwrap_or(0);
+
+        let state = read_json(pc_histogram(session, doc), "histogram");
+        assert_eq!(state["ok"].as_bool(), Some(true), "{state}");
+        let data = &state["data"];
+        assert_eq!(data["width"].as_u64(), Some(u64::from(SIDE)), "宽度");
+        assert_eq!(data["height"].as_u64(), Some(u64::from(SIDE)), "高度");
+        assert_eq!(data["rgb"].as_array().map(Vec::len), Some(3), "三条通道");
+
+        let samples = data["samples"].as_u64().unwrap_or(0);
+        let transparent = data["transparent"].as_u64().unwrap_or(0);
+        let invalid = data["invalid"].as_u64().unwrap_or(0);
+        assert_eq!(samples + transparent + invalid, u64::from(SIDE) * u64::from(SIDE), "像素总数为宽×高");
+
+        let red = data["rgb"][0].as_array().expect("R 通道");
+        let green = data["rgb"][1].as_array().expect("G 通道");
+        let blue = data["rgb"][2].as_array().expect("B 通道");
+        assert_eq!(red[255].as_u64(), Some(4096), "白色背景与红色矩形的 R 都是 255，合并在同一桶");
+        assert_eq!(green[0].as_u64(), Some(256), "16×16 纯红区域落在 G=0 桶");
+        assert_eq!(blue[0].as_u64(), Some(256), "16×16 纯红区域落在 B=0 桶");
+        assert_eq!(green[255].as_u64(), Some(3840), "白色背景落在 G=255 桶");
+
+        let after = read_json(pc_revision(session, doc), "revision after");
+        assert_eq!(after["data"]["revision"].as_u64(), Some(revision), "直方图不改变 revision");
+        assert_eq!(read_json(pc_histogram(session, 999_999), "missing")["ok"].as_bool(), Some(false), "未知文档失败");
+
+        pc_close(session, doc);
+        pc_session_free(session);
+    }
+}
+
 /// Device compute profile: CPU SIMD tier + GPU/AI capability flags.
 ///
 /// ArkTS 侧据此显示加速状态，并作为「有算力用算力、无算力回落 CPU」的判定入口：
@@ -1118,27 +1652,40 @@ pub extern "C" fn pc_paint_stroke(
         let entry = &mut *entry_guard;
         let selection = entry.doc.selection.clone();
         let format = entry.doc.pixel_format();
-        let reusable = layer != 0 && find_layer(&entry.doc.layers, layer).is_some_and(|l| matches!(&l.content, LayerContent::Raster(_)));
-        let target = if reusable {
-            layer
+        let reusable = layer != 0
+            && find_layer(&entry.doc.layers, layer)
+                .is_some_and(|l| matches!(&l.content, LayerContent::Raster(_)));
+        let stroke = Stroke { brush, points };
+        let created = if reusable {
+            None
         } else {
             let name = format!("Paint {}", entry.doc.layers.len() + 1);
-            let created = Layer::new(name, LayerContent::Raster(Surface::new(format)));
-            let new_id = created.id.0;
-            entry.doc.layers.push(created);
-            new_id
+            let mut layer = Layer::new(name, LayerContent::Raster(Surface::new(format)));
+            let LayerContent::Raster(surface) = &mut layer.content else {
+                return fail("paint target is not a pixel layer");
+            };
+            let rect = apply_stroke(surface, &stroke, selection.as_ref(), false);
+            Some((layer, rect))
         };
         entry.checkpoint_named("画笔");
-        let Some(l) = find_layer_mut(&mut entry.doc.layers, target) else {
-            return fail("layer not found");
+        let (target, rect) = if let Some((layer, rect)) = created {
+            let target = layer.id.0;
+            entry.doc.layers.push(layer);
+            (target, rect)
+        } else {
+            let Some(l) = find_layer_mut(&mut entry.doc.layers, layer) else {
+                return fail("layer not found");
+            };
+            let lock_transparency = l.locks.transparency;
+            let surface = match &mut l.content {
+                LayerContent::Raster(s) => s,
+                _ => return fail("paint target is not a pixel layer"),
+            };
+            (
+                layer,
+                apply_stroke(surface, &stroke, selection.as_ref(), lock_transparency),
+            )
         };
-        let lock_transparency = l.locks.transparency;
-        let surface = match &mut l.content {
-            LayerContent::Raster(s) => s,
-            _ => return fail("paint target is not a pixel layer"),
-        };
-        let stroke = Stroke { brush, points };
-        let rect = apply_stroke(surface, &stroke, selection.as_ref(), lock_transparency);
         ok(json!({
             "layerId": target,
             "rect": { "x0": rect.x0, "y0": rect.y0, "x1": rect.x1, "y1": rect.y1 },
@@ -1295,10 +1842,48 @@ pub extern "C" fn pc_select(session: *mut Session, id: u64, params_ptr: *const u
     })
 }
 
+pub type PcFilterCancel = unsafe extern "C-unwind" fn(*mut std::ffi::c_void) -> bool;
+pub type PcFilterProgress = unsafe extern "C-unwind" fn(*mut std::ffi::c_void, f32);
+pub type PcFilterCommit = unsafe extern "C-unwind" fn(*mut std::ffi::c_void) -> bool;
+
 /// Applies an `algo::FilterParams` JSON filter to a pixel layer. The selection is used as a mask,
 /// so with an active selection only the selected pixels change. Returns the updated document info.
 #[unsafe(no_mangle)]
 pub extern "C" fn pc_filter_apply(session: *mut Session, id: u64, layer: u64, params_ptr: *const u8, params_len: usize) -> *mut PcBuffer {
+    filter_apply(session, id, layer, params_ptr, params_len, None, None, None, std::ptr::null_mut())
+}
+
+/// Filter application with cooperative cancellation and progress callbacks. The callbacks may run
+/// on Rayon workers. The commit callback linearizes cancellation against the history/pixel update:
+/// once it returns true, cancellation is rejected and the filter commits atomically.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn pc_filter_apply_with(
+    session: *mut Session,
+    id: u64,
+    layer: u64,
+    params_ptr: *const u8,
+    params_len: usize,
+    cancel: Option<PcFilterCancel>,
+    progress: Option<PcFilterProgress>,
+    commit: Option<PcFilterCommit>,
+    context: *mut std::ffi::c_void,
+) -> *mut PcBuffer {
+    filter_apply(session, id, layer, params_ptr, params_len, cancel, progress, commit, context)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn filter_apply(
+    session: *mut Session,
+    id: u64,
+    layer: u64,
+    params_ptr: *const u8,
+    params_len: usize,
+    cancel: Option<PcFilterCancel>,
+    progress: Option<PcFilterProgress>,
+    commit: Option<PcFilterCommit>,
+    context: *mut std::ffi::c_void,
+) -> *mut PcBuffer {
     guard(move || {
         if session.is_null() {
             return fail("null session");
@@ -1311,6 +1896,29 @@ pub extern "C" fn pc_filter_apply(session: *mut Session, id: u64, layer: u64, pa
             Ok(p) => p,
             Err(e) => return fail(format!("invalid filter parameters: {e}")),
         };
+        // The raw context pointer is not `Sync`, but `Interrupt::new` requires a `Sync` closure
+        // because Rayon workers call it. Carry it as a `usize`; the pointer round-trips unchanged
+        // and the caller keeps the context alive for the duration of the call.
+        let context_addr = context as usize;
+        let cancelled = move || cancel.is_some_and(|callback| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+                callback(context_addr as *mut std::ffi::c_void)
+            }))
+            .unwrap_or(true)
+        });
+        let report = move |fraction: f32| {
+            if let Some(callback) = progress {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+                    callback(context_addr as *mut std::ffi::c_void, fraction);
+                }));
+            }
+        };
+        let commit = move || commit.map_or(true, |callback| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+                callback(context_addr as *mut std::ffi::c_void)
+            }))
+            .unwrap_or(false)
+        });
         // SAFETY: live session pointer.
         let s = unsafe { &*session };
         let entry = match s.entry_mut(id) {
@@ -1319,6 +1927,9 @@ pub extern "C" fn pc_filter_apply(session: *mut Session, id: u64, layer: u64, pa
         };
         let mut entry_guard = entry.write().unwrap_or_else(|e| e.into_inner());
         let entry = &mut *entry_guard;
+        if cancelled() {
+            return fail("filter cancelled");
+        }
         let bounds = entry.doc.bounds();
         if bounds.is_empty() {
             return fail("document is empty");
@@ -1345,19 +1956,344 @@ pub extern "C" fn pc_filter_apply(session: *mut Session, id: u64, layer: u64, pa
         });
         let area = output_area(&filter, content, bounds, selection_bounds);
         if area.is_empty() {
-            return ok(doc_info(entry));
+            return if cancelled() { fail("filter cancelled") } else { ok(doc_info(entry)) };
         }
-        entry.checkpoint_named("滤镜");
+        let computed = {
+            let Some(target) = find_layer(&entry.doc.layers, layer) else {
+                return fail("layer not found");
+            };
+            let LayerContent::Raster(surface) = &target.content else {
+                return fail("filter requires a pixel layer");
+            };
+            apply_in_with(
+                surface,
+                &filter,
+                area,
+                bounds,
+                selection.as_ref(),
+                bounds,
+                &photocraft_raster::Interrupt::new(&cancelled, &report),
+            )
+        };
+        if cancelled() {
+            return fail("filter cancelled");
+        }
+        // `None` also covers checked-filter geometry/allocation rejection. Preserve the historical
+        // fallback for those failures, but never confuse them with cancellation.
+        let result = match computed {
+            Some(surface) => surface,
+            None => {
+                let Some(target) = find_layer(&entry.doc.layers, layer) else {
+                    return fail("layer not found");
+                };
+                let LayerContent::Raster(surface) = &target.content else {
+                    return fail("filter requires a pixel layer");
+                };
+                surface.clone()
+            }
+        };
+        let snapshot = entry.doc.clone();
+        if cancelled() || !commit() {
+            return fail("filter cancelled");
+        }
+        entry.checkpoint_snapshot_named(snapshot, "滤镜");
         let Some(target_mut) = find_layer_mut(&mut entry.doc.layers, layer) else {
             return fail("layer not found");
         };
         let LayerContent::Raster(surface) = &mut target_mut.content else {
             return fail("filter requires a pixel layer");
         };
-        let result = apply_in(surface, &filter, area, bounds, selection.as_ref(), bounds);
         *surface = result;
         ok(doc_info(entry))
     })
+}
+
+#[cfg(test)]
+mod filter_job_tests {
+    #![allow(clippy::panic, clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicU32};
+
+    struct FilterCtx {
+        session: *mut Session,
+        doc: u64,
+        layer: u64,
+    }
+
+    impl Drop for FilterCtx {
+        fn drop(&mut self) {
+            pc_session_free(self.session);
+        }
+    }
+
+    impl FilterCtx {
+        fn new() -> Self {
+            let session = pc_session_new();
+            let created = read_json(pc_document_new(session, 64, 48, b"filter-job".as_ptr(), 10), "new");
+            assert_eq!(created["ok"].as_bool(), Some(true), "{created}");
+            let doc = created["data"]["id"].as_u64().unwrap_or(0);
+            let layer = created["data"]["info"]["layers"][0]["id"].as_u64().unwrap_or(0);
+            Self { session, doc, layer }
+        }
+
+        fn revision(&self) -> u64 {
+            read_json(pc_revision(self.session, self.doc), "revision")["data"]["revision"].as_u64().unwrap_or(0)
+        }
+
+        fn history(&self) -> Value {
+            read_json(pc_history(self.session, self.doc), "history")
+        }
+
+        fn pixels(&self) -> Vec<u8> {
+            let mut out = std::ptr::null_mut();
+            let state = read_json(pc_render_pixels(self.session, self.doc, 0, 0, 64, 48, &mut out), "pixels");
+            assert_eq!(state["ok"].as_bool(), Some(true), "{state}");
+            take_bytes(out, "pixels")
+        }
+
+        fn apply(&self, cancel: Option<PcFilterCancel>, progress: Option<PcFilterProgress>, commit: Option<PcFilterCommit>, context: *mut std::ffi::c_void) -> Value {
+            let params = br#"{"filter":"gaussianBlur","radius":8}"#;
+            read_json(pc_filter_apply_with(self.session, self.doc, self.layer, params.as_ptr(), params.len(), cancel, progress, commit, context), "filter")
+        }
+    }
+
+    fn read_json(buffer: *mut PcBuffer, context: &str) -> Value {
+        let bytes = take_bytes(buffer, context);
+        serde_json::from_slice(&bytes).unwrap_or_else(|error| panic!("{context}: {error}"))
+    }
+
+    fn take_bytes(buffer: *mut PcBuffer, context: &str) -> Vec<u8> {
+        assert!(!buffer.is_null(), "{context}: null buffer");
+        let bytes = unsafe {
+            let buffer = &*buffer;
+            std::slice::from_raw_parts(buffer.ptr, buffer.len).to_vec()
+        };
+        pc_buffer_free(buffer);
+        bytes
+    }
+
+    unsafe extern "C-unwind" fn cancel_before(_: *mut std::ffi::c_void) -> bool {
+        true
+    }
+
+    #[test]
+    fn pre_cancelled_filter_is_atomic() {
+        let ctx = FilterCtx::new();
+        let revision = ctx.revision();
+        let history = ctx.history();
+        let pixels = ctx.pixels();
+        let result = ctx.apply(Some(cancel_before), None, None, std::ptr::null_mut());
+        assert_eq!(result["ok"].as_bool(), Some(false));
+        assert_eq!(result["error"].as_str(), Some("filter cancelled"));
+        assert_eq!(ctx.revision(), revision);
+        assert_eq!(ctx.history(), history);
+        assert_eq!(ctx.pixels(), pixels);
+    }
+
+    #[test]
+    fn cancellation_from_progress_callback_prevents_checkpoint() {
+        struct State {
+            cancel: AtomicBool,
+            progress_bits: AtomicU32,
+        }
+        unsafe extern "C-unwind" fn cancel(context: *mut std::ffi::c_void) -> bool {
+            let state = unsafe { &*(context as *const State) };
+            state.cancel.load(Ordering::Acquire)
+        }
+        unsafe extern "C-unwind" fn progress(context: *mut std::ffi::c_void, fraction: f32) {
+            let state = unsafe { &*(context as *const State) };
+            state.progress_bits.store(fraction.to_bits(), Ordering::Release);
+            state.cancel.store(true, Ordering::Release);
+        }
+        let ctx = FilterCtx::new();
+        let revision = ctx.revision();
+        let history = ctx.history();
+        let pixels = ctx.pixels();
+        let state = State { cancel: AtomicBool::new(false), progress_bits: AtomicU32::new(0) };
+        let result = ctx.apply(Some(cancel), Some(progress), None, std::ptr::addr_of!(state).cast_mut().cast());
+        assert_eq!(result["ok"].as_bool(), Some(false));
+        assert_eq!(result["error"].as_str(), Some("filter cancelled"));
+        assert!(state.cancel.load(Ordering::Acquire));
+        assert!(f32::from_bits(state.progress_bits.load(Ordering::Acquire)) > 0.0);
+        assert_eq!(ctx.revision(), revision);
+        assert_eq!(ctx.history(), history);
+        assert_eq!(ctx.pixels(), pixels);
+    }
+
+    struct CommitState {
+        phase: AtomicU32,
+        cancel_accepted: AtomicBool,
+        commit_calls: AtomicU32,
+    }
+
+    unsafe extern "C-unwind" fn query_commit_cancel(context: *mut std::ffi::c_void) -> bool {
+        let state = unsafe { &*(context as *const CommitState) };
+        state.phase.load(Ordering::Acquire) != 0
+    }
+
+    unsafe extern "C-unwind" fn cancel_for_commit(context: *mut std::ffi::c_void) -> bool {
+        let state = unsafe { &*(context as *const CommitState) };
+        let running = 0;
+        state.phase.compare_exchange(running, 1, Ordering::AcqRel, Ordering::Acquire).is_ok()
+    }
+
+    unsafe extern "C-unwind" fn commit_after_cancel(context: *mut std::ffi::c_void) -> bool {
+        let state = unsafe { &*(context as *const CommitState) };
+        state.cancel_accepted.store(unsafe { cancel_for_commit(context) }, Ordering::Release);
+        state.commit_calls.fetch_add(1, Ordering::AcqRel);
+        let running = 0;
+        state.phase.compare_exchange(running, 2, Ordering::AcqRel, Ordering::Acquire).is_ok()
+    }
+
+    unsafe extern "C-unwind" fn commit_before_cancel(context: *mut std::ffi::c_void) -> bool {
+        let state = unsafe { &*(context as *const CommitState) };
+        state.commit_calls.fetch_add(1, Ordering::AcqRel);
+        let running = 0;
+        let committed = state.phase.compare_exchange(running, 2, Ordering::AcqRel, Ordering::Acquire).is_ok();
+        state.cancel_accepted.store(unsafe { cancel_for_commit(context) }, Ordering::Release);
+        committed
+    }
+
+    #[test]
+    fn cancellation_winning_commit_gate_prevents_checkpoint() {
+        let ctx = FilterCtx::new();
+        let revision = ctx.revision();
+        let history = ctx.history();
+        let pixels = ctx.pixels();
+        let state = CommitState {
+            phase: AtomicU32::new(0),
+            cancel_accepted: AtomicBool::new(false),
+            commit_calls: AtomicU32::new(0),
+        };
+        let result = ctx.apply(
+            Some(query_commit_cancel),
+            None,
+            Some(commit_after_cancel),
+            std::ptr::addr_of!(state).cast_mut().cast(),
+        );
+        assert_eq!(result["ok"].as_bool(), Some(false));
+        assert_eq!(result["error"].as_str(), Some("filter cancelled"));
+        assert!(state.cancel_accepted.load(Ordering::Acquire));
+        assert_eq!(state.commit_calls.load(Ordering::Acquire), 1);
+        assert_eq!(ctx.revision(), revision);
+        assert_eq!(ctx.history(), history);
+        assert_eq!(ctx.pixels(), pixels);
+    }
+
+    #[test]
+    fn cancellation_losing_commit_gate_is_rejected() {
+        let ctx = FilterCtx::new();
+        let revision = ctx.revision();
+        let state = CommitState {
+            phase: AtomicU32::new(0),
+            cancel_accepted: AtomicBool::new(true),
+            commit_calls: AtomicU32::new(0),
+        };
+        let result = ctx.apply(
+            Some(query_commit_cancel),
+            None,
+            Some(commit_before_cancel),
+            std::ptr::addr_of!(state).cast_mut().cast(),
+        );
+        assert_eq!(result["ok"].as_bool(), Some(true), "{result}");
+        assert!(!state.cancel_accepted.load(Ordering::Acquire));
+        assert_eq!(state.commit_calls.load(Ordering::Acquire), 1);
+        assert_eq!(ctx.revision(), revision + 1);
+        assert_eq!(ctx.history()["data"]["undo"], json!(["滤镜"]));
+    }
+
+    unsafe extern "C-unwind" fn panicking_cancel(_: *mut std::ffi::c_void) -> bool {
+        panic!("cancel callback panic");
+    }
+
+    unsafe extern "C-unwind" fn panicking_progress(_: *mut std::ffi::c_void, _: f32) {
+        panic!("progress callback panic");
+    }
+
+    unsafe extern "C-unwind" fn panicking_commit(_: *mut std::ffi::c_void) -> bool {
+        panic!("commit callback panic");
+    }
+
+    #[test]
+    fn panicking_cancel_callback_is_treated_as_cancellation() {
+        let ctx = FilterCtx::new();
+        let revision = ctx.revision();
+        let pixels = ctx.pixels();
+        let result = ctx.apply(Some(panicking_cancel), None, None, std::ptr::null_mut());
+        assert_eq!(result["error"].as_str(), Some("filter cancelled"));
+        assert_eq!(ctx.revision(), revision);
+        assert_eq!(ctx.pixels(), pixels);
+    }
+
+    #[test]
+    fn panicking_progress_callback_does_not_abort_filter() {
+        let ctx = FilterCtx::new();
+        let revision = ctx.revision();
+        let result = ctx.apply(None, Some(panicking_progress), None, std::ptr::null_mut());
+        assert_eq!(result["ok"].as_bool(), Some(true), "{result}");
+        assert_eq!(ctx.revision(), revision + 1);
+    }
+
+    #[test]
+    fn panicking_commit_callback_prevents_checkpoint() {
+        let ctx = FilterCtx::new();
+        let revision = ctx.revision();
+        let pixels = ctx.pixels();
+        let result = ctx.apply(None, None, Some(panicking_commit), std::ptr::null_mut());
+        assert_eq!(result["error"].as_str(), Some("filter cancelled"));
+        assert_eq!(ctx.revision(), revision);
+        assert_eq!(ctx.pixels(), pixels);
+    }
+
+    #[test]
+    fn checked_filter_rejection_is_not_mistaken_for_cancellation() {
+        let ctx = FilterCtx::new();
+        let revision = ctx.revision();
+        let pixels = ctx.pixels();
+        let params = br#"{"filter":"unsharpMask","amount":100,"radius":-1,"threshold":3}"#;
+        let result = read_json(pc_filter_apply_with(
+            ctx.session,
+            ctx.doc,
+            ctx.layer,
+            params.as_ptr(),
+            params.len(),
+            None,
+            None,
+            None,
+            std::ptr::null_mut(),
+        ), "checked filter rejection");
+        assert_eq!(result["ok"].as_bool(), Some(true), "{result}");
+        assert_eq!(ctx.revision(), revision + 1);
+        assert_eq!(ctx.history()["data"]["undo"], json!(["滤镜"]));
+        assert_eq!(ctx.pixels(), pixels);
+    }
+
+    #[test]
+    fn successful_filter_reports_completion_and_creates_one_undo() {
+        struct State {
+            progress: Mutex<Vec<f32>>,
+        }
+        unsafe extern "C-unwind" fn progress(context: *mut std::ffi::c_void, fraction: f32) {
+            let state = unsafe { &*(context as *const State) };
+            state.progress.lock().unwrap_or_else(|error| error.into_inner()).push(fraction);
+        }
+        let ctx = FilterCtx::new();
+        let revision = ctx.revision();
+        let pixels = ctx.pixels();
+        let state = State { progress: Mutex::new(Vec::new()) };
+        let result = ctx.apply(None, Some(progress), None, std::ptr::addr_of!(state).cast_mut().cast());
+        assert_eq!(result["ok"].as_bool(), Some(true), "{result}");
+        let progress = state.progress.lock().unwrap_or_else(|error| error.into_inner());
+        assert!(!progress.is_empty());
+        assert!(progress.iter().all(|value| value.is_finite() && (0.0..=1.0).contains(value)));
+        assert_eq!(progress.last().copied(), Some(1.0));
+        assert_eq!(ctx.revision(), revision + 1);
+        assert_eq!(ctx.history()["data"]["undo"], json!(["滤镜"]));
+        let undone = read_json(pc_undo(ctx.session, ctx.doc), "undo");
+        assert_eq!(undone["ok"].as_bool(), Some(true), "{undone}");
+        assert_eq!(ctx.pixels(), pixels);
+    }
 }
 
 #[derive(Deserialize)]
@@ -3695,14 +4631,13 @@ fn validate_effect_fields(p: &EffectParams) -> Result<(), String> {
 }
 
 /// Full pre-flight check; a failure here must not checkpoint.
-fn validate_effect_op(entry: &DocEntry, layer: u64, p: &EffectParams) -> Result<(), String> {
-    let target = find_layer(&entry.doc.layers, layer).ok_or_else(|| "layer not found".to_string())?;
+fn validate_effect_op(effects: &Effects, p: &EffectParams) -> Result<(), String> {
     validate_effect_fields(p)?;
     match p.op.as_str() {
         "add" => new_effect(&p.kind).map(|_| ()),
         "update" | "remove" | "enable" => {
             let index = effect_index(p)?;
-            let effect = target.effects.items.get(index).ok_or_else(|| format!("effects: effect index out of range: {index}"))?;
+            let effect = effects.items.get(index).ok_or_else(|| format!("effects: effect index out of range: {index}"))?;
             if !is_editable(effect) {
                 return Err(format!("effects: effect at index {index} is not editable"));
             }
@@ -3726,41 +4661,40 @@ fn validate_effect_op(entry: &DocEntry, layer: u64, p: &EffectParams) -> Result<
 }
 
 /// Performs an already validated operation. Never fails for validated input.
-fn run_effect_op(entry: &mut DocEntry, layer: u64, p: &EffectParams) -> Result<(), String> {
-    let target = find_layer_mut(&mut entry.doc.layers, layer).ok_or_else(|| "layer not found".to_string())?;
+fn run_effect_op(effects: &mut Effects, p: &EffectParams) -> Result<(), String> {
     match p.op.as_str() {
         "add" => {
             let mut effect = new_effect(&p.kind)?;
             apply_effect_params(&mut effect, p);
-            target.effects.items.push(effect);
+            if let Some(enabled) = p.enabled {
+                effect.set_enabled(enabled);
+            }
+            effects.items.push(effect);
         }
         "update" => {
             let index = effect_index(p)?;
-            if let Some(effect) = target.effects.items.get_mut(index) {
+            if let Some(effect) = effects.items.get_mut(index) {
                 apply_effect_params(effect, p);
             }
         }
         "remove" => {
             let index = effect_index(p)?;
-            if index < target.effects.items.len() {
-                target.effects.items.remove(index);
+            if index < effects.items.len() {
+                effects.items.remove(index);
             }
         }
         "enable" => {
             let index = effect_index(p)?;
-            if let (Some(effect), Some(on)) = (target.effects.items.get_mut(index), p.enabled) {
+            if let (Some(effect), Some(on)) = (effects.items.get_mut(index), p.enabled) {
                 effect.set_enabled(on);
             }
         }
         "master" => {
             if let Some(on) = p.enabled {
-                target.effects.enabled = on;
+                effects.enabled = on;
             }
         }
-        // C-EFFECTS-API@2：删除集合由 3 类扩到 7 类（投影/描边/外发光 + 内阴影/内发光/
-        // 渐变叠加/斜面浮雕）；PatternOverlay、ColorOverlay、Satin 等 unsupported 保留
-        // （删除后无法通过 UI 重建，构成数据丢失）。只含 @1 三类的旧文档结果与本扩展前一致。
-        "clear" => target.effects.items.retain(|effect| !is_editable(effect)),
+        "clear" => effects.items.retain(|effect| !is_editable(effect)),
         other => return Err(format!("effects: unsupported op: {other}")),
     }
     Ok(())
@@ -3789,7 +4723,7 @@ pub extern "C" fn pc_layer_effects_get(session: *mut Session, id: u64, layer: u6
 }
 
 /// Adds/updates/removes/enables layer effects. `params` is a UTF-8 [`EffectParams`] JSON object.
-/// Every successful call checkpoints first; validation failures leave the document untouched.
+/// Changed calls checkpoint once; no-ops and validation failures leave history untouched.
 #[unsafe(no_mangle)]
 pub extern "C" fn pc_layer_effects_apply(
     session: *mut Session,
@@ -3818,14 +4752,79 @@ pub extern "C" fn pc_layer_effects_apply(
         };
         let mut entry_guard = entry.write().unwrap_or_else(|e| e.into_inner());
         let entry = &mut *entry_guard;
-        if let Err(e) = validate_effect_op(entry, layer, &p) {
+        if find_layer(&entry.doc.layers, layer).is_none() {
+            return fail("layer not found");
+        }
+        let mut staged = match find_layer(&entry.doc.layers, layer) {
+            Some(target) => target.effects.clone(),
+            None => return fail("layer not found"),
+        };
+        if let Err(e) = validate_effect_op(&staged, &p) {
             return fail(e);
         }
-        entry.checkpoint();
-        if let Err(e) = run_effect_op(entry, layer, &p) {
+        if let Err(e) = run_effect_op(&mut staged, &p) {
             return fail(e);
+        }
+        if staged != find_layer(&entry.doc.layers, layer).unwrap().effects {
+            entry.checkpoint();
+            find_layer_mut(&mut entry.doc.layers, layer).unwrap().effects = staged;
         }
         // Re-read so the caller gets fresh indexes after remove/clear.
+        match find_layer(&entry.doc.layers, layer) {
+            Some(target) => ok(effects_json(target)),
+            None => fail("layer not found"),
+        }
+    })
+}
+
+/// Applies a JSON array of effect operations atomically, with at most one checkpoint.
+#[unsafe(no_mangle)]
+pub extern "C" fn pc_layer_effects_apply_batch(
+    session: *mut Session,
+    id: u64,
+    layer: u64,
+    params_ptr: *const u8,
+    params_len: usize,
+) -> *mut PcBuffer {
+    guard(move || {
+        if session.is_null() {
+            return fail("null session");
+        }
+        let params = match unsafe { slice(params_ptr, params_len) } {
+            Ok(b) => b,
+            Err(e) => return fail(e),
+        };
+        let operations = match serde_json::from_slice::<Vec<EffectParams>>(params) {
+            Ok(operations) => operations,
+            Err(e) => return fail(format!("effects: invalid parameters: {e}")),
+        };
+        if operations.len() > 64 {
+            return fail("effects: batch supports at most 64 operations".to_string());
+        }
+        // SAFETY: live session pointer.
+        let s = unsafe { &*session };
+        let entry = match s.entry_mut(id) {
+            Ok(e) => e,
+            Err(e) => return fail(e),
+        };
+        let mut entry_guard = entry.write().unwrap_or_else(|e| e.into_inner());
+        let entry = &mut *entry_guard;
+        let original = match find_layer(&entry.doc.layers, layer) {
+            Some(target) => target.effects.clone(),
+            None => return fail("layer not found"),
+        };
+        let mut staged = original.clone();
+        for operation in &operations {
+            if let Err(e) = validate_effect_op(&staged, operation).and_then(|_| run_effect_op(&mut staged, operation)) {
+                return fail(e);
+            }
+        }
+        if staged != original {
+            entry.checkpoint();
+            if let Some(target) = find_layer_mut(&mut entry.doc.layers, layer) {
+                target.effects = staged;
+            }
+        }
         match find_layer(&entry.doc.layers, layer) {
             Some(target) => ok(effects_json(target)),
             None => fail("layer not found"),
@@ -3989,7 +4988,12 @@ pub extern "C" fn pc_layer_rename(session: *mut Session, id: u64, layer: u64, na
 
 /// Moves a layer one step within its parent (`delta` +1 = up, -1 = down).
 #[unsafe(no_mangle)]
-pub extern "C" fn pc_layer_move(session: *mut Session, id: u64, layer: u64, delta: i32) -> *mut PcBuffer {
+pub extern "C" fn pc_layer_move(
+    session: *mut Session,
+    id: u64,
+    layer: u64,
+    delta: i32,
+) -> *mut PcBuffer {
     guard(move || {
         if session.is_null() {
             return fail("null session");
@@ -4009,12 +5013,12 @@ pub extern "C" fn pc_layer_move(session: *mut Session, id: u64, layer: u64, delt
             return fail("layer not found");
         };
         // 任意 delta：先夹到 [0, len-1]；夹后与原地相同即"已到边界"（沿用 ±1 时代的文案）。
-        let target = (pos as i32 + delta).clamp(0, len as i32 - 1);
-        if target == pos as i32 {
+        let target = (pos as i64 + i64::from(delta)).clamp(0, len as i64 - 1);
+        if target == pos as i64 {
             return fail("layer is already at the edge");
         }
         entry.checkpoint();
-        if !move_layer(&mut entry.doc.layers, layer, target - pos as i32) {
+        if !move_layer(&mut entry.doc.layers, layer, target - pos as i64) {
             return fail("layer not found");
         }
         ok(doc_info(entry))
@@ -4310,14 +5314,28 @@ pub extern "C" fn pc_layer_delete(session: *mut Session, id: u64, layer: u64) ->
         };
         let mut entry_guard = entry.write().unwrap_or_else(|e| e.into_inner());
         let entry = &mut *entry_guard;
+        if find_layer(&entry.doc.layers, layer).is_none() {
+            return fail("layer not found");
+        }
         entry.checkpoint_named("删除图层");
-        if delete_layer(&mut entry.doc.layers, layer) { ok(Value::Null) } else { fail("layer not found") }
+        if delete_layer(&mut entry.doc.layers, layer) {
+            ok(Value::Null)
+        } else {
+            fail("layer not found")
+        }
     })
 }
 
 /// Adds an adjustment layer above every other layer. `params` is a JSON object.
 #[unsafe(no_mangle)]
-pub extern "C" fn pc_adjustment_add(session: *mut Session, id: u64, kind_ptr: *const u8, kind_len: usize, params_ptr: *const u8, params_len: usize) -> *mut PcBuffer {
+pub extern "C" fn pc_adjustment_add(
+    session: *mut Session,
+    id: u64,
+    kind_ptr: *const u8,
+    kind_len: usize,
+    params_ptr: *const u8,
+    params_len: usize,
+) -> *mut PcBuffer {
     guard(move || {
         if session.is_null() {
             return fail("null session");
@@ -4327,7 +5345,10 @@ pub extern "C" fn pc_adjustment_add(session: *mut Session, id: u64, kind_ptr: *c
             Err(e) => return fail(e),
         };
         let params = match unsafe { slice(params_ptr, params_len) } {
-            Ok(b) => serde_json::from_slice::<Value>(b).unwrap_or(Value::Null),
+            Ok(b) => match serde_json::from_slice::<Value>(b) {
+                Ok(value) => value,
+                Err(e) => return fail(format!("invalid adjustment parameters: {e}")),
+            },
             Err(e) => return fail(e),
         };
         let adj = match build_adjustment(&kind, &params) {
@@ -4352,13 +5373,22 @@ pub extern "C" fn pc_adjustment_add(session: *mut Session, id: u64, kind_ptr: *c
 
 /// Replaces the parameters of an existing adjustment layer.
 #[unsafe(no_mangle)]
-pub extern "C" fn pc_adjustment_update(session: *mut Session, id: u64, layer: u64, params_ptr: *const u8, params_len: usize) -> *mut PcBuffer {
+pub extern "C" fn pc_adjustment_update(
+    session: *mut Session,
+    id: u64,
+    layer: u64,
+    params_ptr: *const u8,
+    params_len: usize,
+) -> *mut PcBuffer {
     guard(move || {
         if session.is_null() {
             return fail("null session");
         }
         let params = match unsafe { slice(params_ptr, params_len) } {
-            Ok(b) => serde_json::from_slice::<Value>(b).unwrap_or(Value::Null),
+            Ok(b) => match serde_json::from_slice::<Value>(b) {
+                Ok(value) => value,
+                Err(e) => return fail(format!("invalid adjustment parameters: {e}")),
+            },
             Err(e) => return fail(e),
         };
         // SAFETY: live session pointer.
@@ -4372,6 +5402,8 @@ pub extern "C" fn pc_adjustment_update(session: *mut Session, id: u64, layer: u6
         let kind = match find_layer(&entry.doc.layers, layer).map(|l| l.content.clone()) {
             Some(LayerContent::Adjustment(adj)) => match &adj {
                 Adjustment::BrightnessContrast { .. } => "brightnessContrast",
+                Adjustment::Levels { .. } => "levels",
+                Adjustment::Curves { .. } => "curves",
                 Adjustment::Exposure { .. } => "exposure",
                 Adjustment::Vibrance { .. } => "vibrance",
                 Adjustment::HueSaturation { .. } => "hueSaturation",
@@ -5054,7 +6086,14 @@ pub extern "C" fn pc_layer_delete_many(session: *mut Session, id: u64, ids_ptr: 
 /// 不入栈、`revision` 不变。快照必须在 `crop_to` **之前**取：doc 层是"先算后写"，调用前
 /// 无法预知结果，调用后文档已被裁掉。
 #[unsafe(no_mangle)]
-pub extern "C" fn pc_document_crop(session: *mut Session, id: u64, x0: i32, y0: i32, x1: i32, y1: i32) -> *mut PcBuffer {
+pub extern "C" fn pc_document_crop(
+    session: *mut Session,
+    id: u64,
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+) -> *mut PcBuffer {
     guard(move || {
         if session.is_null() {
             return fail("null session");
@@ -5067,9 +6106,16 @@ pub extern "C" fn pc_document_crop(session: *mut Session, id: u64, x0: i32, y0: 
         };
         let mut entry_guard = entry.write().unwrap_or_else(|e| e.into_inner());
         let entry = &mut *entry_guard;
+        let target = match entry.doc.crop_target(Rect::new(x0, y0, x1, y1)) {
+            Ok(target) => target,
+            Err(e) => return fail(e),
+        };
+        if target == entry.doc.bounds() {
+            return ok(doc_info(entry));
+        }
         // 变更前快照：撤销栈必须存"裁剪之前的文档"，否则 `pc_undo` 恢复不回原尺寸。
         let before = entry.doc.clone();
-        match entry.doc.crop_to(Rect::new(x0, y0, x1, y1)) {
+        match entry.doc.crop_to(target) {
             Err(e) => fail(e),
             Ok(false) => ok(doc_info(entry)),
             Ok(true) => {
@@ -5087,7 +6133,13 @@ pub extern "C" fn pc_document_crop(session: *mut Session, id: u64, x0: i32, y0: 
 /// （单边上限与总像素上限由 `photocraft_doc::canvas` 守门，桥接层不另立数值）。
 /// 入栈时机与 `pc_document_crop` 相同：仅 `Ok(true)` 时用「变更前快照」恰好入栈一次。
 #[unsafe(no_mangle)]
-pub extern "C" fn pc_document_resize_canvas(session: *mut Session, id: u64, width: i32, height: i32, anchor: i32) -> *mut PcBuffer {
+pub extern "C" fn pc_document_resize_canvas(
+    session: *mut Session,
+    id: u64,
+    width: i32,
+    height: i32,
+    anchor: i32,
+) -> *mut PcBuffer {
     guard(move || {
         if session.is_null() {
             return fail("null session");
@@ -5108,6 +6160,12 @@ pub extern "C" fn pc_document_resize_canvas(session: *mut Session, id: u64, widt
             Some(a) => a,
             None => return fail("invalid anchor"),
         };
+        if let Err(e) = Document::validate_canvas_size(width as u32, height as u32) {
+            return fail(e);
+        }
+        if width as u32 == entry.doc.size.width && height as u32 == entry.doc.size.height {
+            return ok(doc_info(entry));
+        }
         // 变更前快照：只有 resize_canvas 返回 Ok(true) 才入栈，撤销才能回到旧画布尺寸。
         let before = entry.doc.clone();
         match entry.doc.resize_canvas(width as u32, height as u32, anchor) {
@@ -5929,6 +6987,14 @@ mod effects_api_tests {
             let state = self.apply(params);
             assert_ok(&state, params);
             state
+        }
+
+        fn apply_batch(&self, params: &str) -> Value {
+            let bytes = params.as_bytes();
+            read_json(
+                pc_layer_effects_apply_batch(self.session, self.doc, self.layer, bytes.as_ptr(), bytes.len()),
+                &format!("pc_layer_effects_apply_batch {params}"),
+            )
         }
 
         fn apply_for_layer(&self, layer: u64, params: &str) -> Value {
@@ -7158,6 +8224,42 @@ mod effects_api_tests {
             "op=shapeCreate 字段 data.layerId: 期望新建形状图层, 实际复用了 Background 图层 {layer}"
         );
         layer
+    }
+
+    #[test]
+    fn effects_batch_is_atomic_and_creates_one_history_entry() {
+        let f = open_fixture();
+        let before = f.revision();
+        let batch = r#"[
+            {"op":"clear"},
+            {"op":"master","enabled":true},
+            {"op":"add","kind":"innerShadow"},
+            {"op":"add","kind":"bevelEmboss","enabled":false}
+        ]"#;
+        let state = f.apply_batch(batch);
+        assert_ok(&state, batch);
+        assert_eq!(f.revision(), before + 1);
+        assert_eq!(items_of(&state, "batch", 0).len(), 2);
+        assert_eq!(items_of(&state, "batch", 0)[1]["enabled"].as_bool(), Some(false));
+
+        f.undo();
+        assert_eq!(items_of(&f.get(), "undo", 0).len(), 0);
+        f.redo();
+        assert_eq!(items_of(&f.get(), "redo", 0).len(), 2);
+
+        let stable = f.revision();
+        let invalid = r#"[
+            {"op":"add","kind":"innerGlow"},
+            {"op":"remove","index":99}
+        ]"#;
+        let failed = f.apply_batch(invalid);
+        assert_fail(&failed, "invalid batch", "effect index out of range");
+        assert_eq!(f.revision(), stable);
+        assert_eq!(items_of(&f.get(), "rollback", 0).len(), 2);
+
+        let unchanged = f.apply_batch("[]");
+        assert_ok(&unchanged, "empty batch");
+        assert_eq!(f.revision(), stable);
     }
 
     /// T3-EXT / 四类新效果必须真实改变渲染像素，且 remove 后回到基线（无残影）。
@@ -11979,6 +13081,488 @@ mod vector_selection_api_tests {
 }
 
 #[cfg(test)]
+mod boundary_regression_tests {
+    #![allow(
+        clippy::panic,
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing
+    )]
+
+    use super::*;
+
+    fn take(buf: *mut PcBuffer) -> Vec<u8> {
+        PcBuffer::into_vec(buf).unwrap_or_else(|| panic!("missing bridge result"))
+    }
+
+    fn call(buf: *mut PcBuffer, context: &str) -> Value {
+        serde_json::from_slice(&take(buf))
+            .unwrap_or_else(|e| panic!("{context}: invalid JSON: {e}"))
+    }
+
+    fn ok(buf: *mut PcBuffer, context: &str) -> Value {
+        let value = call(buf, context);
+        assert_eq!(value["ok"].as_bool(), Some(true), "{context}: {value}");
+        value
+    }
+
+    fn fail(buf: *mut PcBuffer, context: &str, message: &str) -> Value {
+        let value = call(buf, context);
+        assert_eq!(value["ok"].as_bool(), Some(false), "{context}: {value}");
+        assert!(
+            value["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(message),
+            "{context}: {value}"
+        );
+        value
+    }
+
+    struct Fixture {
+        session: *mut Session,
+        doc: u64,
+        background: u64,
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            pc_session_free(self.session);
+        }
+    }
+
+    impl Fixture {
+        fn new(width: u32, height: u32) -> Self {
+            let session = pc_session_new();
+            let created = ok(
+                pc_document_new(session, width, height, b"regression".as_ptr(), 10),
+                "new document",
+            );
+            let doc = created["data"]["id"].as_u64().expect("document id");
+            let info = ok(pc_info(session, doc), "document info");
+            let background = info["data"]["layers"][0]["id"]
+                .as_u64()
+                .expect("background id");
+            Self {
+                session,
+                doc,
+                background,
+            }
+        }
+
+        fn info(&self) -> Value {
+            ok(pc_info(self.session, self.doc), "document info")
+        }
+
+        fn revision(&self) -> u64 {
+            ok(pc_revision(self.session, self.doc), "revision")["data"]["revision"]
+                .as_u64()
+                .expect("revision value")
+        }
+
+        fn history(&self) -> Value {
+            ok(pc_history(self.session, self.doc), "history")
+        }
+
+        fn layer_ids(&self) -> Vec<u64> {
+            // SAFETY: tests exclusively own this session and make no concurrent calls.
+            let session = unsafe { &*self.session };
+            let entry = session.entry(self.doc).expect("document entry");
+            let entry = entry.read().unwrap_or_else(|e| e.into_inner());
+            entry.doc.layers.iter().map(|layer| layer.id.0).collect()
+        }
+
+        fn position(&self, layer: u64) -> usize {
+            self.layer_ids()
+                .iter()
+                .position(|id| *id == layer)
+                .expect("layer position")
+        }
+
+        fn state(&self) -> (Value, u64, Value) {
+            (self.info(), self.revision(), self.history())
+        }
+    }
+
+    #[test]
+    fn preview_reports_scaled_and_unscaled_dimensions() {
+        for (width, height, side, expected) in [
+            (80, 40, 20, (20, 10)),
+            (40, 80, 20, (10, 20)),
+            (32, 24, 64, (32, 24)),
+        ] {
+            let fixture = Fixture::new(width, height);
+            let mut rendered_width = 0u32;
+            let mut rendered_height = 0u32;
+            let meta = ok(
+                pc_preview_size(
+                    fixture.session,
+                    fixture.doc,
+                    side,
+                    &mut rendered_width,
+                    &mut rendered_height,
+                ),
+                "preview size",
+            );
+            assert_eq!(
+                meta["data"]["width"].as_u64(),
+                Some(expected.0),
+                "planned width"
+            );
+            assert_eq!(
+                meta["data"]["height"].as_u64(),
+                Some(expected.1),
+                "planned height"
+            );
+            let mut bytes = vec![0u8; 8 + expected.0 as usize * expected.1 as usize * 4];
+            ok(
+                pc_preview(fixture.session, fixture.doc, side, bytes.as_mut_ptr(), bytes.len()),
+                "preview",
+            );
+            assert_eq!(u64::from(rendered_width), expected.0);
+            assert_eq!(u64::from(rendered_height), expected.1);
+            assert_eq!(&bytes[..4], &(expected.0 as u32).to_le_bytes());
+            assert_eq!(&bytes[4..8], &(expected.1 as u32).to_le_bytes());
+            assert!(bytes[8..].iter().all(|byte| *byte == 255), "white preview");
+        }
+        let fixture = Fixture::new(16, 16);
+        let mut untouched = [0x5au8; 8];
+        fail(
+            pc_preview(fixture.session, fixture.doc, 16, untouched.as_mut_ptr(), 4),
+            "undersized preview output",
+            "buffer is too small",
+        );
+        assert!(untouched.iter().all(|byte| *byte == 0x5a));
+    }
+
+    #[test]
+    fn levels_and_curves_round_trip_render_and_undo() {
+        let fixture = Fixture::new(4, 4);
+        let levels = br#"{
+            "master":{"inBlack":0.2,"inWhite":0.8,"gamma":2.0,"outBlack":0.1,"outWhite":0.9},
+            "perChannel":[
+                {"inBlack":0,"inWhite":1,"gamma":1,"outBlack":0,"outWhite":0.5},
+                {"inBlack":0,"inWhite":1,"gamma":1,"outBlack":0,"outWhite":1},
+                {"inBlack":0,"inWhite":1,"gamma":1,"outBlack":0,"outWhite":1}
+            ],
+            "space":"rgb",
+            "black":{"inBlack":0,"inWhite":1,"gamma":1,"outBlack":0,"outWhite":1}
+        }"#;
+        let added = ok(
+            pc_adjustment_add(fixture.session, fixture.doc, b"levels".as_ptr(), 6, levels.as_ptr(), levels.len()),
+            "add levels",
+        );
+        let layer = added["data"]["layerId"].as_u64().expect("levels layer id");
+        let read = ok(pc_adjustment_get(fixture.session, fixture.doc, layer), "read levels");
+        assert_eq!(read["data"]["type"], "levels");
+        assert_eq!(read["data"]["master"]["gamma"], 2.0);
+        assert_eq!(read["data"]["perChannel"][0]["outWhite"], 0.5);
+        assert_eq!(read["data"]["space"], "rgb");
+
+        let update = br#"{
+            "master":{"inBlack":0,"inWhite":1,"gamma":1,"outBlack":0.25,"outWhite":0.5},
+            "perChannel":[
+                {"inBlack":0,"inWhite":1,"gamma":1,"outBlack":0,"outWhite":1},
+                {"inBlack":0,"inWhite":1,"gamma":1,"outBlack":0,"outWhite":1},
+                {"inBlack":0,"inWhite":1,"gamma":1,"outBlack":0,"outWhite":1}
+            ],
+            "space":"rgb"
+        }"#;
+        ok(
+            pc_adjustment_update(fixture.session, fixture.doc, layer, update.as_ptr(), update.len()),
+            "update levels",
+        );
+        let mut rendered = std::ptr::null_mut();
+        ok(pc_render_pixels(fixture.session, fixture.doc, 0, 0, 1, 1, &mut rendered), "render levels");
+        let pixels = take(rendered);
+        assert_eq!(pixels.len(), 4);
+        assert!((i32::from(pixels[0]) - 128).abs() <= 1, "levels output range: {pixels:?}");
+        assert!((i32::from(pixels[1]) - 128).abs() <= 1, "levels output range: {pixels:?}");
+        assert!((i32::from(pixels[2]) - 128).abs() <= 1, "levels output range: {pixels:?}");
+
+        ok(pc_undo(fixture.session, fixture.doc), "undo levels update");
+        let restored = ok(pc_adjustment_get(fixture.session, fixture.doc, layer), "read restored levels");
+        assert_eq!(restored["data"]["master"]["gamma"], 2.0);
+        ok(pc_redo(fixture.session, fixture.doc), "redo levels update");
+        let redone = ok(pc_adjustment_get(fixture.session, fixture.doc, layer), "read redone levels");
+        assert_eq!(redone["data"]["master"]["outWhite"], 0.5);
+
+        let curves = br#"{
+            "master":[{"input":0,"output":0},{"input":1,"output":1}],
+            "perChannel":[
+                [{"input":0,"output":0},{"input":1,"output":0}],
+                [{"input":0,"output":0},{"input":1,"output":1}],
+                [{"input":0,"output":0},{"input":1,"output":1}]
+            ],
+            "space":"rgb",
+            "pencil":false
+        }"#;
+        let added = ok(
+            pc_adjustment_add(fixture.session, fixture.doc, b"curves".as_ptr(), 6, curves.as_ptr(), curves.len()),
+            "add curves",
+        );
+        let curve_layer = added["data"]["layerId"].as_u64().expect("curves layer id");
+        let read = ok(pc_adjustment_get(fixture.session, fixture.doc, curve_layer), "read curves");
+        assert_eq!(read["data"]["type"], "curves");
+        assert_eq!(read["data"]["perChannel"][0][1]["output"], 0.0);
+        assert_eq!(read["data"]["pencil"], false);
+        let mut rendered = std::ptr::null_mut();
+        ok(pc_render_pixels(fixture.session, fixture.doc, 0, 0, 1, 1, &mut rendered), "render curves");
+        let pixels = take(rendered);
+        assert_eq!(pixels[0], 0, "red curve must run before master: {pixels:?}");
+        assert_eq!(pixels[1], 128, "green curve preserves the Levels master output: {pixels:?}");
+        assert_eq!(pixels[2], 128, "blue curve preserves the Levels master output: {pixels:?}");
+    }
+
+    #[test]
+    fn invalid_levels_and_curves_leave_document_unchanged() {
+        let fixture = Fixture::new(8, 8);
+        let before = fixture.state();
+        let invalid_levels = [
+            (r#"{"master":{"inBlack":0.8,"inWhite":0.2}}"#, "inBlack must be less than inWhite"),
+            (r#"{"master":{"gamma":0}}"#, "gamma must be between"),
+            (r#"{"master":{"outBlack":0.8,"outWhite":0.2}}"#, "outBlack must not exceed"),
+            (r#"{"master":{"inBlack":2}}"#, "inBlack must be between"),
+            (r#"{"master":null}"#, "levels channel must be an object"),
+            (r#"{"perChannel":[{},{}]}"#, "perChannel must contain three"),
+            (r#"{"space":"unknown"}"#, "space must be"),
+            (r#"{"space":null}"#, "space must be"),
+            (r#"{"master":{"gamma":3.5e38}}"#, "gamma must be a finite number"),
+        ];
+        for (payload, expected) in invalid_levels {
+            fail(
+                pc_adjustment_add(fixture.session, fixture.doc, b"levels".as_ptr(), 6, payload.as_ptr(), payload.len()),
+                "invalid levels",
+                expected,
+            );
+            assert_eq!(fixture.state(), before);
+        }
+        let invalid_curves = [
+            (r#"{"master":[{"input":0.5,"output":0}]}"#, "at least two points"),
+            (r#"{"master":[{"input":0.5,"output":0},{"input":0.5,"output":1}]}"#, "strictly increasing"),
+            (r#"{"master":[{"input":0.5,"output":0},{"input":0.5000000001,"output":1}]}"#, "strictly increasing"),
+            (r#"{"master":[{"input":0,"output":2},{"input":1,"output":1}]}"#, "between 0 and 1"),
+            (r#"{"master":[{"input":0,"output":0},{"output":1}]}"#, "input must be a finite number"),
+            (r#"{"perChannel":[{},{}]}"#, "perChannel must contain three"),
+            (r#"{"pencil":1}"#, "pencil must be a boolean"),
+        ];
+        for (payload, expected) in invalid_curves {
+            fail(
+                pc_adjustment_add(fixture.session, fixture.doc, b"curves".as_ptr(), 6, payload.as_ptr(), payload.len()),
+                "invalid curves",
+                expected,
+            );
+            assert_eq!(fixture.state(), before);
+        }
+
+        let added = ok(
+            pc_adjustment_add(fixture.session, fixture.doc, b"levels".as_ptr(), 6, b"{}".as_ptr(), 2),
+            "add default levels",
+        );
+        let layer = added["data"]["layerId"].as_u64().expect("levels layer id");
+        let before = fixture.state();
+        let invalid_update = br#"{"master":{"gamma":0}}"#;
+        fail(
+            pc_adjustment_update(fixture.session, fixture.doc, layer, invalid_update.as_ptr(), invalid_update.len()),
+            "invalid levels update",
+            "gamma",
+        );
+        assert_eq!(fixture.state(), before);
+    }
+
+    #[test]
+    fn painting_new_layer_undo_restores_original_layer_count() {
+        let fixture = Fixture::new(64, 64);
+        let brush = br#"{"size":8,"pressureSize":false,"color":[1,0,0,1]}"#;
+        let points = br#"[{"x":16,"y":16,"pressure":1}]"#;
+        let painted = ok(
+            pc_paint_stroke(
+                fixture.session,
+                fixture.doc,
+                0,
+                brush.as_ptr(),
+                brush.len(),
+                points.as_ptr(),
+                points.len(),
+            ),
+            "paint new layer",
+        );
+        let layer = painted["data"]["layerId"].as_u64().expect("paint layer id");
+        assert_eq!(fixture.layer_ids(), vec![fixture.background, layer]);
+
+        ok(pc_undo(fixture.session, fixture.doc), "undo paint");
+        assert_eq!(fixture.layer_ids(), vec![fixture.background]);
+        ok(pc_redo(fixture.session, fixture.doc), "redo paint");
+        assert_eq!(fixture.layer_ids(), vec![fixture.background, layer]);
+    }
+
+    #[test]
+    fn deleting_missing_layer_leaves_history_unchanged() {
+        let fixture = Fixture::new(64, 64);
+        let before = fixture.state();
+        fail(
+            pc_layer_delete(fixture.session, fixture.doc, u64::MAX),
+            "delete missing layer",
+            "layer not found",
+        );
+        assert_eq!(fixture.state(), before);
+    }
+
+    #[test]
+    fn invalid_adjustment_payloads_leave_document_unchanged() {
+        let fixture = Fixture::new(64, 64);
+        let before = fixture.state();
+        for payload in ["{", "17", "null", "[]"] {
+            let message = if payload == "{" {
+                "invalid adjustment parameters"
+            } else {
+                "must be an object"
+            };
+            fail(
+                pc_adjustment_add(
+                    fixture.session,
+                    fixture.doc,
+                    b"exposure".as_ptr(),
+                    8,
+                    payload.as_ptr(),
+                    payload.len(),
+                ),
+                "add invalid adjustment",
+                message,
+            );
+            assert_eq!(fixture.state(), before);
+        }
+
+        let valid = br#"{"exposure":0.25}"#;
+        let added = ok(
+            pc_adjustment_add(
+                fixture.session,
+                fixture.doc,
+                b"exposure".as_ptr(),
+                8,
+                valid.as_ptr(),
+                valid.len(),
+            ),
+            "add valid adjustment",
+        );
+        let layer = added["data"]["layerId"].as_u64().expect("adjustment id");
+        let params = ok(
+            pc_adjustment_get(fixture.session, fixture.doc, layer),
+            "adjustment params",
+        );
+        let before = fixture.state();
+        for payload in ["{", "17", "null", "[]"] {
+            let message = if payload == "{" {
+                "invalid adjustment parameters"
+            } else {
+                "must be an object"
+            };
+            fail(
+                pc_adjustment_update(
+                    fixture.session,
+                    fixture.doc,
+                    layer,
+                    payload.as_ptr(),
+                    payload.len(),
+                ),
+                "update invalid adjustment",
+                message,
+            );
+            assert_eq!(fixture.state(), before);
+            assert_eq!(
+                ok(
+                    pc_adjustment_get(fixture.session, fixture.doc, layer),
+                    "adjustment params"
+                ),
+                params
+            );
+        }
+    }
+
+    #[test]
+    fn layer_move_clamps_extreme_deltas_without_history_side_effects() {
+        let fixture = Fixture::new(64, 64);
+        let duplicated = ok(
+            pc_layer_duplicate(fixture.session, fixture.doc, fixture.background),
+            "duplicate layer",
+        );
+        let layer = duplicated["data"]["layerId"]
+            .as_u64()
+            .expect("duplicated layer id");
+        let revision = fixture.revision();
+        ok(
+            pc_layer_move(fixture.session, fixture.doc, layer, i32::MIN),
+            "move to bottom",
+        );
+        assert_eq!(fixture.position(layer), 0);
+        assert_eq!(fixture.revision(), revision + 1);
+
+        let revision = fixture.revision();
+        ok(
+            pc_layer_move(fixture.session, fixture.doc, layer, i32::MAX),
+            "move to top",
+        );
+        assert_eq!(fixture.position(layer), fixture.layer_ids().len() - 1);
+        assert_eq!(fixture.revision(), revision + 1);
+
+        let revision = fixture.revision();
+        ok(
+            pc_layer_move(fixture.session, fixture.doc, layer, i32::MIN),
+            "move to bottom",
+        );
+        assert_eq!(fixture.position(layer), 0);
+        assert_eq!(fixture.revision(), revision + 1);
+
+        let before = fixture.state();
+        fail(
+            pc_layer_move(fixture.session, fixture.doc, layer, i32::MIN),
+            "move past bottom",
+            "already at the edge",
+        );
+        assert_eq!(fixture.state(), before);
+    }
+
+    #[test]
+    fn rejected_and_noop_canvas_operations_preserve_history() {
+        let fixture = Fixture::new(64, 64);
+        let before = fixture.state();
+        fail(
+            pc_document_crop(fixture.session, fixture.doc, 80, 80, 100, 100),
+            "crop outside document",
+            "outside the document",
+        );
+        assert_eq!(fixture.state(), before);
+
+        fail(
+            pc_document_resize_canvas(fixture.session, fixture.doc, 0, 64, 0),
+            "zero width",
+            "invalid canvas size",
+        );
+        assert_eq!(fixture.state(), before);
+        let side = photocraft_doc::canvas::MAX_CANVAS_SIDE as i32;
+        let too_tall = (photocraft_doc::canvas::MAX_CANVAS_PIXELS
+            / u64::from(photocraft_doc::canvas::MAX_CANVAS_SIDE)
+            + 1) as i32;
+        fail(
+            pc_document_resize_canvas(fixture.session, fixture.doc, side, too_tall, 0),
+            "oversized canvas",
+            "canvas is too large",
+        );
+        assert_eq!(fixture.state(), before);
+
+        ok(
+            pc_document_crop(fixture.session, fixture.doc, 0, 0, 64, 64),
+            "noop crop",
+        );
+        assert_eq!(fixture.state(), before);
+        ok(
+            pc_document_resize_canvas(fixture.session, fixture.doc, 64, 64, 0),
+            "noop resize",
+        );
+        assert_eq!(fixture.state(), before);
+    }
+}
+
 mod concurrency_tests {
     //! Session 线程安全契约：纯读并发、写串行、close 竞态（NAPI 异步化前置）。
     #![allow(clippy::panic, clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]

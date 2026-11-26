@@ -92,16 +92,33 @@ fn normalize_rect(r: Rect) -> Rect {
 }
 
 impl Document {
+    /// 规范化裁剪矩形并与当前画布求交；不修改文档。
+    pub fn crop_target(&self, keep: Rect) -> Result<Rect, String> {
+        let target = normalize_rect(keep).intersect(&self.bounds());
+        if target.is_empty() {
+            return Err("crop rectangle is outside the document".to_string());
+        }
+        Ok(target)
+    }
+
+    /// 校验目标画布尺寸；不修改文档。
+    pub fn validate_canvas_size(width: u32, height: u32) -> Result<(), String> {
+        if width == 0 || height == 0 || width > MAX_CANVAS_SIDE || height > MAX_CANVAS_SIDE {
+            return Err("invalid canvas size".to_string());
+        }
+        if u64::from(width) * u64::from(height) > MAX_CANVAS_PIXELS {
+            return Err("canvas is too large".to_string());
+        }
+        Ok(())
+    }
+
     /// 裁剪到 `keep`（文档坐标，`x1`/`y1` 独占语义与 `Rect` 一致）。
     ///
     /// 校验顺序：先规范化（若 `x0>x1` / `y0>y1` 则交换）→ 与 `self.bounds()` 求交 → 判空。
     /// 返回 `Ok(true)` = 已变更（调用方才可 checkpoint）；`Ok(false)` = 无变化（不 checkpoint）；
     /// `Err(msg)` = 非法参数，**文档保证完全未被修改**。
     pub fn crop_to(&mut self, keep: Rect) -> Result<bool, String> {
-        let target = normalize_rect(keep).intersect(&self.bounds());
-        if target.is_empty() {
-            return Err("crop rectangle is outside the document".to_string());
-        }
+        let target = self.crop_target(keep)?;
         if target == self.bounds() {
             // 与当前画布完全一致：无变化，不 checkpoint。
             return Ok(false);
@@ -115,12 +132,7 @@ impl Document {
     /// 校验：`w`/`h` ∈ `1..=MAX_CANVAS_SIDE` 且 `w*h <= MAX_CANVAS_PIXELS`。返回语义同
     /// [`Self::crop_to`]（目标尺寸与当前相同 => `Ok(false)`）。扩展区为透明（默认像素）。
     pub fn resize_canvas(&mut self, width: u32, height: u32, anchor: CanvasAnchor) -> Result<bool, String> {
-        if width == 0 || height == 0 || width > MAX_CANVAS_SIDE || height > MAX_CANVAS_SIDE {
-            return Err("invalid canvas size".to_string());
-        }
-        if u64::from(width) * u64::from(height) > MAX_CANVAS_PIXELS {
-            return Err("canvas is too large".to_string());
-        }
+        Self::validate_canvas_size(width, height)?;
         if width == self.size.width && height == self.size.height {
             return Ok(false);
         }

@@ -1,7 +1,13 @@
+#include <algorithm>
+#include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
+#include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 
@@ -26,13 +32,19 @@ PcBuffer *pc_undo_steps(void *session, uint64_t id, uint32_t steps);
 PcBuffer *pc_redo_steps(void *session, uint64_t id, uint32_t steps);
 PcBuffer *pc_close(void *session, uint64_t id);
 PcBuffer *pc_info(void *session, uint64_t id);
-PcBuffer *pc_preview(void *session, uint64_t id, uint32_t max_side, PcBuffer **out);
+PcBuffer *pc_preview_size(void *session, uint64_t id, uint32_t max_side, uint32_t *width, uint32_t *height);
+PcBuffer *pc_preview(void *session, uint64_t id, uint32_t max_side, uint8_t *out, size_t capacity);
 PcBuffer *pc_layer_thumbnail(void *session, uint64_t id, uint64_t layer, uint32_t side, PcBuffer **out);
 PcBuffer *pc_render(void *session, uint64_t id, int32_t x, int32_t y, int32_t w, int32_t h, PcBuffer **out);
 PcBuffer *pc_paint_stroke(void *session, uint64_t id, uint64_t layer, const uint8_t *params, size_t params_len, const uint8_t *points, size_t points_len);
 PcBuffer *pc_select(void *session, uint64_t id, const uint8_t *params, size_t params_len);
 PcBuffer *pc_selection_info(void *session, uint64_t id);
+using PcFilterCancel = bool (*)(void *context);
+using PcFilterProgress = void (*)(void *context, float fraction);
+using PcFilterCommit = bool (*)(void *context);
 PcBuffer *pc_filter_apply(void *session, uint64_t id, uint64_t layer, const uint8_t *params, size_t params_len);
+PcBuffer *pc_filter_apply_with(void *session, uint64_t id, uint64_t layer, const uint8_t *params, size_t params_len,
+                               PcFilterCancel cancel, PcFilterProgress progress, PcFilterCommit commit, void *context);
 PcBuffer *pc_shape_create(void *session, uint64_t id, const uint8_t *params, size_t params_len);
 PcBuffer *pc_vector_path_create(void *session, uint64_t id, const uint8_t *params, size_t params_len);
 PcBuffer *pc_vector_path_edit(void *session, uint64_t id, const uint8_t *params, size_t params_len);
@@ -63,7 +75,10 @@ PcBuffer *pc_redo(void *session, uint64_t id);
 PcBuffer *pc_export(void *session, uint64_t id, const uint8_t *format, size_t format_len, uint8_t quality, PcBuffer **out);
 PcBuffer *pc_layer_effects_get(void *session, uint64_t id, uint64_t layer);
 PcBuffer *pc_layer_effects_apply(void *session, uint64_t id, uint64_t layer, const uint8_t *params, size_t params_len);
+PcBuffer *pc_layer_effects_apply_batch(void *session, uint64_t id, uint64_t layer, const uint8_t *params, size_t params_len);
 PcBuffer *pc_render_pixels(void *session, uint64_t id, int32_t x, int32_t y, int32_t w, int32_t h, PcBuffer **out);
+PcBuffer *pc_histogram(void *session, uint64_t id);
+PcBuffer *pc_metadata(void *session, uint64_t id);
 PcBuffer *pc_revision(void *session, uint64_t id);
 PcBuffer *pc_layer_mask_get(void *session, uint64_t id, uint64_t layer);
 PcBuffer *pc_layer_mask_add(void *session, uint64_t id, uint64_t layer, const uint8_t *fill, size_t fill_len);
@@ -189,17 +204,19 @@ napi_value MakeArrayBuffer(napi_env env, PcBuffer *buffer) {
 
 uint64_t GetU64(napi_env env, napi_value value) {
     double number = 0;
-    if (napi_get_value_double(env, value, &number) == napi_ok) {
+    if (napi_get_value_double(env, value, &number) == napi_ok &&
+        std::isfinite(number) && number >= 0.0 && number < 18446744073709551616.0) {
         return static_cast<uint64_t>(number);
     }
     int64_t big = 0;
-    if (napi_get_value_int64(env, value, &big) == napi_ok) {
+    if (napi_get_value_int64(env, value, &big) == napi_ok && big >= 0) {
         return static_cast<uint64_t>(big);
     }
     return 0;
 }
 
-enum class AsyncOp { Open, Export, Filter, Cutout, CopyVisible };
+enum class AsyncOp { Open, Export, Filter, Cutout, CopyVisible, Histogram };
+struct FilterJobState;
 
 // 入参在 JS 线程拷入，execute 线程只调 pc_*（Session 已线程安全），complete 回 JS 线程 resolve/reject。
 struct AsyncWork {
@@ -208,6 +225,7 @@ struct AsyncWork {
     napi_async_work work = nullptr;
     uint64_t id = 0;
     uint64_t layer = 0;
+    uint64_t job = 0;
     uint8_t quality = 90;
     std::string name;
     std::string params;
@@ -215,7 +233,59 @@ struct AsyncWork {
     std::vector<uint8_t> data;
     std::string result;
     PcBuffer *bytes = nullptr;
+    std::shared_ptr<FilterJobState> filterJob;
 };
+
+struct FilterJobState {
+    // 0 running, 1 cancelled, 2 commit gate won; cancel and commit race on this state.
+    std::atomic<uint32_t> phase{0};
+    std::atomic<uint32_t> progressPermille{0};
+};
+
+std::mutex g_filterJobsMutex;
+std::unordered_map<uint64_t, std::shared_ptr<FilterJobState>> g_filterJobs;
+uint32_t g_nextFilterJob = 1;
+
+std::shared_ptr<FilterJobState> RegisterFilterJob(uint64_t &job) {
+    std::lock_guard<std::mutex> lock(g_filterJobsMutex);
+    if (g_nextFilterJob == 0) {
+        return nullptr;
+    }
+    job = g_nextFilterJob++;
+    auto state = std::make_shared<FilterJobState>();
+    g_filterJobs.emplace(job, state);
+    return state;
+}
+
+void UnregisterFilterJob(uint64_t job) {
+    if (job == 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_filterJobsMutex);
+    g_filterJobs.erase(job);
+}
+
+bool FilterCancelCallback(void *context) {
+    return static_cast<FilterJobState *>(context)->phase.load(std::memory_order_acquire) != 0;
+}
+
+bool FilterCommitCallback(void *context) {
+    auto *phase = &static_cast<FilterJobState *>(context)->phase;
+    uint32_t running = 0;
+    return phase->compare_exchange_strong(running, 2, std::memory_order_acq_rel, std::memory_order_acquire);
+}
+
+void FilterProgressCallback(void *context, float fraction) {
+    if (!std::isfinite(fraction)) {
+        return;
+    }
+    fraction = std::max(0.0f, std::min(1.0f, fraction));
+    auto value = static_cast<uint32_t>(fraction * 1000.0f + 0.5f);
+    auto *progress = &static_cast<FilterJobState *>(context)->progressPermille;
+    auto current = progress->load(std::memory_order_acquire);
+    while (current < value && !progress->compare_exchange_weak(current, value, std::memory_order_release, std::memory_order_acquire)) {
+    }
+}
 
 void AsyncExecute(napi_env env, void *data) {
     AsyncWork *w = static_cast<AsyncWork *>(data);
@@ -230,8 +300,9 @@ void AsyncExecute(napi_env env, void *data) {
                                              w->quality, &w->bytes));
             break;
         case AsyncOp::Filter:
-            w->result = TakeString(pc_filter_apply(session, w->id, w->layer,
-                                                   reinterpret_cast<const uint8_t *>(w->params.data()), w->params.size()));
+            w->result = TakeString(pc_filter_apply_with(session, w->id, w->layer,
+                                                          reinterpret_cast<const uint8_t *>(w->params.data()), w->params.size(),
+                                                          FilterCancelCallback, FilterProgressCallback, FilterCommitCallback, w->filterJob.get()));
             break;
         case AsyncOp::Cutout:
             w->result = TakeString(pc_cutout_remove_background(session, w->id,
@@ -240,11 +311,17 @@ void AsyncExecute(napi_env env, void *data) {
         case AsyncOp::CopyVisible:
             w->result = TakeString(pc_copy_visible(session, w->id));
             break;
+        case AsyncOp::Histogram:
+            w->result = TakeString(pc_histogram(session, w->id));
+            break;
     }
 }
 
 void AsyncComplete(napi_env env, napi_status status, void *data) {
     AsyncWork *w = static_cast<AsyncWork *>(data);
+    if (w->op == AsyncOp::Filter) {
+        UnregisterFilterJob(w->job);
+    }
     auto reject = [&](const std::string &message) {
         napi_value error = nullptr;
         napi_create_string_utf8(env, message.c_str(), message.size(), &error);
@@ -288,9 +365,15 @@ void AsyncComplete(napi_env env, napi_status status, void *data) {
 }
 
 napi_value QueueAsync(napi_env env, AsyncWork *w) {
+    auto discard = [&] {
+        if (w->op == AsyncOp::Filter) {
+            UnregisterFilterJob(w->job);
+        }
+        delete w;
+    };
     napi_value promise = nullptr;
     if (napi_create_promise(env, &w->deferred, &promise) != napi_ok) {
-        delete w;
+        discard();
         return Throw(env, "could not create a promise");
     }
     napi_value resource_name = nullptr;
@@ -299,10 +382,17 @@ napi_value QueueAsync(napi_env env, AsyncWork *w) {
         napi_value error = nullptr;
         napi_create_string_utf8(env, "could not create async work", NAPI_AUTO_LENGTH, &error);
         napi_reject_deferred(env, w->deferred, error);
-        delete w;
+        discard();
         return promise;
     }
-    napi_queue_async_work(env, w->work);
+    if (napi_queue_async_work(env, w->work) != napi_ok) {
+        napi_value error = nullptr;
+        napi_create_string_utf8(env, "could not queue async work", NAPI_AUTO_LENGTH, &error);
+        napi_reject_deferred(env, w->deferred, error);
+        napi_delete_async_work(env, w->work);
+        discard();
+        return promise;
+    }
     return promise;
 }
 
@@ -439,15 +529,31 @@ napi_value Preview(napi_env env, napi_callback_info info) {
     napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
     int32_t side = 1024;
     napi_get_value_int32(env, argv[1], &side);
-    PcBuffer *out = nullptr;
-    std::string result = TakeString(pc_preview(Session(), GetU64(env, argv[0]), static_cast<uint32_t>(side), &out));
-    if (!IsOk(result)) {
-        if (out != nullptr) {
-            pc_buffer_free(out);
-        }
-        return Throw(env, ErrorOf(result));
+    side = std::max<int32_t>(1, std::min<int32_t>(8192, side));
+    void *session = Session();
+    uint64_t document = GetU64(env, argv[0]);
+    uint32_t width = 0;
+    uint32_t height = 0;
+    std::string planned = TakeString(pc_preview_size(session, document, static_cast<uint32_t>(side), &width, &height));
+    if (!IsOk(planned)) {
+        return Throw(env, ErrorOf(planned));
     }
-    return MakeArrayBuffer(env, out);
+    uint64_t byte_length = 8 + static_cast<uint64_t>(width) * height * 4;
+    if (byte_length > std::numeric_limits<size_t>::max()) {
+        return Throw(env, "preview is too large");
+    }
+    napi_value result = nullptr;
+    void *pixels = nullptr;
+    napi_status allocated = napi_create_arraybuffer(env, static_cast<size_t>(byte_length), &pixels, &result);
+    if (allocated != napi_ok || result == nullptr) {
+        return Throw(env, "could not allocate a preview buffer");
+    }
+    std::string rendered = TakeString(pc_preview(session, document, static_cast<uint32_t>(side),
+                                                  static_cast<uint8_t *>(pixels), static_cast<size_t>(byte_length)));
+    if (!IsOk(rendered)) {
+        return Throw(env, ErrorOf(rendered));
+    }
+    return result;
 }
 
 napi_value LayerThumbnail(napi_env env, napi_callback_info info) {
@@ -524,11 +630,11 @@ napi_value SelectionInfo(napi_env env, napi_callback_info info) {
 }
 
 napi_value FilterApply(napi_env env, napi_callback_info info) {
-    size_t argc = 3;
-    napi_value argv[3] = {nullptr, nullptr, nullptr};
+    size_t argc = 4;
+    napi_value argv[4] = {nullptr, nullptr, nullptr, nullptr};
     napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
     if (argc < 3) {
-        return Throw(env, "filterApply(documentId, layerId, paramsJson) needs three arguments");
+        return Throw(env, "filterApply(documentId, layerId, paramsJson, onJobId?) needs three arguments");
     }
     AsyncWork *w = new AsyncWork();
     w->op = AsyncOp::Filter;
@@ -538,7 +644,76 @@ napi_value FilterApply(napi_env env, napi_callback_info info) {
         delete w;
         return Throw(env, "filterApply: paramsJson must be a string");
     }
+    napi_value on_job = nullptr;
+    if (argc >= 4) {
+        napi_valuetype type = napi_undefined;
+        napi_typeof(env, argv[3], &type);
+        if (type != napi_undefined && type != napi_null) {
+            if (type != napi_function) {
+                delete w;
+                return Throw(env, "filterApply: onJobId must be a function");
+            }
+            on_job = argv[3];
+        }
+    }
+    w->filterJob = RegisterFilterJob(w->job);
+    if (!w->filterJob) {
+        delete w;
+        return Throw(env, "filter job ids exhausted");
+    }
+    if (on_job != nullptr) {
+        napi_value job = nullptr;
+        napi_create_uint32(env, static_cast<uint32_t>(w->job), &job);
+        napi_value ignored = nullptr;
+        if (napi_call_function(env, nullptr, on_job, 1, &job, &ignored) != napi_ok) {
+            UnregisterFilterJob(w->job);
+            delete w;
+            return nullptr;
+        }
+    }
     return QueueAsync(env, w);
+}
+
+napi_value FilterCancel(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    uint64_t job = argc > 0 ? GetU64(env, argv[0]) : 0;
+    bool found = false;
+    {
+        std::lock_guard<std::mutex> lock(g_filterJobsMutex);
+        auto item = g_filterJobs.find(job);
+        if (item != g_filterJobs.end()) {
+            auto *phase = &item->second->phase;
+            uint32_t current = phase->load(std::memory_order_acquire);
+            if (current == 0) {
+                found = phase->compare_exchange_strong(current, 1, std::memory_order_acq_rel, std::memory_order_acquire);
+            } else {
+                found = current == 1;
+            }
+        }
+    }
+    napi_value result = nullptr;
+    napi_get_boolean(env, found, &result);
+    return result;
+}
+
+napi_value FilterProgress(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    uint64_t job = argc > 0 ? GetU64(env, argv[0]) : 0;
+    double progress = -1.0;
+    {
+        std::lock_guard<std::mutex> lock(g_filterJobsMutex);
+        auto item = g_filterJobs.find(job);
+        if (item != g_filterJobs.end()) {
+            progress = static_cast<double>(item->second->progressPermille.load(std::memory_order_acquire)) / 1000.0;
+        }
+    }
+    napi_value result = nullptr;
+    napi_create_double(env, progress, &result);
+    return result;
 }
 
 napi_value ShapeCreate(napi_env env, napi_callback_info info) {
@@ -934,6 +1109,31 @@ napi_value CopyVisible(napi_env env, napi_callback_info info) {
     return QueueAsync(env, w);
 }
 
+// 直方图统计走条带合成，耗时随画布面积增长：必须异步执行，避免大图卡住 UI 线程。
+napi_value Histogram(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    AsyncWork *w = new AsyncWork();
+    w->op = AsyncOp::Histogram;
+    w->id = GetU64(env, argv[0]);
+    return QueueAsync(env, w);
+}
+
+// 图像信息/EXIF：只读小 JSON，无像素遍历，同步调用即可。
+napi_value Metadata(napi_env env, napi_callback_info info) {
+    size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    std::string result = TakeString(pc_metadata(Session(), GetU64(env, argv[0])));
+    if (!IsOk(result)) {
+        return Throw(env, ErrorOf(result));
+    }
+    napi_value out = nullptr;
+    napi_create_string_utf8(env, result.c_str(), result.size(), &out);
+    return out;
+}
+
 napi_value LayerDeleteMany(napi_env env, napi_callback_info info) {
     size_t argc = 2;
     napi_value argv[2] = {nullptr, nullptr};
@@ -1073,6 +1273,27 @@ napi_value UpdateLayerEffect(napi_env env, napi_callback_info info) {
     }
     std::string result = TakeString(pc_layer_effects_apply(Session(), GetU64(env, argv[0]), GetU64(env, argv[1]),
                                                           reinterpret_cast<const uint8_t *>(params.data()), params.size()));
+    if (!IsOk(result)) {
+        return Throw(env, ErrorOf(result));
+    }
+    napi_value out = nullptr;
+    napi_create_string_utf8(env, result.c_str(), result.size(), &out);
+    return out;
+}
+
+napi_value UpdateLayerEffectsBatch(napi_env env, napi_callback_info info) {
+    size_t argc = 3;
+    napi_value argv[3] = {nullptr, nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+    if (argc < 3) {
+        return Throw(env, "updateLayerEffectsBatch(documentId, layerId, paramsJson) needs three arguments");
+    }
+    std::string params;
+    if (!GetString(env, argv[2], params)) {
+        return Throw(env, "updateLayerEffectsBatch: paramsJson must be a string");
+    }
+    std::string result = TakeString(pc_layer_effects_apply_batch(Session(), GetU64(env, argv[0]), GetU64(env, argv[1]),
+                                                                 reinterpret_cast<const uint8_t *>(params.data()), params.size()));
     if (!IsOk(result)) {
         return Throw(env, ErrorOf(result));
     }
@@ -1489,6 +1710,8 @@ napi_value Init(napi_env env, napi_value exports) {
         {"select", nullptr, Select, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"selectionInfo", nullptr, SelectionInfo, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"filterApply", nullptr, FilterApply, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"filterCancel", nullptr, FilterCancel, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"filterProgress", nullptr, FilterProgress, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"shapeCreate", nullptr, ShapeCreate, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"fontRegister", nullptr, FontRegister, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"textCreate", nullptr, TextCreate, nullptr, nullptr, nullptr, napi_default, nullptr},
@@ -1512,6 +1735,8 @@ napi_value Init(napi_env env, napi_value exports) {
         {"deleteLayer", nullptr, LayerDelete, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"layerDeleteMany", nullptr, LayerDeleteMany, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"copyVisible", nullptr, CopyVisible, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"histogram", nullptr, Histogram, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"metadata", nullptr, Metadata, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"addAdjustment", nullptr, AdjustmentAdd, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"updateAdjustment", nullptr, AdjustmentUpdate, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"getAdjustment", nullptr, AdjustmentGet, nullptr, nullptr, nullptr, napi_default, nullptr},
@@ -1520,6 +1745,7 @@ napi_value Init(napi_env env, napi_value exports) {
         {"exportImage", nullptr, ExportImage, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"layerEffects", nullptr, LayerEffects, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"updateLayerEffect", nullptr, UpdateLayerEffect, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"updateLayerEffectsBatch", nullptr, UpdateLayerEffectsBatch, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"renderPixels", nullptr, RenderPixels, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"revision", nullptr, Revision, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"computeProfile", nullptr, ComputeProfile, nullptr, nullptr, nullptr, napi_default, nullptr},

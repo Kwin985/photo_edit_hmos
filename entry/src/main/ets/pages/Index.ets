@@ -6,7 +6,7 @@ import { preferences, uniformTypeDescriptor as utd } from '@kit.ArkData';
 import { bundleManager, common } from '@kit.AbilityKit';
 import { deviceInfo } from '@kit.BasicServicesKit';
 import { systemShare } from '@kit.ShareKit';
-import { Engine, DocumentInfo, LayerInfo, AdjustmentInfo, SelectionInfo, emptyAdjustment, flattenLayers, visibleRectLeavesTile, LayerEffectInfo, LayerEffectsInfo, FxGradientInfo, FxGradientStop, LayerEditInfo, LayerMaskInfo, GuidesInfo, CutoutOutcome } from '../engine/Engine';
+import { Engine, DocumentInfo, LayerInfo, AdjustmentInfo, LevelsAdjustmentInfo, LevelsChannelInfo, CurvesAdjustmentInfo, CurvePointInfo, SelectionInfo, HistogramInfo, ImageMetadataInfo, emptyAdjustment, flattenLayers, visibleRectLeavesTile, LayerEffectInfo, LayerEffectsInfo, FxGradientInfo, FxGradientStop, LayerEditInfo, LayerMaskInfo, GuidesInfo, CutoutOutcome, identityLevelsChannel, identityCurve, defaultLevelsAdjustment, defaultCurvesAdjustment, normalizeCurvePoints, curveSamples } from '../engine/Engine';
 import { FilterDef, FilterParamDef, FILTER_GROUPS, FILTERS, filtersInGroup, findFilter, buildFilterArgs } from '../engine/FilterCatalog';
 import { GalleryParamDef, GalleryPresetDef, GALLERY_CATEGORIES, GALLERY_PRESETS, galleryPresetsInCategory, findGalleryPreset, buildGalleryArgs } from '../engine/GalleryCatalog';
 
@@ -34,6 +34,11 @@ const COLOR_SHAPE_ACCENT: string = '#6366f1';
 const COLOR_TYPE_CARD: string = '#1b2a10';
 const COLOR_TYPE_ACCENT: string = '#84cc16';
 const BRUSH_COLORS: string[] = ['#ffffff', '#111827', '#e5484d', '#f5a524', '#30a46c', '#3b82f6', '#8b5cf6'];
+// 裁剪比例预设（对标 GIMP / ImageToolbox 的宽高比锁定）：0 = 自由，其余为 宽/高。
+const CROP_ASPECT_LABELS: string[] = ['自由', '1:1', '4:3', '3:4', '16:9', '9:16'];
+const CROP_ASPECT_VALUES: number[] = [0, 1, 4 / 3, 3 / 4, 16 / 9, 9 / 16];
+/** 最近取色最多保留 8 个（与固定色板同尺寸，避免面板换行）。 */
+const RECENT_COLOR_LIMIT: number = 8;
 
 // 首选项存储（R2）：单实例名 + 四个键，读写全部走同步 API 并静默失败。
 const PREFS_NAME: string = 'artsphoto_prefs';
@@ -43,6 +48,9 @@ const PREF_KEY_GUIDES: string = 'guides';
 const PREF_KEY_DEFAULT_ZOOM: string = 'defaultZoom';
 const PREF_KEY_RECENT_FILES: string = 'recentFiles';
 const PREF_KEY_FX_PRESETS: string = 'fxPresets';
+const PREF_KEY_PALETTES: string = 'palettes';
+/** 最多保存 12 个命名色板（与最近颜色 8 个色点/行同量级）。 */
+const MAX_PALETTES: number = 12;
 
 
 const PERF_DOMAIN: number = 0x0A01;
@@ -57,6 +65,10 @@ const DETAIL_MARGIN: number = 0.12;
 // detail 渲染区域的网格对齐粒度（见 renderDetail）：区域边界对齐到该格后，
 // 平移/缩放不足一格时缓存键保持不变，可直接命中已缓存的像素字节。
 const DETAIL_TILE: number = 256;
+// C-COMPARE-UI@1：对比快照尺寸上限（4000×4000，与引擎大图档一致）；超限文档禁用对比按钮。
+const COMPARE_MAX_PIXELS: number = 16384000;
+// 打开文档后延迟保存原始快照的间隔：避开打开首帧渲染与缩略图队列的竞争。
+const COMPARE_SNAPSHOT_DELAY_MS: number = 500;
 // 左上角悬浮缩放工具条（.position({ x: 12, y: 12 })）的命中矩形：
 // 该区域内的触摸不交给画布，否则画笔工具下点「适应」「1:1」会误落一笔并让文档版本号递增。
 const ZOOM_BAR_RIGHT: number = 330;
@@ -107,6 +119,8 @@ interface AdjustPatch {
   lightness?: number;
   levels?: number;
   level?: number;
+  levelsData?: LevelsAdjustmentInfo;
+  curvesData?: CurvesAdjustmentInfo;
 }
 
 // 图层二次编辑 apply 请求参数（C-EDIT-UI@1 §A）：键名与 C-EDIT-API@1 的 EditParams 逐字一致；
@@ -246,6 +260,12 @@ interface FxPreset {
   data: LayerEffectsInfo;
 }
 
+/** 命名调色板（GIMP/Krita 色板的最小可用形态）：名称 + 最多 8 个十六进制颜色。 */
+interface SavedPalette {
+  name: string;
+  colors: string[];
+}
+
 const FX_CARD_BG: string = '#1b2836';
 const FX_GROUP_BG: string = '#22303f';
 const FX_GROUP_ACTIVE_BG: string = '#2a3d55';
@@ -297,7 +317,16 @@ struct Index {
   @State layers: LayerInfo[] = [];
   @State selectedLayerId: number = 0;
   @State pixelMap: image.PixelMap | undefined = undefined;
+  // C-COMPARE-UI@1：对比态 UI 开关。compareActive 控制画布手势拦截与按钮高亮，
+  // compareReady 表示原始快照已就绪（快照在文档装载完成 500ms 后异步生成，需要触发按钮态刷新），
+  // compareFit 兼容「画布被裁剪/扩展后快照尺寸≠当前画布尺寸」的显示（Contain 保持原图比例）。
+  @State compareActive: boolean = false;
+  @State compareReady: boolean = false;
+  @State compareFit: ImageFit = ImageFit.Fill;
   @State adjust: AdjustmentInfo = emptyAdjustment();
+  @State levelsChannel: number = 0;
+  @State curvesChannel: number = 0;
+  @State curvesPointIndex: number = 0;
   @State zoom: number = 1;
   @State panX: number = 0;
   @State panY: number = 0;
@@ -311,6 +340,10 @@ struct Index {
   @State previewPixelW: number = 0;
   @State previewPixelH: number = 0;
   @State busy: boolean = false;
+  @State activeFilterJobId: number = 0;
+  @State filterProgress: number = -1;
+  @State filterRunningLabel: string = '';
+  @State filterCancelRequested: boolean = false;
   @State status: string = '打开一张图片开始编辑';
   @State isWide: boolean = false;
   @State screenWidth: number = 0;
@@ -338,6 +371,20 @@ struct Index {
   @State brushHardness: number = 80;
   @State brushOpacity: number = 100;
   @State brushColor: string = '#e5484d';
+  @State recentColors: string[] = [];
+  // 直方图（GIMP/Krita/darktable 标配）：打开卡片或编辑后按 revision 异步刷新。
+  @State histOpen: boolean = false;
+  @State histBusy: boolean = false;
+  @State histData: HistogramInfo | undefined = undefined;
+  // 图像信息/EXIF（挂在直方图卡下）：sourceBytes/sourceFormat 由打开路径记录。
+  @State infoOpen: boolean = false;
+  @State metaData: ImageMetadataInfo | undefined = undefined;
+  @State sourceBytes: number = 0;
+  @State sourceFormat: string = '';
+  // 命名调色板（GIMP/Krita 对标）：与最近颜色共用画笔色板，持久化到 preferences。
+  @State palettes: SavedPalette[] = [];
+  @State paletteOpen: boolean = false;
+  @State paletteName: string = '';
   @State selectionKind: string = 'rect';
   @State selectionMode: string = 'replace';
   @State selectionFeather: number = 0;
@@ -373,6 +420,11 @@ struct Index {
   @State fxInfo: LayerEffectsInfo = { enabled: true, items: [] };
   @State fxOpen: boolean = false;
   @State fxKind: string = 'dropShadow';
+  private fxSliderDocId: number = 0;
+  private fxSliderLayerId: number = 0;
+  private fxSliderKind: string = '';
+  private fxSliderIndex: number = -1;
+  private fxSliderName: string = '';
   // 滑块草稿：拖动过程中只更新这些状态，End/Click 时才提交引擎。
   @State fxOpacity: number = 75;
   @State fxAngle: number = 120;
@@ -468,6 +520,8 @@ struct Index {
   @State cropY0: number = 0;
   @State cropX1: number = 0;
   @State cropY1: number = 0;
+  // 裁剪宽高比：0 = 自由；非 0 时拖拽按 宽/高 锁定（进入裁剪时重置为自由）。
+  @State cropAspect: number = 0;
   // 画布变换手势（C-TRANSFORM-GESTURE@1 §1）：trMode 是变换态的唯一判定量；
   // 标签与入口按钮的启用态依赖它重组，其余拖拽态一律普通字段。
   @State trMode: boolean = false;
@@ -480,6 +534,15 @@ struct Index {
 
   private brushSettings: RenderingContextSettings = new RenderingContextSettings(true);
   private brushCtx: CanvasRenderingContext2D = new CanvasRenderingContext2D(this.brushSettings);
+  private histSettings: RenderingContextSettings = new RenderingContextSettings(true);
+  private histCtx: CanvasRenderingContext2D = new CanvasRenderingContext2D(this.histSettings);
+  private curveSettings: RenderingContextSettings = new RenderingContextSettings(true);
+  private curveCtx: CanvasRenderingContext2D = new CanvasRenderingContext2D(this.curveSettings);
+  private histToken: number = 0;
+  private histTimer: number = -1;
+  private histDocId: number = 0;
+  private histRevision: number = -1;
+  private metaDocId: number = 0;
   private strokePoints: BrushPoint[] = [];
   private strokeStartMs: number = 0;
   private drawing: boolean = false;
@@ -502,6 +565,10 @@ struct Index {
 
   private renderTimer: number = -1;
   private renderToken: number = 0;
+  private documentGeneration: number = 0;
+  private documentClosed: boolean = false;
+  private filterJobToken: number = 0;
+  private filterProgressTimer: number = -1;
   // PAN-PREFETCH@1：手势中可见区越出当前 detail tile 时，提前以 0 延迟调度重渲染，
   // 避免「手势结束 + 140ms debounce + 异步 createPixelMap」期间露出空白底色（分块拖影）。
   // 该标志保证一次越界手势只提前调度一次，不违背 R7.3「每帧不触发引擎渲染」。
@@ -541,9 +608,27 @@ struct Index {
   private previewDirtyY: number = 0;
   private previewDirtyW: number = 0;
   private previewDirtyH: number = 0;
+  private levelsEditDocId: number = 0;
+  private levelsEditLayerId: number = 0;
+  private curvesEditDocId: number = 0;
+  private curvesEditLayerId: number = 0;
+  // C-COMPARE-UI@1：原始合成快照（打开文档时的整画布 RGBA8）。快照与所有权模型同 detailPixels：
+  // 字节由 originalPixels 长期强引用（PixelMap 零拷贝共享），PixelMap 对象按需创建、退出对比即释放。
+  private originalPixels: ArrayBuffer | undefined = undefined;
+  private originalW: number = 0;
+  private originalH: number = 0;
+  // 对比显示的临时像素槽（detail 模式裁剪输出）：PixelMap 显示期间必须持有，退出对比释放。
+  private comparePixels: ArrayBuffer | undefined = undefined;
+  private comparePixelMap: image.PixelMap | undefined = undefined;
+  // 进入对比前的当前显示 PixelMap：退出时原样恢复，不释放（它仍是显示对象）。
+  private savedPixelMap: image.PixelMap | undefined = undefined;
+  // 进出竞态守卫：cmpEnter/cmpExit 各自 ++，createPixelMap 回调按序号丢弃过期提交。
+  private compareSeq: number = 0;
+  private compareTimer: number = -1;
   private thumbToken: number = 0;
   private thumbTimer: number = -1;
   private thumbQueueToken: number = 0;
+  private thumbRequestTokens: Map<number, number> = new Map<number, number>();
   private layerThumbCache: Map<number, image.PixelMap> = new Map<number, image.PixelMap>();
   private thumbPending: Set<number> = new Set<number>();
   private pinchActive: boolean = false;
@@ -641,6 +726,8 @@ struct Index {
     this.cropDragging = false;
     this.cropDragKind = '';
     this.cropFrameCount = 0;
+    // 宽高比每次进入裁剪都回到自由，避免上次比例悄悄改变拖拽行为。
+    this.cropAspect = 0;
     // ④ 打开裁剪模式（唯一判定裁剪态的布尔量，不依赖 tool）。
     this.cropMode = true;
     // ⑤ 状态栏提示。
@@ -870,7 +957,12 @@ struct Index {
       this.cropX1 = this.cropDragOriginX1 + dx;
       this.cropY1 = this.cropDragOriginY1 + dy;
     }
-    this.cropClampRect();
+    if (this.cropAspect > 0) {
+      // 比例锁定：角/边拖拽由比例约束独立处理边界与最小尺寸。
+      this.cropClampAspect(kind);
+    } else {
+      this.cropClampRect();
+    }
     // 拖拽期间只重绘叠加层：不调用任何引擎/渲染/缓存接口，不产生检查点（R2.4）。
     this.redrawCanvas();
     this.cropFrameCount++;
@@ -968,6 +1060,160 @@ struct Index {
     this.cropY0 = y0;
     this.cropX1 = x1;
     this.cropY1 = y1;
+  }
+
+  // 比例锁定（对标 GIMP / ImageToolbox 的宽高比裁剪）：角拖拽锚定对角、边拖拽锚定对边，
+  // 由本方法独立处理最小尺寸与画布边界（不依赖只推边的 cropClampRect，否则比例会被二次 clamp 破坏）。
+  private cropClampAspect(kind: string): void {
+    const info = this.info;
+    if (info === undefined || this.cropAspect <= 0) {
+      return;
+    }
+    const ratio = this.cropAspect;
+    const scale = this.displayScale();
+    if (scale <= 0 || info.width <= 0 || info.height <= 0) {
+      return;
+    }
+    const minW = Math.min(Math.max(1, CROP_MIN_VP / scale), info.width);
+    const minH = Math.min(Math.max(1, CROP_MIN_VP / scale), info.height);
+    const w = Math.max(1, this.cropX1 - this.cropX0);
+    const h = Math.max(1, this.cropY1 - this.cropY0);
+    let tw = w;
+    let th = h;
+    if (kind === 'n' || kind === 's') {
+      // 上下边：高度为主轴，宽度按比例。
+      th = h;
+      tw = h * ratio;
+    } else if (kind === 'e' || kind === 'w') {
+      // 左右边：宽度为主轴，高度按比例。
+      tw = w;
+      th = w / ratio;
+    } else if (kind === 'nw' || kind === 'ne' || kind === 'se' || kind === 'sw') {
+      // 角：由拖拽起点快照判断用户主要在拖哪个方向，保证跟手。
+      const ow = Math.max(1, this.cropDragOriginX1 - this.cropDragOriginX0);
+      const oh = Math.max(1, this.cropDragOriginY1 - this.cropDragOriginY0);
+      const dw = Math.abs(w - ow);
+      const dh = Math.abs(h - oh);
+      if (dw >= dh * ratio) {
+        tw = w;
+        th = w / ratio;
+      } else {
+        th = h;
+        tw = h * ratio;
+      }
+    } else if (kind === 'move') {
+      // 平移不改宽高；进入比例时已校正，这里只兜底。
+      if (w / h > ratio) {
+        tw = h * ratio;
+      } else {
+        th = w / ratio;
+      }
+    } else {
+      // 切换比例：内接于当前框，只缩不放，避免框突然跳大。
+      if (w / h > ratio) {
+        tw = h * ratio;
+        th = h;
+      } else {
+        tw = w;
+        th = w / ratio;
+      }
+    }
+    // 最小尺寸（保持比例）与画布内接（保持比例）。
+    if (tw < minW) {
+      tw = minW;
+      th = tw / ratio;
+    }
+    if (th < minH) {
+      th = minH;
+      tw = th * ratio;
+    }
+    const fit = Math.min(1, info.width / Math.max(tw, 1e-6), info.height / Math.max(th, 1e-6));
+    tw *= fit;
+    th *= fit;
+    if (tw < 1 || th < 1) {
+      return;
+    }
+    let x0 = this.cropX0;
+    let y0 = this.cropY0;
+    let x1 = this.cropX1;
+    let y1 = this.cropY1;
+    if (kind === 'nw') {
+      x1 = this.cropX1;
+      y1 = this.cropY1;
+      x0 = x1 - tw;
+      y0 = y1 - th;
+    } else if (kind === 'ne') {
+      x0 = this.cropX0;
+      y1 = this.cropY1;
+      x1 = x0 + tw;
+      y0 = y1 - th;
+    } else if (kind === 'se') {
+      x0 = this.cropX0;
+      y0 = this.cropY0;
+      x1 = x0 + tw;
+      y1 = y0 + th;
+    } else if (kind === 'sw') {
+      x1 = this.cropX1;
+      y0 = this.cropY0;
+      x0 = x1 - tw;
+      y1 = y0 + th;
+    } else if (kind === 'n') {
+      y1 = this.cropY1;
+      y0 = y1 - th;
+      const cx = (this.cropX0 + this.cropX1) / 2;
+      x0 = cx - tw / 2;
+      x1 = cx + tw / 2;
+    } else if (kind === 's') {
+      y0 = this.cropY0;
+      y1 = y0 + th;
+      const cx = (this.cropX0 + this.cropX1) / 2;
+      x0 = cx - tw / 2;
+      x1 = cx + tw / 2;
+    } else if (kind === 'e') {
+      x0 = this.cropX0;
+      x1 = x0 + tw;
+      const cy = (this.cropY0 + this.cropY1) / 2;
+      y0 = cy - th / 2;
+      y1 = cy + th / 2;
+    } else if (kind === 'w') {
+      x1 = this.cropX1;
+      x0 = x1 - tw;
+      const cy = (this.cropY0 + this.cropY1) / 2;
+      y0 = cy - th / 2;
+      y1 = cy + th / 2;
+    } else {
+      const cx = (this.cropX0 + this.cropX1) / 2;
+      const cy = (this.cropY0 + this.cropY1) / 2;
+      x0 = cx - tw / 2;
+      y0 = cy - th / 2;
+      x1 = cx + tw / 2;
+      y1 = cy + th / 2;
+    }
+    // 平移入画布（只移动不缩放，比例与尺寸保持不变）。
+    const dx = x0 < 0 ? -x0 : (x1 > info.width ? info.width - x1 : 0);
+    const dy = y0 < 0 ? -y0 : (y1 > info.height ? info.height - y1 : 0);
+    this.cropX0 = x0 + dx;
+    this.cropX1 = x1 + dx;
+    this.cropY0 = y0 + dy;
+    this.cropY1 = y1 + dy;
+  }
+
+  private setCropAspect(ratio: number): void {
+    this.cropAspect = ratio;
+    if (ratio > 0 && this.cropMode) {
+      this.cropClampAspect('');
+      this.redrawCanvas();
+    }
+    this.status = ratio > 0 ? ('裁剪比例：' + this.cropAspectLabel(ratio)) : '裁剪比例：自由';
+  }
+
+  private cropAspectLabel(ratio: number): string {
+    for (let i = 0; i < CROP_ASPECT_VALUES.length; i++) {
+      if (CROP_ASPECT_VALUES[i] === ratio) {
+        return CROP_ASPECT_LABELS[i];
+      }
+    }
+    return '自由';
   }
 
   // 屏幕投影：返回 [left, top, w, h]（vp），供命中判定、绘制与标签定位共用。
@@ -1671,6 +1917,8 @@ struct Index {
   }
 
   aboutToAppear(): void {
+    this.documentClosed = false;
+    this.busy = false;
     this.initTextFont();
     // 首选项在既有初始化之后读取：读不到时保持默认值，不影响字体/渲染初始化。
     this.loadPrefs();
@@ -1784,9 +2032,14 @@ struct Index {
         return;
       }
       const file = fileIo.openSync(info.path, fileIo.OpenMode.READ_ONLY);
-      const buffer = new ArrayBuffer(stat.size);
-      const read = fileIo.readSync(file.fd, buffer);
-      fileIo.closeSync(file);
+      let buffer: ArrayBuffer;
+      let read: number;
+      try {
+        buffer = new ArrayBuffer(stat.size);
+        read = fileIo.readSync(file.fd, buffer);
+      } finally {
+        fileIo.closeSync(file);
+      }
       if (read <= 0) {
         return;
       }
@@ -1802,6 +2055,9 @@ struct Index {
   }
 
   aboutToDisappear(): void {
+    this.documentClosed = true;
+    this.documentGeneration++;
+    this.renderToken++;
     if (this.renderTimer !== -1) {
       clearTimeout(this.renderTimer);
       this.renderTimer = -1;
@@ -1814,10 +2070,7 @@ struct Index {
       this.layerThumb = undefined;
     }
     this.clearAllLayerThumbs();
-    if (this.docId !== 0) {
-      Engine.close(this.docId);
-      this.docId = 0;
-    }
+    this.closeDocument();
     // 离开页面：清空编辑草稿与变换草稿（不产生任何引擎调用）。
     this.editReset();
     this.trResetDraft();
@@ -1847,32 +2100,252 @@ struct Index {
     return message !== undefined && message.length > 0 ? message : String(err);
   }
 
+  private clearFilterProgressTimer(): void {
+    if (this.filterProgressTimer !== -1) {
+      clearInterval(this.filterProgressTimer);
+      this.filterProgressTimer = -1;
+    }
+  }
+
+  private stopActiveFilter(cancel: boolean): void {
+    const job = this.activeFilterJobId;
+    this.filterJobToken++;
+    this.clearFilterProgressTimer();
+    this.activeFilterJobId = 0;
+    this.filterProgress = -1;
+    this.filterRunningLabel = '';
+    this.filterCancelRequested = false;
+    if (job !== 0) {
+      if (cancel) {
+        Engine.cancelFilter(job);
+      }
+      this.busy = false;
+    }
+  }
+
+  private pollFilterProgress(token: number, job: number): void {
+    if (token !== this.filterJobToken || job !== this.activeFilterJobId || this.filterCancelRequested) {
+      return;
+    }
+    const progress = Engine.filterProgress(job);
+    if (progress < 0) {
+      return;
+    }
+    this.filterProgress = progress;
+    this.status = '正在应用滤镜：' + this.filterRunningLabel + ' ' + Math.round(progress * 100) + '%';
+  }
+
+  private cancelFilter(): void {
+    if (this.activeFilterJobId === 0 || this.filterCancelRequested) {
+      return;
+    }
+    if (Engine.cancelFilter(this.activeFilterJobId)) {
+      this.filterCancelRequested = true;
+      this.status = '正在取消滤镜…';
+    }
+  }
+
+  // 文档切换/关闭：丢弃直方图结果与在途任务，避免旧文档的分布短暂显示在新文档卡片上。
+  private resetHistogramState(): void {
+    if (this.histTimer !== -1) {
+      clearTimeout(this.histTimer);
+      this.histTimer = -1;
+    }
+    this.histToken++;
+    this.histBusy = false;
+    this.histData = undefined;
+    this.histDocId = 0;
+    this.histRevision = -1;
+  }
+
+  // 图像信息与源文件标签：文档关闭/替换时清空，展开卡片时按 docId 重新读取。
+  private resetMetadataState(): void {
+    this.metaData = undefined;
+    this.metaDocId = 0;
+    this.sourceBytes = 0;
+    this.sourceFormat = '';
+  }
+
+  /** 记录打开来源（文件名 + 字节数），信息卡显示「格式 · 大小」。新建文档传空名/0。 */
+  private rememberSource(name: string, bytes: number): void {
+    const dot = name.lastIndexOf('.');
+    this.sourceFormat = dot > 0 ? name.substring(dot + 1).toLowerCase() : '';
+    this.sourceBytes = bytes;
+    this.metaData = undefined;
+    this.metaDocId = 0;
+  }
+
+  private toggleInfoCard(): void {
+    this.infoOpen = !this.infoOpen;
+    if (this.infoOpen && (this.metaData === undefined || this.metaDocId !== this.docId)) {
+      this.refreshMetadata();
+    }
+  }
+
+  private refreshMetadata(): void {
+    if (this.docId === 0) {
+      this.metaData = undefined;
+      return;
+    }
+    try {
+      this.metaData = Engine.metadata(this.docId);
+      this.metaDocId = this.docId;
+    } catch (err) {
+      this.status = '图像信息读取失败：' + this.messageOf(err as Object);
+    }
+  }
+
+  private metaFormatLabel(): string {
+    return this.sourceFormat.length > 0 ? this.sourceFormat.toUpperCase() : '新建文档';
+  }
+
+  private metaBytesLabel(): string {
+    const bytes = this.sourceBytes;
+    if (bytes <= 0) {
+      return '—';
+    }
+    if (bytes >= 1024 * 1024) {
+      return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
+    }
+    if (bytes >= 1024) {
+      return Math.round(bytes / 1024).toString() + ' KB';
+    }
+    return bytes.toString() + ' B';
+  }
+
+  private metaInfoFallback(value: string): string {
+    return value.length > 0 ? value : '—';
+  }
+
+  private exifCameraLabel(): string {
+    const e = this.metaData?.exif;
+    if (e === undefined) {
+      return '—';
+    }
+    const parts: string[] = [];
+    if (e.make.length > 0) {
+      parts.push(e.make);
+    }
+    if (e.model.length > 0 && e.model !== e.make) {
+      parts.push(e.model);
+    }
+    return parts.length > 0 ? parts.join(' ') : '—';
+  }
+
+  private exifLensLabel(): string {
+    const e = this.metaData?.exif;
+    return e !== undefined ? this.metaInfoFallback(e.lens) : '—';
+  }
+
+  private exifExposureLabel(): string {
+    const e = this.metaData?.exif;
+    if (e === undefined || !Number.isFinite(e.exposureTime) || e.exposureTime <= 0) {
+      return '—';
+    }
+    return e.exposureTime >= 1
+      ? e.exposureTime.toFixed(1) + ' s'
+      : '1/' + Math.round(1 / e.exposureTime).toString() + ' s';
+  }
+
+  private exifApertureLabel(): string {
+    const e = this.metaData?.exif;
+    return e !== undefined && e.fNumber > 0 ? 'f/' + e.fNumber.toFixed(1) : '—';
+  }
+
+  private exifIsoLabel(): string {
+    const e = this.metaData?.exif;
+    return e !== undefined && e.iso > 0 ? 'ISO ' + Math.round(e.iso).toString() : 'ISO —';
+  }
+
+  private exifFocalLabel(): string {
+    const e = this.metaData?.exif;
+    if (e === undefined || !(e.focalLength > 0)) {
+      return '焦距 —';
+    }
+    const base = Math.round(e.focalLength).toString() + ' mm';
+    return e.focalLength35mm > 0 ? base + '（等效 ' + Math.round(e.focalLength35mm).toString() + ' mm）' : base;
+  }
+
+  private exifDateLabel(): string {
+    const e = this.metaData?.exif;
+    return e !== undefined ? this.metaInfoFallback(e.dateTaken) : '—';
+  }
+
+  private closeDocument(): void {
+    this.stopActiveFilter(true);
+    this.cmpReleaseState();
+    this.renderToken++;
+    this.thumbQueueToken++;
+    this.thumbToken++;
+    this.resetPenDraft();
+    this.clearBrushPreview();
+    this.resetHistogramState();
+    this.resetMetadataState();
+    if (this.docId !== 0) {
+      Engine.close(this.docId);
+      this.docId = 0;
+    }
+  }
+
+  private beginDocumentReplacement(status: string): number {
+    const generation = ++this.documentGeneration;
+    this.closeDocument();
+    if (this.renderTimer !== -1) {
+      clearTimeout(this.renderTimer);
+      this.renderTimer = -1;
+    }
+    this.busy = true;
+    this.status = status;
+    return generation;
+  }
+
+  private isCurrentDocumentLoad(generation: number): boolean {
+    return !this.documentClosed && generation === this.documentGeneration;
+  }
+
+  private finishDocumentLoad(generation: number): void {
+    if (this.isCurrentDocumentLoad(generation)) {
+      this.busy = false;
+      // C-COMPARE-UI@1 §1：文档装载完成后延迟保存原始快照（打开/示例/新建三个入口共用）。
+      this.cmpScheduleSnapshot();
+    }
+  }
+
   private async openFile(): Promise<void> {
+    if (this.busy || this.documentClosed) {
+      return;
+    }
+    this.busy = true;
+    this.status = '正在读取文件…';
+    let generation = this.documentGeneration;
     try {
       const options = new picker.DocumentSelectOptions();
       options.maxSelectNumber = 1;
       // HEIC/HEIF 打开：桥接层已启用纯 Rust heic-rs 解码，选择器同步放行 iPhone 照片后缀。
       options.fileSuffixFilters = ['图片|.png,.jpg,.jpeg,.webp,.bmp,.tif,.tiff,.psd,.psb,.heic,.heif'];
       const uris = await new picker.DocumentViewPicker(getContext(this)).select(options);
-      if (uris.length === 0) {
+      if (uris.length === 0 || this.documentClosed) {
         return;
       }
-      this.busy = true;
-      this.status = '正在解析文件…';
       const uri = uris[0];
       const file = fileIo.openSync(uri, fileIo.OpenMode.READ_ONLY);
-      const stat = fileIo.statSync(file.fd);
-      const data = new ArrayBuffer(stat.size);
-      fileIo.readSync(file.fd, data);
-      fileIo.closeSync(file);
-
-      if (this.docId !== 0) {
-        Engine.close(this.docId);
-        this.docId = 0;
+      let data: ArrayBuffer;
+      try {
+        const stat = fileIo.statSync(file.fd);
+        data = new ArrayBuffer(stat.size);
+        fileIo.readSync(file.fd, data);
+      } finally {
+        fileIo.closeSync(file);
       }
       const name = uri.substring(uri.lastIndexOf('/') + 1);
       const outcome = await Engine.open(name, data);
+      if (!this.isCurrentDocumentLoad(generation)) {
+        Engine.close(outcome.id);
+        return;
+      }
+      generation = this.beginDocumentReplacement('正在载入文档…');
       this.docId = outcome.id;
+      this.rememberSource(name, data.byteLength);
       this.info = outcome.info;
       // 文档被替换：丢弃裁剪框且不恢复视图快照（R1.5）。
       if (this.cropMode) {
@@ -1901,6 +2374,9 @@ struct Index {
       // 视图辅助（V2）：回填新文档的参考线（失败静默置空）。
       this.syncGuides();
       await this.refreshPreview();
+      if (!this.isCurrentDocumentLoad(generation)) {
+        return;
+      }
       const info = outcome.info;
       this.status = info.width + ' × ' + info.height + ' · ' + info.mode + ' · ' + info.depth;
       if (outcome.warnings.length > 0) {
@@ -1908,10 +2384,13 @@ struct Index {
       }
       this.saveRecentFile(uri);
     } catch (err) {
+      if (!this.isCurrentDocumentLoad(generation)) {
+        return;
+      }
       this.status = '打开失败：' + this.messageOf(err as Object);
       promptAction.showToast({ message: '打开失败：' + this.messageOf(err as Object) });
     } finally {
-      this.busy = false;
+      this.finishDocumentLoad(generation);
     }
   }
 
@@ -1955,23 +2434,32 @@ struct Index {
   }
 
   private async openFileFromPath(path: string): Promise<void> {
+    if (this.busy || this.documentClosed) {
+      return;
+    }
+    this.busy = true;
+    this.status = '正在读取最近文档…';
+    let generation = this.documentGeneration;
     try {
-      this.busy = true;
-      this.status = '正在打开最近文档…';
-      if (this.docId !== 0) {
-        Engine.close(this.docId);
-        this.docId = 0;
-      }
-      // 读取文件内容（仅支持本地路径，跨设备需通过系统分享获取稳定 URI）
       const file = fileIo.openSync(path, fileIo.OpenMode.READ_ONLY);
-      const stat = fileIo.statSync(file.fd);
-      const data = new ArrayBuffer(stat.size);
-      fileIo.readSync(file.fd, data);
-      fileIo.closeSync(file);
+      let data: ArrayBuffer;
+      try {
+        const stat = fileIo.statSync(file.fd);
+        data = new ArrayBuffer(stat.size);
+        fileIo.readSync(file.fd, data);
+      } finally {
+        fileIo.closeSync(file);
+      }
 
       const name = path.substring(path.lastIndexOf('/') + 1);
       const outcome = await Engine.open(name, data);
+      if (!this.isCurrentDocumentLoad(generation)) {
+        Engine.close(outcome.id);
+        return;
+      }
+      generation = this.beginDocumentReplacement('正在载入最近文档…');
       this.docId = outcome.id;
+      this.rememberSource(name, data.byteLength);
       this.info = outcome.info;
       if (this.cropMode) { this.cropDiscard(); }
       this.layers = flattenLayers(outcome.info.layers, 0);
@@ -1993,27 +2481,36 @@ struct Index {
       this.syncCanvasDraft();
       this.syncGuides();
       await this.refreshPreview();
+      if (!this.isCurrentDocumentLoad(generation)) {
+        return;
+      }
       this.status = this.info.width + ' × ' + this.info.height + ' · ' + this.info.mode + ' · ' + this.info.depth;
     } catch (err) {
+      if (!this.isCurrentDocumentLoad(generation)) {
+        return;
+      }
       this.status = '最近文档打开失败：' + this.messageOf(err as Object);
       promptAction.showToast({ message: '最近文档打开失败：' + this.messageOf(err as Object) });
     } finally {
-      this.busy = false;
+      this.finishDocumentLoad(generation);
     }
   }
 
   private async openSample(): Promise<void> {
+    if (this.busy || this.documentClosed) {
+      return;
+    }
+    const generation = this.beginDocumentReplacement('正在载入示例…');
     try {
-      this.busy = true;
-      this.status = '正在载入示例…';
       const raw = getContext(this).resourceManager.getRawFileContentSync('sample.jpg');
       const data = raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength) as ArrayBuffer;
-      if (this.docId !== 0) {
-        Engine.close(this.docId);
-        this.docId = 0;
-      }
       const outcome = await Engine.open('sample.jpg', data);
+      if (!this.isCurrentDocumentLoad(generation)) {
+        Engine.close(outcome.id);
+        return;
+      }
       this.docId = outcome.id;
+      this.rememberSource('sample.jpg', data.byteLength);
       this.info = outcome.info;
       // 文档被替换：丢弃裁剪框且不恢复视图快照（R1.5）。
       if (this.cropMode) {
@@ -2042,34 +2539,39 @@ struct Index {
       // 视图辅助（V2）：回填示例文档的参考线（失败静默置空）。
       this.syncGuides();
       await this.refreshPreview();
+      if (!this.isCurrentDocumentLoad(generation)) {
+        return;
+      }
       const info = outcome.info;
       this.status = info.width + ' × ' + info.height + ' · ' + info.mode + ' · ' + info.depth;
       this.saveRecentFile('sample.jpg');
     } catch (err) {
+      if (!this.isCurrentDocumentLoad(generation)) {
+        return;
+      }
       this.status = '示例载入失败：' + this.messageOf(err as Object);
       promptAction.showToast({ message: '示例载入失败：' + this.messageOf(err as Object) });
     } finally {
-      this.busy = false;
+      this.finishDocumentLoad(generation);
     }
   }
 
   // 新建空白文档（RGB / 8 位、白色 Background）：装载流程与 openSample 完全一致。
   private async newDocument(): Promise<void> {
+    if (this.busy || this.documentClosed) {
+      return;
+    }
     const width = Math.round(Number(this.newDocW));
     const height = Math.round(Number(this.newDocH));
     if (width < 1 || height < 1 || width > 16384 || height > 16384) {
       this.status = '新建文档：宽高需在 1–16384 之间';
       return;
     }
+    const generation = this.beginDocumentReplacement('正在新建文档…');
     try {
-      this.busy = true;
-      this.status = '正在新建文档…';
-      if (this.docId !== 0) {
-        Engine.close(this.docId);
-        this.docId = 0;
-      }
       const outcome = Engine.newDocument(width, height, '未命名');
       this.docId = outcome.id;
+      this.rememberSource('', 0);
       this.info = outcome.info;
       // 文档被替换：丢弃裁剪框且不恢复视图快照（R1.5）。
       if (this.cropMode) {
@@ -2095,12 +2597,18 @@ struct Index {
       // 视图辅助（V2）：新文档参考线为空，仍走一次回填以清理上一张图的叠加层。
       this.syncGuides();
       await this.refreshPreview();
+      if (!this.isCurrentDocumentLoad(generation)) {
+        return;
+      }
       this.status = '已新建文档 · ' + outcome.info.width + ' × ' + outcome.info.height;
     } catch (err) {
+      if (!this.isCurrentDocumentLoad(generation)) {
+        return;
+      }
       this.status = '新建失败：' + this.messageOf(err as Object);
       promptAction.showToast({ message: '新建失败：' + this.messageOf(err as Object) });
     } finally {
-      this.busy = false;
+      this.finishDocumentLoad(generation);
     }
   }
 
@@ -2250,6 +2758,10 @@ struct Index {
   private renderDetail(): void {
     const info = this.info;
     if (this.docId === 0 || info === undefined || this.viewportW <= 0 || this.viewportH <= 0) {
+      return;
+    }
+    // C-COMPARE-UI@1 §3：对比态挂起细节渲染，防止当前合成覆盖对比画面；退出对比时统一重调度。
+    if (this.compareActive) {
       return;
     }
     if (!this.needsDetail()) {
@@ -2437,6 +2949,10 @@ struct Index {
     if (this.docId === 0) {
       return;
     }
+    // C-COMPARE-UI@1 §3：对比态挂起预览渲染（rebuildPreview 仅由本方法触达，同样被拦住）。
+    if (this.compareActive) {
+      return;
+    }
     const side = this.isWide ? 2048 : 1280;
     // 缓存键：版本号 + 预览边长（C-RENDER-API@1 约定）。
     const key = this.docRevision + ':' + side;
@@ -2504,10 +3020,199 @@ struct Index {
         this.scheduleDetail();
       }
     } catch (err) {
+      if (token !== this.renderToken) {
+        return;
+      }
       this.status = '预览渲染失败：' + this.messageOf(err as Object);
       this.perf('preview rev=' + this.docRevision + ' key=' + key + ' hit=false calls=' + this.previewCalls +
         ' ms=' + (Date.now() - startedAt) + ' error=true');
     }
+  }
+
+  // ============ 原图对比（C-COMPARE-UI@1） ============
+  // §1 快照：文档装载完成 500ms 后保存一次「打开时的整画布合成」（renderPixels 只读，不改文档）。
+  // §2 进入：按住「对比」按钮 → 显示几何（displayWidth/displayLeft/displayTop）不变，仅替换 Image 内容；
+  //    detail 模式裁剪输出与当前可见区同尺寸（快照按文档原点对齐求交，交集外透明），preview 模式整图显示。
+  // §3 挂起：compareActive 期间 renderDetail/refreshPreview 早退、renderToken 作废在途回调；
+  //    退出时 scheduleDetail 统一恢复当前合成。
+  // §4 释放：closeDocument / aboutToDisappear（经 beginDocumentReplacement → closeDocument）统一回收。
+
+  private cmpScheduleSnapshot(): void {
+    if (this.compareTimer !== -1) {
+      clearTimeout(this.compareTimer);
+    }
+    this.compareTimer = setTimeout(() => {
+      this.compareTimer = -1;
+      this.cmpPrepareSnapshot();
+    }, COMPARE_SNAPSHOT_DELAY_MS);
+  }
+
+  private cmpPrepareSnapshot(): void {
+    const info = this.info;
+    if (this.docId === 0 || info === undefined || this.documentClosed || this.compareActive) {
+      return;
+    }
+    const startedAt = Date.now();
+    const head = 'cmpSnapshot rev=' + this.docRevision + ' w=' + info.width + ' h=' + info.height;
+    if (info.width * info.height > COMPARE_MAX_PIXELS) {
+      this.originalPixels = undefined;
+      this.originalW = 0;
+      this.originalH = 0;
+      this.compareReady = false;
+      this.perf(head + ' ms=' + (Date.now() - startedAt) + ' ok=false big=true');
+      return;
+    }
+    try {
+      const pixels = Engine.renderPixels(this.docId, 0, 0, info.width, info.height);
+      if (pixels.byteLength !== info.width * info.height * 4) {
+        this.originalPixels = undefined;
+        this.originalW = 0;
+        this.originalH = 0;
+        this.compareReady = false;
+        this.perf(head + ' ms=' + (Date.now() - startedAt) + ' ok=false bad=' + pixels.byteLength);
+        return;
+      }
+      this.originalPixels = pixels;
+      this.originalW = info.width;
+      this.originalH = info.height;
+      this.compareReady = true;
+      this.perf(head + ' ms=' + (Date.now() - startedAt) + ' ok=true bytes=' + pixels.byteLength);
+    } catch (err) {
+      this.originalPixels = undefined;
+      this.originalW = 0;
+      this.originalH = 0;
+      this.compareReady = false;
+      this.perf(head + ' ms=' + (Date.now() - startedAt) + ' ok=false error=true');
+    }
+  }
+
+  private cmpEnter(): void {
+    const info = this.info;
+    if (this.docId === 0 || info === undefined || this.busy || this.compareActive ||
+      this.originalPixels === undefined || this.originalW <= 0 || this.originalH <= 0) {
+      return;
+    }
+    if (this.drawing || this.selecting || this.shaping || this.movingLayer) {
+      return;
+    }
+    // 作废在途渲染：renderToken++ 让 pending 的 createPixelMap 回调自弃；清掉待触发的细节渲染。
+    this.renderToken++;
+    if (this.renderTimer !== -1) {
+      clearTimeout(this.renderTimer);
+      this.renderTimer = -1;
+    }
+    const seq = ++this.compareSeq;
+    const startedAt = Date.now();
+    const snap = this.originalPixels;
+    const usingDetail = this.usingDetail;
+    const outW = usingDetail ? this.regionW : this.originalW;
+    const outH = usingDetail ? this.regionH : this.originalH;
+    let out: ArrayBuffer;
+    if (usingDetail) {
+      if (outW <= 0 || outH <= 0) {
+        return;
+      }
+      // 输出 = 当前可见区域（regionX/Y/W/H 文档坐标）。快照按文档原点 (0,0) 对齐求交，交集外保持透明。
+      out = new ArrayBuffer(outW * outH * 4);
+      const x0 = Math.max(0, this.regionX);
+      const y0 = Math.max(0, this.regionY);
+      const x1 = Math.min(this.originalW, this.regionX + outW);
+      const y1 = Math.min(this.originalH, this.regionY + outH);
+      if (x1 > x0 && y1 > y0) {
+        const src = new Uint8Array(snap);
+        const dst = new Uint8Array(out);
+        const copyW = (x1 - x0) * 4;
+        for (let row = y0; row < y1; row++) {
+          const srcOff = (row * this.originalW + x0) * 4;
+          const dstOff = ((row - this.regionY) * outW + (x0 - this.regionX)) * 4;
+          dst.set(src.subarray(srcOff, srcOff + copyW), dstOff);
+        }
+      }
+      this.comparePixels = out;
+    } else {
+      // preview 模式：零拷贝直接用快照字节建图（originalPixels 长期持有，无需独立槽）。
+      this.comparePixels = undefined;
+      out = snap;
+    }
+    const options: image.InitializationOptions = {
+      size: { width: outW, height: outH },
+      pixelFormat: image.PixelMapFormat.RGBA_8888,
+      srcPixelFormat: image.PixelMapFormat.RGBA_8888,
+      alphaType: image.AlphaType.UNPREMUL
+    };
+    this.savedPixelMap = this.pixelMap;
+    this.compareActive = true;
+    image.createPixelMap(out, options).then((map: image.PixelMap) => {
+      if (seq !== this.compareSeq || !this.compareActive) {
+        this.safeRelease(map);
+        return;
+      }
+      this.comparePixelMap = map;
+      this.compareFit = usingDetail ||
+        (this.originalW === info.width && this.originalH === info.height) ? ImageFit.Fill : ImageFit.Contain;
+      this.pixelMap = map;
+      this.status = '对比中：显示打开时的原图（松开恢复）';
+      this.perf('compare enter rev=' + this.docRevision + ' w=' + outW + ' h=' + outH +
+        ' ms=' + (Date.now() - startedAt) + ' detail=' + (usingDetail ? 'true' : 'false'));
+    }).catch((err: Error) => {
+      if (seq !== this.compareSeq) {
+        return;
+      }
+      this.compareActive = false;
+      this.savedPixelMap = undefined;
+      this.comparePixels = undefined;
+      this.status = '对比失败：' + this.messageOf(err as Object);
+      this.perf('compare enter rev=' + this.docRevision + ' w=' + outW + ' h=' + outH +
+        ' ms=' + (Date.now() - startedAt) + ' error=true');
+    });
+  }
+
+  private cmpExit(): void {
+    if (!this.compareActive) {
+      return;
+    }
+    this.compareSeq++;
+    this.compareActive = false;
+    const info = this.info;
+    this.status = info !== undefined
+      ? info.width + ' × ' + info.height + ' · ' + info.mode + ' · ' + info.depth
+      : '';
+    const saved = this.savedPixelMap;
+    this.savedPixelMap = undefined;
+    if (saved !== undefined && this.pixelMap !== saved) {
+      const stale = this.pixelMap;
+      this.pixelMap = saved;
+      if (stale !== undefined && stale !== saved) {
+        // 只回收对比 PixelMap 对象本身：其字节源由 comparePixels / originalPixels 持有。
+        this.safeRelease(stale);
+      }
+    }
+    this.comparePixelMap = undefined;
+    this.comparePixels = undefined;
+    this.compareFit = ImageFit.Fill;
+    this.scheduleDetail();
+    this.redrawCanvas();
+    this.perf('compare exit rev=' + this.docRevision + ' ms=0');
+  }
+
+  private cmpReleaseState(): void {
+    if (this.compareTimer !== -1) {
+      clearTimeout(this.compareTimer);
+      this.compareTimer = -1;
+    }
+    this.compareSeq++;
+    this.compareActive = false;
+    this.compareReady = false;
+    this.compareFit = ImageFit.Fill;
+    if (this.comparePixelMap !== undefined) {
+      this.safeRelease(this.comparePixelMap);
+      this.comparePixelMap = undefined;
+    }
+    this.savedPixelMap = undefined;
+    this.comparePixels = undefined;
+    this.originalPixels = undefined;
+    this.originalW = 0;
+    this.originalH = 0;
   }
 
   // 预览缓存命中但当前显示的是细节图时：用缓存字节重建预览 PixelMap（不请求引擎）。
@@ -2607,6 +3312,128 @@ struct Index {
     this.scheduleThumbRefresh();
     // 每次成功编辑后同步历史面板（只读标签，不额外触发渲染）。
     this.loadHistory();
+    this.scheduleHistogram();
+    // 信息卡展开时同步刷新（裁切/旋转会改变尺寸）；同步小 JSON，不阻塞。
+    if (this.infoOpen) {
+      this.refreshMetadata();
+    }
+  }
+
+  // 直方图（GIMP/Krita/darktable 标配）：异步条带合成，打开卡片或编辑后 debounce 刷新。
+  // 计算成本随画布面积增长，只读操作不产生 revision；文档/版本未变时直接复用上次结果。
+  private scheduleHistogram(): void {
+    if (!this.histOpen || this.docId === 0) {
+      return;
+    }
+    if (this.histTimer !== -1) {
+      clearTimeout(this.histTimer);
+    }
+    this.histTimer = setTimeout(() => {
+      this.histTimer = -1;
+      if (this.histOpen && this.docId !== 0) {
+        this.refreshHistogram();
+      }
+    }, 500);
+  }
+
+  private async refreshHistogram(): Promise<void> {
+    if (this.docId === 0) {
+      this.histData = undefined;
+      return;
+    }
+    const docId = this.docId;
+    const revision = this.docRevision;
+    if (this.histDocId === docId && this.histRevision === revision && this.histData !== undefined) {
+      this.drawHistogram();
+      return;
+    }
+    const token = ++this.histToken;
+    this.histBusy = true;
+    try {
+      const data = await Engine.histogram(docId);
+      if (token !== this.histToken || this.docId !== docId || revision !== this.docRevision) {
+        return;
+      }
+      this.histData = data;
+      this.histDocId = docId;
+      this.histRevision = revision;
+      this.drawHistogram();
+    } catch (err) {
+      if (token === this.histToken && this.docId === docId && revision === this.docRevision) {
+        this.status = '直方图失败：' + this.messageOf(err as Object);
+      }
+    } finally {
+      if (token === this.histToken) {
+        this.histBusy = false;
+      }
+    }
+  }
+
+  private toggleHistogram(): void {
+    this.histOpen = !this.histOpen;
+    if (!this.histOpen) {
+      return;
+    }
+    if (this.histData === undefined || this.histRevision !== this.docRevision || this.histDocId !== this.docId) {
+      this.refreshHistogram();
+    } else {
+      this.drawHistogram();
+    }
+  }
+
+  private drawHistogram(): void {
+    const ctx = this.histCtx;
+    const w = ctx.width > 0 ? ctx.width : 300;
+    const h = ctx.height > 0 ? ctx.height : 92;
+    ctx.globalAlpha = 1;
+    ctx.clearRect(0, 0, w, h);
+    ctx.fillStyle = '#0b0d12';
+    ctx.fillRect(0, 0, w, h);
+    ctx.strokeStyle = '#2a2f3a';
+    ctx.lineWidth = 1;
+    for (let i = 1; i < 4; i++) {
+      const x = w * i / 4;
+      ctx.beginPath();
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, h);
+      ctx.stroke();
+    }
+    const data = this.histData;
+    if (data === undefined || data.rgb.length < 3) {
+      return;
+    }
+    let peak = 1;
+    for (const channel of data.rgb) {
+      for (const count of channel) {
+        peak = Math.max(peak, count);
+      }
+    }
+    const colors: string[] = ['#ff5c5c', '#5cff8c', '#5c9dff'];
+    const logPeak = Math.log(1 + peak);
+    for (let c = 0; c < 3; c++) {
+      const channel = data.rgb[c];
+      if (channel.length < 256) {
+        continue;
+      }
+      ctx.beginPath();
+      ctx.moveTo(0, h);
+      for (let i = 0; i < 256; i++) {
+        const value = Math.log(1 + channel[i]) / logPeak;
+        const x = w * i / 255;
+        const y = h - Math.max(0, Math.min(1, value)) * (h - 4);
+        ctx.lineTo(x, y);
+      }
+      ctx.lineTo(w, h);
+      ctx.closePath();
+      ctx.globalAlpha = 0.24;
+      ctx.fillStyle = colors[c];
+      ctx.fill();
+      ctx.globalAlpha = 0.9;
+      ctx.strokeStyle = colors[c];
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
   }
 
   // 历史记录只读刷新：失败静默（历史面板不是主流程，不能因它中断编辑反馈）。
@@ -2629,9 +3456,10 @@ struct Index {
   // 历史跳转：index 是列表中的序号（0 = 最近一步），实际跳转步数为 index + 1。
   // 复用 undo()/redo() 的文档替换流程：清缓存、重置选中/草稿、回填画布尺寸、刷新历史。
   private async jumpHistory(kind: string, index: number): Promise<void> {
-    if (this.docId === 0) {
+    if (this.docId === 0 || this.busy) {
       return;
     }
+    this.stopActiveFilter(true);
     const steps = index + 1;
     try {
       const jump = kind === 'undo'
@@ -2646,12 +3474,19 @@ struct Index {
       this.layers = flattenLayers(jump.info.layers, 0);
       this.selectedLayerId = 0;
       this.adjust = emptyAdjustment();
+      this.cancelToneEdit('levels');
+      this.cancelToneEdit('curves');
+      this.fxCancelSliderEdit();
       this.editReset();
       this.maskReset();
       await this.refreshPreview();
       this.syncSelection();
       this.syncCanvasDraft();
       this.loadHistory();
+      this.scheduleHistogram();
+      if (this.infoOpen) {
+        this.refreshMetadata();
+      }
       this.status = (kind === 'undo' ? '已撤销 ' : '已重做 ') + jump.steps + ' 步';
     } catch (err) {
       this.status = '历史跳转失败：' + this.messageOf(err as Object);
@@ -2659,6 +3494,9 @@ struct Index {
   }
 
   private selectTool(tool: string): void {
+    if (this.tool === 'pen' && tool !== 'pen') {
+      this.penCancel();
+    }
     // BUGFIX(TOOL-CLEAN@1)：文字草稿坐标未清理，若 Up 在没有新 Down 的情况下到达，
     // 会在旧坐标落字（幽灵文字）；切工具时统一复位。
     this.textMultiTouch = false;
@@ -2705,13 +3543,7 @@ struct Index {
       this.cancelStroke();
       this.cancelSelect();
       this.cancelShape();
-      this.penPathSubpaths = [];
-      this.penPathKnots = [];
-      this.penActiveSubpath = -1;
-      this.penPendingKnot = -1;
-      this.penDraggingCtrl = false;
-      this.penCtrlKnotIndex = -1;
-      this.penCtrlSide = 'out';
+      this.resetPenDraft();
       this.status = '钢笔：点击画布放锚点；按住拖拽出平滑控制柄；Esc 取消';
     } else if (tool === 'move') {
       // 移动工具：不落笔、不建选区、不建形状；提示当前是否具备可移动的选中图层（R3.3 / R3.4）。
@@ -2719,6 +3551,13 @@ struct Index {
       this.cancelSelect();
       this.cancelShape();
       this.status = this.editMoverHint();
+    } else if (tool === 'picker') {
+      // 吸管不改文档：只取消进行中的笔画/选区/形状草稿，取色结果写入画笔颜色。
+      this.cancelStroke();
+      this.cancelSelect();
+      this.cancelShape();
+      this.cancelMove();
+      this.status = '吸管：点击画布取色，写入画笔颜色';
     } else {
       this.cancelSelect();
       this.cancelShape();
@@ -2735,6 +3574,52 @@ struct Index {
     return [b, g, r, 1];
   }
 
+  // 吸管（GIMP/Krita/ImageToolbox 标配）：从合成结果取 1×1 像素，写入画笔色并记入最近颜色。
+  // 1×1 渲染只合成该像素，点击频率低，不进入渲染调度链。
+  private pickColorAt(screenX: number, screenY: number): void {
+    const info = this.info;
+    if (this.docId === 0 || info === undefined) {
+      this.status = '吸管：请先打开图片';
+      return;
+    }
+    const x = Math.floor(this.screenToDocX(screenX));
+    const y = Math.floor(this.screenToDocY(screenY));
+    if (x < 0 || y < 0 || x >= info.width || y >= info.height) {
+      this.status = '吸管：取色点不在画布内';
+      return;
+    }
+    try {
+      const bytes = new Uint8Array(Engine.renderPixels(this.docId, x, y, 1, 1));
+      if (bytes.length < 4) {
+        this.status = '吸管：引擎未返回像素';
+        return;
+      }
+      const hex = '#' + this.byteHex(bytes[0]) + this.byteHex(bytes[1]) + this.byteHex(bytes[2]);
+      this.brushColor = hex;
+      this.pushRecentColor(hex);
+      const alpha = bytes[3];
+      this.status = '吸管：' + hex.toUpperCase() + (alpha < 255 ? '（半透明 A=' + alpha + '）' : '');
+    } catch (err) {
+      this.status = '吸管失败：' + this.messageOf(err as Object);
+    }
+  }
+
+  private byteHex(value: number): string {
+    const clamped = Math.max(0, Math.min(255, Math.round(value)));
+    return clamped < 16 ? '0' + clamped.toString(16) : clamped.toString(16);
+  }
+
+  private pushRecentColor(hex: string): void {
+    const lower = hex.toLowerCase();
+    const next: string[] = [lower];
+    for (const color of this.recentColors) {
+      if (color.toLowerCase() !== lower && next.length < RECENT_COLOR_LIMIT) {
+        next.push(color);
+      }
+    }
+    this.recentColors = next;
+  }
+
   private clearBrushPreview(): void {
     try {
       this.brushCtx.clearRect(0, 0, this.viewportW, this.viewportH);
@@ -2749,6 +3634,17 @@ struct Index {
   // ──────────────────────────────────────────────────────────────────────
   // A1 矢量绘图：钢笔工具方法（1.2.0）
   // ──────────────────────────────────────────────────────────────────────
+  private resetPenDraft(): void {
+    this.penPathSubpaths = [];
+    this.penPathKnots = [];
+    this.penActiveSubpath = -1;
+    this.penPendingKnot = -1;
+    this.penDraggingCtrl = false;
+    this.penCtrlKnotIndex = -1;
+    this.penCtrlSide = 'out';
+    this.penPathLayerId = 0;
+  }
+
   private penStart(documentId: number): void {
     if (documentId === 0) {
       this.status = '钢笔：请先打开一张图片';
@@ -2829,7 +3725,7 @@ struct Index {
     }
   }
 
-  private penCommit(documentId: number): void {
+  private async penCommit(documentId: number): Promise<void> {
     if (documentId === 0 || this.penPathLayerId === 0) { return; }
     const knots = this.penPathKnots;
     if (knots.length === 0) { return; }
@@ -2838,21 +3734,11 @@ struct Index {
     try {
       Engine.vectorPathRasterize(documentId, JSON.stringify({ layerId: this.penPathLayerId }));
       const committedLayerId = this.penPathLayerId;
-      this.penPathSubpaths = [];
-      this.penPathKnots = [];
-      this.penActiveSubpath = -1;
-      this.penPendingKnot = -1;
-      this.penDraggingCtrl = false;
-      this.penCtrlKnotIndex = -1;
-      this.penCtrlSide = 'out';
-      this.penPathLayerId = 0;
-      // R-PEN-MULTI@1：刷新图层列表并选中新路径图层，让「路径转选区」可以直接使用
-      // （此前该层不出现在列表里且不选中，按钮守卫直接静默返回）。
-      if (this.refreshLayersOnly()) {
-        const row = this.layerRowById(committedLayerId);
-        if (row !== undefined) {
-          this.selectLayer(row);
-        }
+      this.resetPenDraft();
+      await this.afterEdit();
+      const row = this.layerRowById(committedLayerId);
+      if (row !== undefined) {
+        this.selectLayer(row);
       }
       this.status = '钢笔：路径已完成（已选中路径图层，可转选区）';
     } catch (err) {
@@ -2860,15 +3746,22 @@ struct Index {
     }
   }
 
-  private penCancel(): void {
-    this.penPathSubpaths = [];
-    this.penPathKnots = [];
-    this.penActiveSubpath = -1;
-    this.penPendingKnot = -1;
-    this.penDraggingCtrl = false;
-    this.penCtrlKnotIndex = -1;
-    this.penCtrlSide = 'out';
-    this.status = '钢笔：已取消';
+  private async penCancel(): Promise<void> {
+    const documentId = this.docId;
+    const layerId = this.penPathLayerId;
+    this.resetPenDraft();
+    this.clearBrushPreview();
+    if (documentId === 0 || layerId === 0) {
+      this.status = '钢笔：已取消';
+      return;
+    }
+    try {
+      Engine.deleteLayer(documentId, layerId);
+      await this.afterEdit();
+      this.status = '钢笔：已取消';
+    } catch (err) {
+      this.status = '钢笔取消失败：' + this.messageOf(err as Object);
+    }
   }
 
   // 把当前选中的矢量图层路径转成选区（D1，可继续用画笔/滤镜编辑）。
@@ -3883,7 +4776,7 @@ struct Index {
   }
 
   private async applyFilter(): Promise<void> {
-    if (this.busy) {
+    if (this.busy || this.documentClosed) {
       return;
     }
     if (this.docId === 0) {
@@ -3894,20 +4787,58 @@ struct Index {
       this.status = '滤镜：请先在图层列表选择一个像素图层';
       return;
     }
+    const docId = this.docId;
+    const layerId = this.selectedLayerId;
+    const generation = this.documentGeneration;
     const label = this.filterLabel();
+    const args = this.currentFilterArgs();
+    const token = ++this.filterJobToken;
+    this.clearFilterProgressTimer();
+    this.busy = true;
+    this.filterRunningLabel = label;
+    this.filterProgress = 0;
+    this.filterCancelRequested = false;
+    this.status = '正在应用滤镜：' + label;
     try {
-      this.busy = true;
-      const info = await Engine.filterApply(this.docId, this.selectedLayerId, this.currentFilterArgs());
-      this.info = info;
-      this.layers = flattenLayers(info.layers, 0);
-      // 滤镜改变了文档内容：先同步版本号，预览缓存键才会正确失效（R8.2）。
-      this.syncDocRevision();
-      await this.refreshPreview();
-      this.status = '已应用滤镜：' + label;
+      await Engine.filterApply(docId, layerId, args, (jobId: number) => {
+        if (token !== this.filterJobToken || this.documentClosed ||
+          generation !== this.documentGeneration || docId !== this.docId) {
+          Engine.cancelFilter(jobId);
+          return;
+        }
+        this.activeFilterJobId = jobId;
+        this.filterProgressTimer = setInterval(() => {
+          this.pollFilterProgress(token, jobId);
+        }, 120);
+      });
+      if (token !== this.filterJobToken || this.documentClosed ||
+        generation !== this.documentGeneration || docId !== this.docId) {
+        return;
+      }
+      this.clearFilterProgressTimer();
+      this.activeFilterJobId = 0;
+      this.filterProgress = 1;
+      await this.afterEdit();
+      if (token === this.filterJobToken && !this.documentClosed && docId === this.docId) {
+        this.status = '已应用滤镜：' + label;
+      }
     } catch (err) {
-      this.status = '滤镜失败：' + this.messageOf(err as Object);
+      if (token !== this.filterJobToken || this.documentClosed ||
+        generation !== this.documentGeneration || docId !== this.docId) {
+        return;
+      }
+      const message = this.messageOf(err as Object);
+      this.status = message.indexOf('filter cancelled') >= 0 ?
+        '已取消滤镜，文档未改变' : '滤镜失败：' + message;
     } finally {
-      this.busy = false;
+      if (token === this.filterJobToken) {
+        this.clearFilterProgressTimer();
+        this.activeFilterJobId = 0;
+        this.filterProgress = -1;
+        this.filterRunningLabel = '';
+        this.filterCancelRequested = false;
+        this.busy = false;
+      }
     }
   }
 
@@ -3976,6 +4907,8 @@ struct Index {
   }
 
   private clearLayerThumbCache(layerId: number): void {
+    this.thumbRequestTokens.set(layerId, (this.thumbRequestTokens.get(layerId) ?? 0) + 1);
+    this.thumbPending.delete(layerId);
     const cached = this.layerThumbCache.get(layerId);
     if (cached === undefined) {
       return;
@@ -3994,6 +4927,8 @@ struct Index {
       cached.push(thumb);
     }
     this.thumbQueueToken++;
+    this.thumbRequestTokens.clear();
+    this.thumbPending.clear();
     this.layerThumbCache.clear();
     this.layerThumb = undefined;
     this.layerThumbVersion++;
@@ -4010,8 +4945,13 @@ struct Index {
       return false;
     }
     const docId = this.docId;
+    const generation = this.documentGeneration;
+    const queueToken = this.thumbQueueToken;
+    const requestToken = (this.thumbRequestTokens.get(layerId) ?? 0) + 1;
+    this.thumbRequestTokens.set(layerId, requestToken);
     this.thumbPending.add(layerId);
     try {
+      const revision = Engine.revision(docId);
       const bytes = Engine.layerThumbnail(docId, layerId, 96);
       const view = new DataView(bytes);
       const width = view.getUint32(0, true);
@@ -4026,8 +4966,10 @@ struct Index {
         alphaType: image.AlphaType.UNPREMUL
       };
       const next = await image.createPixelMap(bytes.slice(8), options);
-      if (this.docId !== docId) {
-        next.release();
+      if (this.docId !== docId || generation !== this.documentGeneration ||
+        queueToken !== this.thumbQueueToken || revision !== Engine.revision(docId) ||
+        requestToken !== this.thumbRequestTokens.get(layerId) || this.layerThumbCache.has(layerId)) {
+        this.safeRelease(next);
         return false;
       }
       this.layerThumbCache.set(layerId, next);
@@ -4036,7 +4978,10 @@ struct Index {
       // Group / adjustment / empty layers legitimately have no thumbnail.
       return false;
     } finally {
-      this.thumbPending.delete(layerId);
+      if (requestToken === this.thumbRequestTokens.get(layerId)) {
+        this.thumbRequestTokens.delete(layerId);
+        this.thumbPending.delete(layerId);
+      }
     }
   }
 
@@ -4106,6 +5051,13 @@ struct Index {
     } else {
       this.adjust = emptyAdjustment();
     }
+    this.levelsChannel = this.adjust.levelsData?.space === 'lab' ? 1 : 0;
+    this.curvesChannel = this.adjust.curvesData?.space === 'lab' ? 1 : 0;
+    this.curvesPointIndex = 0;
+    this.levelsEditDocId = 0;
+    this.levelsEditLayerId = 0;
+    this.curvesEditDocId = 0;
+    this.curvesEditLayerId = 0;
     // 切换图层时同步加载该层的效果：失败只写状态栏，不抛到 UI 线程。
     this.loadFx(layer.id);
     // 同一时刻按新图层类型回填编辑分组（非文字/形状图层会自动清空分组，R5.4）。
@@ -4160,10 +5112,8 @@ struct Index {
       return;
     }
     try {
-      const info = Engine.moveLayer(this.docId, this.selectedLayerId, delta);
-      this.info = info;
-      this.layers = flattenLayers(info.layers, 0);
-      await this.refreshPreview();
+      Engine.moveLayer(this.docId, this.selectedLayerId, delta);
+      await this.afterEdit();
       this.status = delta > 1 ? '图层已置顶' : (delta === 1 ? '图层已上移' : (delta < -1 ? '图层已置底' : '图层已下移'));
     } catch (err) {
       const message = this.messageOf(err as Object);
@@ -4182,12 +5132,10 @@ struct Index {
     }
     try {
       const outcome = Engine.duplicateLayer(this.docId, this.selectedLayerId);
-      this.info = outcome.info;
-      this.layers = flattenLayers(outcome.info.layers, 0);
       this.selectedLayerId = outcome.layerId;
       this.clearLayerThumbCache(outcome.layerId);
       this.loadLayerThumb(outcome.layerId);
-      for (const layer of this.layers) {
+      for (const layer of flattenLayers(outcome.info.layers, 0)) {
         if (layer.id === outcome.layerId) {
           this.layerNameDraft = layer.name;
           this.layerOpacity = Math.round(layer.opacity * 100);
@@ -4196,7 +5144,7 @@ struct Index {
           break;
         }
       }
-      await this.refreshPreview();
+      await this.afterEdit();
       this.status = '已复制图层';
     } catch (err) {
       this.status = '复制失败：' + this.messageOf(err as Object);
@@ -4209,12 +5157,10 @@ struct Index {
     }
     try {
       const outcome = Engine.mergeLayer(this.docId, this.selectedLayerId);
-      this.info = outcome.info;
-      this.layers = flattenLayers(outcome.info.layers, 0);
       this.selectedLayerId = outcome.layerId;
       this.clearLayerThumbCache(outcome.layerId);
       this.loadLayerThumb(outcome.layerId);
-      for (const layer of this.layers) {
+      for (const layer of flattenLayers(outcome.info.layers, 0)) {
         if (layer.id === outcome.layerId) {
           this.layerNameDraft = layer.name;
           this.layerOpacity = Math.round(layer.opacity * 100);
@@ -4223,7 +5169,7 @@ struct Index {
           break;
         }
       }
-      await this.refreshPreview();
+      await this.afterEdit();
       this.status = '已向下合并图层';
     } catch (err) {
       this.status = '合并失败：' + this.messageOf(err as Object);
@@ -4237,12 +5183,10 @@ struct Index {
     try {
       this.busy = true;
       const outcome = await Engine.copyVisible(this.docId);
-      this.info = outcome.info;
-      this.layers = flattenLayers(outcome.info.layers, 0);
       this.selectedLayerId = outcome.layerId;
       this.clearLayerThumbCache(outcome.layerId);
       this.loadLayerThumb(outcome.layerId);
-      for (const layer of this.layers) {
+      for (const layer of flattenLayers(outcome.info.layers, 0)) {
         if (layer.id === outcome.layerId) {
           this.layerNameDraft = layer.name;
           this.layerOpacity = Math.round(layer.opacity * 100);
@@ -4251,7 +5195,7 @@ struct Index {
           break;
         }
       }
-      await this.refreshPreview();
+      await this.afterEdit();
       this.status = '已复制可见图层';
     } catch (err) {
       this.status = '复制可见失败：' + this.messageOf(err as Object);
@@ -5338,6 +6282,7 @@ struct Index {
 
   // 清空 FX 状态：打开新文档、删除图层时使用。
   private fxReset(): void {
+    this.fxCancelSliderEdit();
     this.fxInfo = { enabled: true, items: [] };
     this.fxOpen = false;
     this.fxKind = 'dropShadow';
@@ -5346,6 +6291,7 @@ struct Index {
 
   // 从引擎读取指定图层的效果；失败时回落为空状态并写状态栏。
   private loadFx(layerId: number): void {
+    this.fxCancelSliderEdit();
     if (this.docId === 0 || layerId === 0) {
       this.fxReset();
       return;
@@ -5649,7 +6595,47 @@ struct Index {
   }
 
   // 滑块拖动时只更新草稿；End/Click 才提交，避免拖动期间反复渲染。
+  private fxCancelSliderEdit(): void {
+    this.fxSliderDocId = 0;
+    this.fxSliderLayerId = 0;
+    this.fxSliderKind = '';
+    this.fxSliderIndex = -1;
+    this.fxSliderName = '';
+  }
+
+  private fxSliderContextCurrent(): boolean {
+    if (this.fxSliderDocId === 0 || this.fxSliderDocId !== this.docId ||
+      this.fxSliderLayerId === 0 || this.fxSliderLayerId !== this.selectedLayerId ||
+      this.fxSliderKind !== this.fxKind) {
+      return false;
+    }
+    const item = this.fxItem(this.fxSliderKind);
+    const index = item === undefined ? -1 : item.index;
+    return index === this.fxSliderIndex;
+  }
+
+  private fxBeginSliderEdit(name: string): void {
+    this.fxCancelSliderEdit();
+    this.fxSliderDocId = this.docId;
+    this.fxSliderLayerId = this.selectedLayerId;
+    this.fxSliderKind = this.fxKind;
+    const item = this.fxItem(this.fxKind);
+    this.fxSliderIndex = item === undefined ? -1 : item.index;
+    this.fxSliderName = name;
+  }
+
   private fxOnSlider(name: string, value: number, mode: SliderChangeMode): void {
+    if (mode === SliderChangeMode.Begin ||
+      (mode === SliderChangeMode.Click && this.fxSliderDocId === 0)) {
+      this.fxBeginSliderEdit(name);
+    }
+    if (this.fxSliderDocId === 0 || this.fxSliderName !== name) {
+      return;
+    }
+    if (!this.fxSliderContextCurrent()) {
+      this.fxCancelSliderEdit();
+      return;
+    }
     const rounded = Math.round(value);
     if (name === 'opacity') {
       this.fxOpacity = rounded;
@@ -5713,31 +6699,39 @@ struct Index {
   }
 
   private async fxCommit(name: string, value: number): Promise<void> {
-    if (this.docId === 0 || this.selectedLayerId === 0) {
+    if (!this.fxSliderContextCurrent()) {
+      this.fxCancelSliderEdit();
       return;
     }
-    const item = this.fxItem(this.fxKind);
+    const docId = this.fxSliderDocId;
+    const layerId = this.fxSliderLayerId;
+    const kind = this.fxSliderKind;
+    const index = this.fxSliderIndex;
+    this.fxCancelSliderEdit();
     let params: FxUpdateParams;
-    if (item === undefined) {
-      params = { op: 'add', kind: this.fxKind };
+    if (index < 0) {
+      params = { op: 'add', kind: kind };
     } else {
-      params = { op: 'update', index: item.index };
+      params = { op: 'update', index: index };
     }
     this.fxAssign(params, name, value);
     // 渐变叠加的任何参数提交都必须附带完整 stops：首尾用当前草稿，中间色标原样保留（R3.4）。
-    if (this.fxKind === 'gradientOverlay') {
+    if (kind === 'gradientOverlay') {
       params.gradientStops = this.fxStopsDraft();
     }
-    await this.fxApply(params);
+    await this.fxApply(params, layerId, docId);
   }
 
   // 唯一的引擎写入口：成功用返回值刷新 fxInfo 与草稿，再通过 afterEdit 统一刷新元数据与画面。
-  private async fxApply(params: FxUpdateParams): Promise<boolean> {
-    if (this.docId === 0 || this.selectedLayerId === 0) {
+  private async fxApply(params: FxUpdateParams, targetLayerId?: number, targetDocId?: number): Promise<boolean> {
+    this.fxCancelSliderEdit();
+    const docId = targetDocId ?? this.docId;
+    const layerId = targetLayerId ?? this.selectedLayerId;
+    if (docId === 0 || layerId === 0) {
       return false;
     }
     try {
-      this.fxInfo = Engine.updateLayerEffect(this.docId, this.selectedLayerId, JSON.stringify(params));
+      this.fxInfo = Engine.updateLayerEffect(docId, layerId, JSON.stringify(params));
       this.fxSyncDraft();
       await this.afterEdit();
       return true;
@@ -5826,6 +6820,73 @@ struct Index {
     } catch (err) {}
   }
 
+  // ===== 命名调色板（GIMP/Krita 色板对标）=====
+  private loadPalettes(): void {
+    try {
+      const store = preferences.getPreferencesSync(getContext(this), { name: PREFS_NAME });
+      const raw = store.getSync(PREF_KEY_PALETTES, '[]') as string;
+      this.palettes = JSON.parse(raw) as SavedPalette[];
+    } catch (err) {
+      this.palettes = [];
+    }
+  }
+
+  private persistPalettes(): void {
+    try {
+      const store = preferences.getPreferencesSync(getContext(this), { name: PREFS_NAME });
+      store.putSync(PREF_KEY_PALETTES, JSON.stringify(this.palettes));
+      store.flush().catch(() => {});
+    } catch (err) {}
+  }
+
+  private savePalette(): void {
+    const name = this.paletteName.trim();
+    if (name.length === 0) {
+      this.status = '请先输入色板名称';
+      return;
+    }
+    const colors: string[] = [this.brushColor];
+    const source = this.recentColors.length > 0 ? this.recentColors : BRUSH_COLORS;
+    for (const color of source) {
+      if (color.toLowerCase() !== this.brushColor.toLowerCase() && colors.length < RECENT_COLOR_LIMIT) {
+        colors.push(color);
+      }
+    }
+    const existing = this.palettes.findIndex(p => p.name === name);
+    const next = this.palettes.slice();
+    if (existing >= 0) {
+      next[existing] = { name: name, colors: colors };
+    } else {
+      if (next.length >= MAX_PALETTES) {
+        this.status = '最多保存 ' + MAX_PALETTES + ' 个色板';
+        return;
+      }
+      next.push({ name: name, colors: colors });
+    }
+    this.palettes = next;
+    this.paletteName = '';
+    this.persistPalettes();
+    this.status = '已保存色板 ' + name;
+  }
+
+  private applyPalette(name: string): void {
+    const palette = this.palettes.find(p => p.name === name);
+    if (palette === undefined) {
+      return;
+    }
+    this.recentColors = palette.colors.slice(0, RECENT_COLOR_LIMIT);
+    if (palette.colors.length > 0) {
+      this.brushColor = palette.colors[0];
+    }
+    this.status = '已套用色板 ' + name;
+  }
+
+  private deletePalette(name: string): void {
+    this.palettes = this.palettes.filter(p => p.name !== name);
+    this.persistPalettes();
+    this.status = '已删除色板 ' + name;
+  }
+
   private fxSavePreset(): void {
     const name = this.fxPresetName.trim();
     if (name.length === 0) {
@@ -5847,59 +6908,115 @@ struct Index {
   }
 
   private fxPresetItemToParams(item: LayerEffectInfo): FxUpdateParams {
-    const params: FxUpdateParams = {
-      op: 'add',
-      kind: item.kind,
-      blend: item.blend,
-      opacity: item.opacity,
-      color: item.color,
-      angle: item.angle,
-      distance: item.distance,
-      spread: item.spread,
-      size: item.size,
-      position: item.position,
-      technique: item.technique,
-      knocksOut: item.knocksOut,
-      antiAlias: item.antiAlias,
-    };
-    if (item.source !== undefined) params.source = item.source;
-    if (item.style !== undefined) params.bevelStyle = item.style;
-    if (item.bevelTechnique !== undefined) params.bevelTechnique = item.bevelTechnique;
-    if (item.depth !== undefined) params.depth = item.depth;
-    if (item.up !== undefined) params.up = item.up;
-    if (item.soften !== undefined) params.soften = item.soften;
-    if (item.altitude !== undefined) params.altitude = item.altitude;
-    if (item.highlightColor !== undefined) params.highlightColor = item.highlightColor;
-    if (item.highlightOpacity !== undefined) params.highlightOpacity = item.highlightOpacity;
-    if (item.shadowColor !== undefined) params.shadowColor = item.shadowColor;
-    if (item.shadowOpacity !== undefined) params.shadowOpacity = item.shadowOpacity;
-    if (item.dither !== undefined) params.dither = item.dither;
-    if (item.gradient !== undefined) {
-      params.gradientStops = item.gradient.stops;
-      params.gradientStyle = item.gradient.style;
-      params.gradientScale = item.gradient.scale;
-      params.reverse = item.gradient.reverse;
-      params.align = item.gradient.align;
+    const params: FxUpdateParams = { op: 'add', kind: item.kind, enabled: item.enabled };
+    if (item.kind === 'bevelEmboss') {
+      params.bevelStyle = item.style;
+      params.bevelTechnique = item.bevelTechnique;
+      params.depth = item.depth;
+      params.up = item.up;
+      params.size = item.size;
+      params.soften = item.soften;
+      params.angle = item.angle;
+      params.altitude = item.altitude;
+      params.highlightColor = item.highlightColor;
+      params.highlightOpacity = item.highlightOpacity;
+      params.shadowColor = item.shadowColor;
+      params.shadowOpacity = item.shadowOpacity;
+      params.antiAlias = item.antiAlias;
+      return params;
+    }
+    params.blend = item.blend;
+    params.opacity = item.opacity;
+    if (item.kind === 'gradientOverlay') {
+      const gradient = item.gradient;
+      if (gradient === undefined) {
+        return params;
+      }
+      if (gradient.stops.length >= 2) {
+        params.gradientStops = gradient.stops;
+      }
+      params.gradientStyle = gradient.style;
+      params.angle = gradient.angle;
+      params.gradientScale = gradient.scale;
+      params.reverse = gradient.reverse;
+      params.align = gradient.align;
+      params.dither = item.dither;
+      return params;
+    }
+    if (item.color.length >= 3) {
+      params.color = item.color;
+    }
+    if (item.kind === 'dropShadow') {
+      params.angle = item.angle;
+      params.distance = item.distance;
+      params.spread = item.spread;
+      params.size = item.size;
+      params.knocksOut = item.knocksOut;
+      params.antiAlias = item.antiAlias;
+    } else if (item.kind === 'stroke') {
+      params.size = item.size;
+      params.position = item.position;
+    } else if (item.kind === 'outerGlow' || item.kind === 'innerGlow') {
+      params.spread = item.spread;
+      params.size = item.size;
+      params.technique = item.technique;
+      params.antiAlias = item.antiAlias;
+      if (item.kind === 'innerGlow') {
+        params.source = item.source;
+      }
+    } else if (item.kind === 'innerShadow') {
+      params.angle = item.angle;
+      params.distance = item.distance;
+      params.spread = item.spread;
+      params.size = item.size;
+      params.antiAlias = item.antiAlias;
     }
     return params;
   }
 
   private async fxApplyPreset(name: string): Promise<void> {
-    if (this.docId === 0 || this.selectedLayerId === 0) {
+    if (this.busy || this.docId === 0 || this.selectedLayerId === 0) {
       return;
     }
     const preset = this.fxPresets.find(p => p.name === name);
     if (preset === undefined) {
       return;
     }
-    await this.fxClear();
-    await this.fxMaster(preset.data.enabled);
+    const docId = this.docId;
+    const layerId = this.selectedLayerId;
+    const operations: FxUpdateParams[] = [
+      { op: 'clear' },
+      { op: 'master', enabled: preset.data.enabled }
+    ];
     for (const item of preset.data.items) {
-      const params = this.fxPresetItemToParams(item);
-      await this.fxApply(params);
+      operations.push(this.fxPresetItemToParams(item));
     }
-    this.fxSyncDraft();
-    this.status = '已套用预设：' + name;
+    this.busy = true;
+    try {
+      const changed = await this.fxApplyBatch(operations, layerId);
+      if (!changed) {
+        return;
+      }
+      if (this.docId === docId && this.selectedLayerId === layerId) {
+        this.status = '已套用预设：' + name;
+      }
+    } finally {
+      this.busy = false;
+    }
+  }
+
+  private async fxApplyBatch(operations: FxUpdateParams[], targetLayerId: number): Promise<boolean> {
+    this.fxCancelSliderEdit();
+    const docId = this.docId;
+    try {
+      this.fxInfo = Engine.updateLayerEffectsBatch(docId, targetLayerId, JSON.stringify(operations));
+      this.fxSyncDraft();
+      await this.afterEdit();
+      return true;
+    } catch (err) {
+      this.status = '图层样式失败：' + this.messageOf(err as Object);
+      return false;
+    }
   }
 
   private fxDeletePreset(name: string): void {
@@ -6263,6 +7380,7 @@ struct Index {
     if (this.fxKind === kind) {
       return;
     }
+    this.fxCancelSliderEdit();
     this.fxKind = kind;
     this.fxSyncDraft();
   }
@@ -6315,6 +7433,10 @@ struct Index {
     switch (kind) {
       case 'brightnessContrast':
         return '{"brightness":0,"contrast":0}';
+      case 'levels':
+        return JSON.stringify(defaultLevelsAdjustment());
+      case 'curves':
+        return JSON.stringify(defaultCurvesAdjustment());
       case 'exposure':
         return '{"exposure":0,"offset":0,"gamma":1}';
       case 'vibrance':
@@ -6371,8 +7493,452 @@ struct Index {
       lightness: patch.lightness !== undefined ? patch.lightness : a.lightness,
       levels: patch.levels !== undefined ? patch.levels : a.levels,
       level: patch.level !== undefined ? patch.level : a.level,
+      levelsData: patch.levelsData !== undefined ? patch.levelsData : a.levelsData,
+      curvesData: patch.curvesData !== undefined ? patch.curvesData : a.curvesData,
       colorize: a.colorize
     };
+  }
+
+  private levelsInfo(): LevelsAdjustmentInfo {
+    return this.adjust.levelsData ?? defaultLevelsAdjustment();
+  }
+
+  private curvesInfo(): CurvesAdjustmentInfo {
+    return this.adjust.curvesData ?? defaultCurvesAdjustment();
+  }
+
+  private levelsSelectedChannel(): LevelsChannelInfo {
+    const data = this.levelsInfo();
+    if (this.levelsChannel === 4) {
+      return data.black;
+    }
+    return this.levelsChannel === 0 ? data.master : data.perChannel[this.levelsChannel - 1];
+  }
+
+  private curvesSelectedPoints(): CurvePointInfo[] {
+    const data = this.curvesInfo();
+    if (this.curvesChannel === 4) {
+      return data.black;
+    }
+    return this.curvesChannel === 0 ? data.master : data.perChannel[this.curvesChannel - 1];
+  }
+
+  private curvesSelectedPoint(): CurvePointInfo | undefined {
+    const points = this.curvesSelectedPoints();
+    return points.length > 0 ? points[Math.max(0, Math.min(points.length - 1, this.curvesPointIndex))] : undefined;
+  }
+
+  private setLevelsChannel(channel: number): void {
+    if (this.toneChannelAvailable('levels', channel)) {
+      this.levelsChannel = channel;
+    }
+  }
+
+  private setCurvesChannel(channel: number): void {
+    if (this.toneChannelAvailable('curves', channel)) {
+      this.curvesChannel = channel;
+      this.curvesPointIndex = 0;
+      this.drawCurveGraph();
+    }
+  }
+
+  private updateLevelsChannel(channel: LevelsChannelInfo): void {
+    const data = this.levelsInfo();
+    const perChannel: [LevelsChannelInfo, LevelsChannelInfo, LevelsChannelInfo] = [
+      data.perChannel[0], data.perChannel[1], data.perChannel[2]
+    ];
+    if (this.levelsChannel === 0) {
+      data.master = channel;
+    } else if (this.levelsChannel === 4) {
+      data.black = channel;
+    } else {
+      perChannel[this.levelsChannel - 1] = channel;
+    }
+    data.perChannel = perChannel;
+    this.adjust = this.adjustWith({ levelsData: data });
+  }
+
+  private setLevelsValue(field: string, value: number): void {
+    // 当前选中层就是提交目标；切换选中层后由 commitAdjustment 的引擎校验兜底。
+    if (this.docId === 0 || this.selectedLayerId === 0) {
+      return;
+    }
+    const channel = this.levelsSelectedChannel();
+    const next: LevelsChannelInfo = {
+      inBlack: channel.inBlack,
+      inWhite: channel.inWhite,
+      gamma: channel.gamma,
+      outBlack: channel.outBlack,
+      outWhite: channel.outWhite
+    };
+    switch (field) {
+      case 'inBlack':
+        next.inBlack = Math.max(0, Math.min(1, value));
+        if (next.inBlack >= next.inWhite) {
+          return;
+        }
+        break;
+      case 'inWhite':
+        next.inWhite = Math.max(0, Math.min(1, value));
+        if (next.inWhite <= next.inBlack) {
+          return;
+        }
+        break;
+      case 'gamma':
+        next.gamma = Math.max(0.01, Math.min(100, value));
+        break;
+      case 'outBlack':
+        next.outBlack = Math.max(0, Math.min(value, next.outWhite));
+        break;
+      case 'outWhite':
+        next.outWhite = Math.min(1, Math.max(value, next.outBlack));
+        break;
+      default:
+        return;
+    }
+    this.updateLevelsChannel(next);
+  }
+
+  private resetLevelsChannel(): void {
+    this.updateLevelsChannel(identityLevelsChannel());
+    this.commitLevels();
+  }
+
+  private resetLevels(): void {
+    const data = defaultLevelsAdjustment();
+    data.space = this.levelsInfo().space;
+    this.adjust = this.adjustWith({ levelsData: data });
+    this.commitLevels();
+  }
+
+  private setLevelsSpace(space: string): void {
+    const data = this.levelsInfo();
+    data.space = space;
+    this.adjust = this.adjustWith({ levelsData: data });
+    this.levelsChannel = this.toneChannelAvailable('levels', this.levelsChannel) ? this.levelsChannel : (space === 'lab' ? 1 : 0);
+    this.commitLevels();
+  }
+
+  private updateCurve(points: CurvePointInfo[], selectedIndex: number = this.curvesPointIndex): void {
+    const data = this.curvesInfo();
+    const perChannel: [CurvePointInfo[], CurvePointInfo[], CurvePointInfo[]] = [
+      data.perChannel[0], data.perChannel[1], data.perChannel[2]
+    ];
+    if (this.curvesChannel === 0) {
+      data.master = points;
+    } else if (this.curvesChannel === 4) {
+      data.black = points;
+    } else {
+      perChannel[this.curvesChannel - 1] = points;
+    }
+    data.perChannel = perChannel;
+    this.curvesPointIndex = Math.max(0, Math.min(points.length - 1, selectedIndex));
+    this.adjust = this.adjustWith({ curvesData: data });
+    this.drawCurveGraph();
+  }
+
+  private selectCurvePoint(index: number): void {
+    const points = this.curvesSelectedPoints();
+    if (index >= 0 && index < points.length) {
+      this.curvesPointIndex = index;
+      this.drawCurveGraph();
+    }
+  }
+
+  private setCurveCoordinate(field: string, value: number): void {
+    if (this.docId === 0 || this.selectedLayerId === 0) {
+      return;
+    }
+    const points = this.curvesSelectedPoints();
+    const index = Math.max(0, Math.min(points.length - 1, this.curvesPointIndex));
+    if (points.length < 2) {
+      return;
+    }
+    const next = points.map((point: CurvePointInfo): CurvePointInfo => ({ input: point.input, output: point.output }));
+    if (field === 'input') {
+      const lower = index === 0 ? 0 : (next[index - 1].input + next[index].input) / 2;
+      const upper = index === next.length - 1 ? 1 : (next[index].input + next[index + 1].input) / 2;
+      const input = Math.max(lower, Math.min(upper, value));
+      if ((index > 0 && input <= next[index - 1].input) ||
+        (index < next.length - 1 && input >= next[index + 1].input)) {
+        return;
+      }
+      next[index].input = input;
+    } else if (field === 'output') {
+      next[index].output = Math.max(0, Math.min(1, value));
+    } else {
+      return;
+    }
+    this.updateCurve(next, index);
+  }
+
+  private addCurvePoint(input: number, output: number): void {
+    const points = this.curvesSelectedPoints();
+    if (points.length >= 32) {
+      this.status = '触屏曲线最多保留 32 个控制点';
+      return;
+    }
+    let best = 0;
+    let width = -1;
+    for (let i = 0; i < points.length - 1; i++) {
+      const span = points[i + 1].input - points[i].input;
+      if (span > width) {
+        width = span;
+        best = i;
+      }
+    }
+    const lower = points[best].input + 0.005;
+    const upper = points[best + 1].input - 0.005;
+    if (upper < lower) {
+      return;
+    }
+    const x = Math.max(lower, Math.min(upper, input));
+    const next = points.map((point: CurvePointInfo): CurvePointInfo => ({ input: point.input, output: point.output }));
+    const added: CurvePointInfo = { input: x, output: Math.max(0, Math.min(1, output)) };
+    next.splice(best + 1, 0, added);
+    this.updateCurve(next, best + 1);
+    this.commitCurves();
+  }
+
+  private removeCurvePoint(): void {
+    const points = this.curvesSelectedPoints();
+    if (points.length <= 2) {
+      return;
+    }
+    const index = Math.max(0, Math.min(points.length - 1, this.curvesPointIndex));
+    const next = points.map((point: CurvePointInfo): CurvePointInfo => ({ input: point.input, output: point.output }));
+    next.splice(index, 1);
+    this.updateCurve(next, index > 0 ? index - 1 : 0);
+    this.commitCurves();
+  }
+
+  private resetCurveChannel(): void {
+    this.updateCurve(identityCurve(), 0);
+    this.commitCurves();
+  }
+
+  private resetCurves(): void {
+    const data = defaultCurvesAdjustment();
+    data.space = this.curvesInfo().space;
+    data.pencil = this.curvesInfo().pencil;
+    this.adjust = this.adjustWith({ curvesData: data });
+    this.curvesPointIndex = 0;
+    this.commitCurves();
+    this.drawCurveGraph();
+  }
+
+  private applyCurvePreset(preset: string): void {
+    let points: CurvePointInfo[];
+    switch (preset) {
+      case 'lighten':
+        points = [{ input: 0, output: 0.12 }, { input: 0.5, output: 0.58 }, { input: 1, output: 1 }];
+        break;
+      case 'darken':
+        points = [{ input: 0, output: 0 }, { input: 0.5, output: 0.42 }, { input: 1, output: 0.88 }];
+        break;
+      case 'contrast':
+        points = [{ input: 0, output: 0 }, { input: 0.25, output: 0.16 }, { input: 0.75, output: 0.84 }, { input: 1, output: 1 }];
+        break;
+      case 'fade':
+        points = [{ input: 0, output: 0.12 }, { input: 0.5, output: 0.52 }, { input: 1, output: 0.88 }];
+        break;
+      default:
+        points = identityCurve();
+        break;
+    }
+    this.updateCurve(normalizeCurvePoints(points), 0);
+    this.commitCurves();
+  }
+
+  private setCurvesSpace(space: string): void {
+    const data = this.curvesInfo();
+    data.space = space;
+    this.adjust = this.adjustWith({ curvesData: data });
+    this.curvesChannel = this.toneChannelAvailable('curves', this.curvesChannel) ? this.curvesChannel : (space === 'lab' ? 1 : 0);
+    this.curvesPointIndex = 0;
+    this.commitCurves();
+    this.drawCurveGraph();
+  }
+
+  private setCurvesPencil(pencil: boolean): void {
+    const data = this.curvesInfo();
+    data.pencil = pencil;
+    this.adjust = this.adjustWith({ curvesData: data });
+    this.commitCurves();
+    this.drawCurveGraph();
+  }
+
+  private toneSpaceSelected(kind: string): string {
+    return kind === 'levels' ? this.levelsInfo().space : this.curvesInfo().space;
+  }
+
+  private toneChannelAvailable(kind: string, index: number): boolean {
+    const space = this.toneSpaceSelected(kind);
+    return space === 'lab' ? index >= 1 && index <= 3 : space === 'cmyk' || index !== 4;
+  }
+
+  private toneChannelLabel(kind: string, index: number): string {
+    const space = this.toneSpaceSelected(kind);
+    if (space === 'lab') {
+      return index === 1 ? '明度' : index === 2 ? 'a 色轴' : 'b 色轴';
+    }
+    if (space === 'cmyk') {
+      return index === 1 ? '青' : index === 2 ? '洋红' : index === 3 ? '黄' : index === 4 ? '黑色' : '主通道';
+    }
+    return index === 1 ? '红' : index === 2 ? '绿' : index === 3 ? '蓝' : '主通道';
+  }
+
+  private toneChannelColor(kind: string, index: number): string {
+    if (index === 1) {
+      return this.toneSpaceSelected(kind) === 'lab' ? '#f5d76e' : '#ff6b6b';
+    }
+    if (index === 2) {
+      return '#51cf66';
+    }
+    if (index === 3) {
+      return '#748ffc';
+    }
+    return index === 4 ? '#a9b7c6' : '#e7dbff';
+  }
+
+  private toneChannelSelected(kind: string, index: number): boolean {
+    return (kind === 'levels' ? this.levelsChannel : this.curvesChannel) === index;
+  }
+
+  private curveGraphTap(x: number, y: number): void {
+    const input = Math.max(0, Math.min(1, (x - 8) / 224));
+    const output = 1 - Math.max(0, Math.min(1, (y - 8) / 224));
+    const points = this.curvesSelectedPoints();
+    let nearest = -1;
+    let distance = 18;
+    for (let i = 0; i < points.length; i++) {
+      const dx = 8 + points[i].input * 224 - x;
+      const dy = 8 + (1 - points[i].output) * 224 - y;
+      const candidate = Math.sqrt(dx * dx + dy * dy);
+      if (candidate < distance) {
+        distance = candidate;
+        nearest = i;
+      }
+    }
+    if (nearest >= 0) {
+      this.selectCurvePoint(nearest);
+    } else {
+      this.addCurvePoint(input, output);
+    }
+  }
+
+  private curvePath(points: CurvePointInfo[], pencil: boolean): string {
+    const samples = curveSamples(points, pencil);
+    let commands = '';
+    for (let i = 0; i < samples.length; i++) {
+      const x = 8 + i / (samples.length - 1) * 224;
+      const y = 8 + (1 - samples[i]) * 224;
+      commands += (i === 0 ? 'M' : 'L') + x.toFixed(2) + ' ' + y.toFixed(2) + ' ';
+    }
+    return commands;
+  }
+
+  private curveChannelColor(): string {
+    return this.toneChannelColor('curves', this.curvesChannel);
+  }
+
+  // 曲线画布固定 240 vp：tap 映射 8..232 与 curveGraphTap 的坐标口径一致。
+  private drawCurveGraph(): void {
+    try {
+      const ctx = this.curveCtx;
+      const size = 240;
+      ctx.clearRect(0, 0, size, size);
+      ctx.fillStyle = '#0b0d12';
+      ctx.fillRect(0, 0, size, size);
+      ctx.strokeStyle = '#2a2f3a';
+      ctx.lineWidth = 1;
+      for (let i = 1; i < 4; i++) {
+        const p = 8 + 224 * i / 4;
+        ctx.beginPath();
+        ctx.moveTo(p, 8);
+        ctx.lineTo(p, 232);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(8, p);
+        ctx.lineTo(232, p);
+        ctx.stroke();
+      }
+      ctx.strokeStyle = '#3a3550';
+      ctx.beginPath();
+      ctx.moveTo(8, 232);
+      ctx.lineTo(232, 8);
+      ctx.stroke();
+      const points = this.curvesSelectedPoints();
+      if (points.length >= 2) {
+        const samples = curveSamples(points, this.curvesInfo().pencil);
+        ctx.strokeStyle = this.curveChannelColor();
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        for (let i = 0; i < samples.length; i++) {
+          const x = 8 + i / (samples.length - 1) * 224;
+          const y = 8 + (1 - samples[i]) * 224;
+          if (i === 0) {
+            ctx.moveTo(x, y);
+          } else {
+            ctx.lineTo(x, y);
+          }
+        }
+        ctx.stroke();
+        for (let i = 0; i < points.length; i++) {
+          const x = 8 + points[i].input * 224;
+          const y = 8 + (1 - points[i].output) * 224;
+          ctx.fillStyle = i === this.curvesPointIndex ? '#ffffff' : this.curveChannelColor();
+          ctx.beginPath();
+          ctx.arc(x, y, i === this.curvesPointIndex ? 5 : 4, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      }
+    } catch (err) {
+      // Canvas 尚未挂载：onReady 时还会再画一次。
+    }
+  }
+
+  private commitLevels(): void {
+    this.commitAdjustment(JSON.stringify(this.levelsInfo()));
+  }
+
+  private commitCurves(): void {
+    this.commitAdjustment(JSON.stringify(this.curvesInfo()));
+  }
+
+  private beginToneEdit(kind: string): void {
+    if (kind === 'levels') {
+      this.levelsEditDocId = this.docId;
+      this.levelsEditLayerId = this.selectedLayerId;
+    } else {
+      this.curvesEditDocId = this.docId;
+      this.curvesEditLayerId = this.selectedLayerId;
+    }
+  }
+
+  private cancelToneEdit(kind: string): void {
+    if (kind === 'levels') {
+      this.levelsEditDocId = 0;
+      this.levelsEditLayerId = 0;
+    } else {
+      this.curvesEditDocId = 0;
+      this.curvesEditLayerId = 0;
+    }
+  }
+
+  private commitToneEdit(kind: string, params: string): void {
+    const docId = kind === 'levels' ? this.levelsEditDocId : this.curvesEditDocId;
+    const layerId = kind === 'levels' ? this.levelsEditLayerId : this.curvesEditLayerId;
+    this.cancelToneEdit(kind);
+    if (docId === 0 || layerId === 0 || docId !== this.docId || layerId !== this.selectedLayerId) {
+      return;
+    }
+    try {
+      Engine.updateAdjustment(docId, layerId, params);
+      this.afterEdit();
+    } catch (err) {
+      this.status = this.messageOf(err as Object);
+    }
   }
 
   private commitBrightnessContrast(): void {
@@ -6400,6 +7966,8 @@ struct Index {
   }
 
   private commitAdjustment(params: string): void {
+    this.cancelToneEdit('levels');
+    this.cancelToneEdit('curves');
     if (this.docId === 0 || this.selectedLayerId === 0) {
       return;
     }
@@ -6418,9 +7986,10 @@ struct Index {
   }
 
   private async undo(): Promise<void> {
-    if (this.docId === 0) {
+    if (this.docId === 0 || this.busy) {
       return;
     }
+    this.stopActiveFilter(true);
     try {
       const info = Engine.undo(this.docId);
       // 撤销换了文档内容：版本号变化即缓存失效（R8.2）。
@@ -6434,6 +8003,9 @@ struct Index {
       this.layers = flattenLayers(info.layers, 0);
       this.selectedLayerId = 0;
       this.adjust = emptyAdjustment();
+      this.cancelToneEdit('levels');
+      this.cancelToneEdit('curves');
+      this.fxCancelSliderEdit();
       // 撤销后选中层已归零：清草稿与进行中的移动状态（R4.4）。
       this.editReset();
       this.maskReset();
@@ -6447,6 +8019,10 @@ struct Index {
       // 视图辅助（V2）：参考线同样可撤销，撤销后重新回填。
       this.syncGuides();
       this.loadHistory();
+      this.scheduleHistogram();
+      if (this.infoOpen) {
+        this.refreshMetadata();
+      }
       this.status = '已撤销';
     } catch (err) {
       this.status = this.messageOf(err as Object);
@@ -6454,9 +8030,10 @@ struct Index {
   }
 
   private async redo(): Promise<void> {
-    if (this.docId === 0) {
+    if (this.docId === 0 || this.busy) {
       return;
     }
+    this.stopActiveFilter(true);
     try {
       const info = Engine.redo(this.docId);
       // 重做换了文档内容：版本号变化即缓存失效（R8.2）。
@@ -6470,6 +8047,9 @@ struct Index {
       this.layers = flattenLayers(info.layers, 0);
       this.selectedLayerId = 0;
       this.adjust = emptyAdjustment();
+      this.cancelToneEdit('levels');
+      this.cancelToneEdit('curves');
+      this.fxCancelSliderEdit();
       // 重做后选中层已归零：清草稿与进行中的移动状态（R4.4）。
       this.editReset();
       this.maskReset();
@@ -6482,6 +8062,10 @@ struct Index {
       // 视图辅助（V2）：重做后重新回填参考线。
       this.syncGuides();
       this.loadHistory();
+      this.scheduleHistogram();
+      if (this.infoOpen) {
+        this.refreshMetadata();
+      }
       this.status = '已重做';
     } catch (err) {
       this.status = this.messageOf(err as Object);
@@ -6496,11 +8080,14 @@ struct Index {
       promptAction.showToast({ message: '请先打开一张图片' });
       return;
     }
+    const docId = this.docId;
+    const format = this.exportFormat;
+    const quality = this.exportQuality;
     try {
       this.busy = true;
-      const bytes = await Engine.exportImage(this.docId, this.exportFormat, this.exportQuality);
+      const bytes = await Engine.exportImage(docId, format, quality);
       const options = new picker.DocumentSaveOptions();
-      options.newFileNames = ['artsphoto-' + Date.now() + '.' + this.exportFormat];
+      options.newFileNames = ['artsphoto-' + Date.now() + '.' + format];
       const uris = await new picker.DocumentViewPicker(getContext(this)).save(options);
       if (uris.length === 0) {
         return;
@@ -6512,7 +8099,7 @@ struct Index {
       } finally {
         fileIo.closeSync(file);
       }
-      this.status = '已导出 ' + this.exportFormat.toUpperCase();
+      this.status = '已导出 ' + format.toUpperCase();
       promptAction.showToast({ message: '导出成功' });
     } catch (err) {
       this.status = '导出失败：' + this.messageOf(err as Object);
@@ -6539,7 +8126,8 @@ struct Index {
     try {
       this.busy = true;
       const format = (this.exportFormat === 'psd' || this.exportFormat === 'psb') ? 'png' : this.exportFormat;
-      const bytes = await Engine.exportImage(this.docId, format, this.exportQuality);
+      const quality = this.exportQuality;
+      const bytes = await Engine.exportImage(this.docId, format, quality);
       const ctx = getContext(this) as common.UIAbilityContext;
       const dir = ctx.filesDir + '/share';
       try {
@@ -6583,13 +8171,17 @@ struct Index {
 
   private barEnabled(kind: string): boolean {
     if (kind === 'open') {
-      return true;
+      return !this.busy && !this.documentClosed;
     }
     if (kind === 'undo') {
-      return this.info?.canUndo === true;
+      return !this.busy && this.info?.canUndo === true;
     }
     if (kind === 'redo') {
-      return this.info?.canRedo === true;
+      return !this.busy && this.info?.canRedo === true;
+    }
+    // C-COMPARE-UI@1：对比按钮只在快照就绪且未处于对比态时可用。
+    if (kind === 'cmp') {
+      return this.docId !== 0 && !this.busy && this.compareReady && !this.compareActive;
     }
     return this.docId !== 0 && !this.busy;
   }
@@ -6612,6 +8204,28 @@ struct Index {
       })
   }
 
+  /** 对比按钮（C-COMPARE-UI@1）：按住显示打开时的原图，松开恢复；视觉与 BarButton 一致，按住态高亮。 */
+  @Builder
+  CmpButton() {
+    Button('对比')
+      .fontSize(13)
+      .fontColor(this.barEnabled('cmp') ? COLOR_TEXT : '#4d5663')
+      .backgroundColor(this.compareActive ? '#2b6cf6' : '#22262e')
+      .height(32)
+      .constraintSize({ minWidth: 48 })
+      .flexShrink(0)
+      .padding({ left: this.screenWidth < WIDE_BREAKPOINT_VP ? 10 : 12, right: this.screenWidth < WIDE_BREAKPOINT_VP ? 10 : 12 })
+      .borderRadius(8)
+      .enabled(this.barEnabled('cmp'))
+      .onTouch((event: TouchEvent) => {
+        if (event.type === TouchType.Down) {
+          this.cmpEnter();
+        } else if (event.type === TouchType.Up || event.type === TouchType.Cancel) {
+          this.cmpExit();
+        }
+      })
+  }
+
   /** 导出格式芯片（FMT-EXPORT@1）：六种格式共用同一套视觉与点击链路。 */
   @Builder
   ExportChip(format: string) {
@@ -6622,8 +8236,11 @@ struct Index {
       .padding({ left: 10, right: 10 })
       .backgroundColor(this.exportFormat === format ? COLOR_EXPORT_ACCENT : '#22352b')
       .borderRadius(7)
+      .enabled(!this.busy)
       .onClick(() => {
-        this.exportFormat = format;
+        if (!this.busy) {
+          this.exportFormat = format;
+        }
       })
   }
 
@@ -6665,6 +8282,7 @@ struct Index {
           this.BarButton('重做', 'redo', () => {
             this.redo();
           })
+          this.CmpButton()
           this.BarButton('导出', 'export', () => {
             this.exportImage();
           })
@@ -6695,7 +8313,7 @@ struct Index {
         .backgroundColor(COLOR_CANVAS)
       if (this.pixelMap !== undefined && this.displayWidth() > 0 && this.displayHeight() > 0) {
         Image(this.pixelMap as image.PixelMap)
-          .objectFit(ImageFit.Fill)
+          .objectFit(this.compareActive ? this.compareFit : ImageFit.Fill)
           .interpolation(ImageInterpolation.Medium)
           .width(this.displayWidth())
           .height(this.displayHeight())
@@ -6898,6 +8516,10 @@ struct Index {
         }
         return;
       }
+      // C-COMPARE-UI@1 §3：对比态画布手势全部忽略，防止编辑动作破坏「按住看原图」语义。
+      if (this.compareActive) {
+        return;
+      }
       // 交互式裁剪手柄（C-CROPMODE-UI@1 §3.1）：最先于所有工具分支消费触摸。
       // 位置约束：必须在工具条区域守卫之后（保留 R5.3 的工具条拦截），
       // 必须在 tool==='pan' 与 move/select/shape/text/brush 分支之前（R5.1）。
@@ -6943,6 +8565,17 @@ struct Index {
         return;
       }
       if (this.tool === 'pan') {
+        return;
+      }
+      // 吸管：单指点击取色；多指交给 PinchGesture（缩放保持可用），整段手势在工具内消费。
+      if (this.tool === 'picker') {
+        if (event.touches.length > 1) {
+          return;
+        }
+        if (event.type === TouchType.Down) {
+          const touch = event.touches[0];
+          this.pickColorAt(touch.x, touch.y);
+        }
         return;
       }
       // 移动工具：多指落下即取消（交给 PinchGesture，缩放保持可用）；
@@ -7037,7 +8670,7 @@ struct Index {
           this.penDownX = touch.x;
           this.penDownY = touch.y;
           if (this.docId !== 0) {
-            this.penAddKnot(this.docId, touch.x, touch.y, false);
+            this.penAddKnot(this.docId, this.screenToDocX(touch.x), this.screenToDocY(touch.y), false);
             this.penPendingKnot = this.penPathKnots.length / 7 - 1;
           }
         } else if (event.type === TouchType.Move) {
@@ -7046,8 +8679,8 @@ struct Index {
             const touch = event.touches[0];
             const knotIdx = this.penCtrlKnotIndex;
             if (knotIdx >= 0 && this.penPathKnots.length > knotIdx * 7) {
-              this.penPathKnots[knotIdx * 7 + (this.penCtrlSide === 'in' ? 2 : 4)] = touch.x;
-              this.penPathKnots[knotIdx * 7 + (this.penCtrlSide === 'out' ? 3 : 5)] = touch.y;
+              this.penPathKnots[knotIdx * 7 + (this.penCtrlSide === 'in' ? 2 : 4)] = this.screenToDocX(touch.x);
+              this.penPathKnots[knotIdx * 7 + (this.penCtrlSide === 'out' ? 3 : 5)] = this.screenToDocY(touch.y);
               this.penSetCtrlKnot(this.docId, knotIdx, this.penCtrlSide);
             }
           } else if (this.penPendingKnot >= 0) {
@@ -7060,8 +8693,8 @@ struct Index {
               this.penCtrlKnotIndex = this.penPendingKnot;
               this.penCtrlSide = 'out';
               this.penPendingKnot = -1;
-              this.penPathKnots[this.penCtrlKnotIndex * 7 + 4] = touch.x;
-              this.penPathKnots[this.penCtrlKnotIndex * 7 + 5] = touch.y;
+              this.penPathKnots[this.penCtrlKnotIndex * 7 + 4] = this.screenToDocX(touch.x);
+              this.penPathKnots[this.penCtrlKnotIndex * 7 + 5] = this.screenToDocY(touch.y);
               this.penSetCtrlKnot(this.docId, this.penCtrlKnotIndex, 'out');
             }
           }
@@ -7654,6 +9287,7 @@ struct Index {
       AppStorage.setOrCreate<string[]>('recentFiles', storedRecent);
       this.redrawCanvas();
       this.fxLoadPresets();
+      this.loadPalettes();
     } catch (err) {
       // 读取失败：全部保持默认值，不改变任何 @State。
     }
@@ -7925,6 +9559,7 @@ struct Index {
             }
             .width('100%')
             .height(18)
+            .enabled(!this.busy)
             .onClick(() => {
               this.jumpHistory('undo', index);
             })
@@ -7943,6 +9578,7 @@ struct Index {
             }
             .width('100%')
             .height(18)
+            .enabled(!this.busy)
             .onClick(() => {
               this.jumpHistory('redo', index);
             })
@@ -8067,6 +9703,25 @@ struct Index {
               .textOverflow({ overflow: TextOverflow.Ellipsis })
           }
           .width('100%')
+
+          // 宽高比锁定（对标 GIMP / ImageToolbox）：选择后拖拽保持比例。
+          if (this.cropMode) {
+            Row({ space: 6 }) {
+              ForEach(CROP_ASPECT_LABELS, (label: string, index: number) => {
+                Text(label)
+                  .fontSize(9)
+                  .fontColor(this.cropAspect === CROP_ASPECT_VALUES[index] ? '#0b1220' : FX_TEXT)
+                  .height(24)
+                  .padding({ left: 8, right: 8 })
+                  .backgroundColor(this.cropAspect === CROP_ASPECT_VALUES[index] ? COLOR_LAYER_ACCENT : FX_GROUP_BG)
+                  .borderRadius(6)
+                  .onClick(() => {
+                    this.setCropAspect(CROP_ASPECT_VALUES[index]);
+                  })
+              }, (label: string) => label)
+            }
+            .width('100%')
+          }
 
           // 画布旋转/翻转（Image Rotation）：像素层完整支持；含文字/形状/智能对象时引擎明确拒绝。
           Row({ space: 6 }) {
@@ -10100,7 +11755,7 @@ struct Index {
           .fontWeight(FontWeight.Bold)
           .fontColor('#ffe9c7')
         Text(this.tool === 'pan' ? '移动与缩放' : (this.tool === 'move' ? '移动图层' :
-          (this.tool === 'eraser' ? '橡皮擦' : '绘制')))
+          (this.tool === 'eraser' ? '橡皮擦' : (this.tool === 'picker' ? '吸管取色' : '绘制'))))
           .fontSize(10)
           .fontColor('#b08a55')
           .layoutWeight(1)
@@ -10115,6 +11770,7 @@ struct Index {
           this.ToolChip('移动图层', 'move')
           this.ToolChip('画笔', 'brush')
           this.ToolChip('橡皮', 'eraser')
+          this.ToolChip('吸管', 'picker')
         }
       }
       .scrollable(ScrollDirection.Horizontal)
@@ -10195,6 +11851,135 @@ struct Index {
           }
           .width('100%')
           .margin({ top: 4 })
+
+          // 最近取色（GIMP/Krita 色板的最小可用子集）：吸管取过的颜色排在最前，去重且上限 8 个。
+          if (this.recentColors.length > 0) {
+            Row({ space: 8 }) {
+              Text('最近')
+                .fontSize(11)
+                .fontColor('#e8c48f')
+                .width(40)
+              ForEach(this.recentColors, (color: string) => {
+                Column()
+                  .width(24)
+                  .height(24)
+                  .backgroundColor(color)
+                  .borderRadius(12)
+                  .border({ width: this.brushColor === color ? 2 : 0, color: '#f8d9a0' })
+                  .onClick(() => {
+                    this.brushColor = color;
+                  })
+              }, (color: string) => color)
+            }
+            .width('100%')
+            .margin({ top: 4 })
+          }
+
+          // 命名调色板（GIMP/Krita 对标）：保存当前色 + 最近颜色/固定色板，可命名/套用/删除。
+          Row({ space: 6 }) {
+            Text(this.paletteOpen ? '▾ 调色板' : '▸ 调色板')
+              .fontSize(11)
+              .fontColor('#e8c48f')
+            Text(this.palettes.length.toString() + ' 个')
+              .fontSize(9)
+              .fontColor('#b08a55')
+              .layoutWeight(1)
+          }
+          .width('100%')
+          .margin({ top: 6 })
+          .onClick(() => {
+            this.paletteOpen = !this.paletteOpen;
+          })
+
+          if (this.paletteOpen) {
+            Row({ space: 6 }) {
+              TextInput({ placeholder: '色板名称', text: this.paletteName })
+                .fontSize(10)
+                .height(28)
+                .layoutWeight(1)
+                .backgroundColor('#3a2a18')
+                .fontColor('#ffe9c7')
+                .placeholderColor('#8a6a45')
+                .onChange((value: string) => {
+                  this.paletteName = value;
+                })
+              Button('保存当前')
+                .fontSize(10)
+                .height(28)
+                .padding({ left: 10, right: 10 })
+                .backgroundColor(COLOR_BRUSH_ACCENT)
+                .fontColor('#1a1206')
+                .borderRadius(6)
+                .onClick(() => {
+                  this.savePalette();
+                })
+            }
+            .width('100%')
+            .margin({ top: 4 })
+
+            if (this.palettes.length === 0) {
+              Text('暂无保存的色板：输入名称后点「保存当前」')
+                .fontSize(9)
+                .fontColor('#8a6a45')
+                .margin({ top: 4 })
+            } else {
+              Column({ space: 4 }) {
+                ForEach(this.palettes, (palette: SavedPalette) => {
+                  Column({ space: 4 }) {
+                    Row({ space: 6 }) {
+                      Text(palette.name)
+                        .fontSize(10)
+                        .fontColor('#ffe9c7')
+                        .layoutWeight(1)
+                        .maxLines(1)
+                        .textOverflow({ overflow: TextOverflow.Ellipsis })
+                      Text('套用')
+                        .fontSize(9)
+                        .fontColor('#1a1206')
+                        .height(20)
+                        .padding({ left: 8, right: 8 })
+                        .backgroundColor(COLOR_BRUSH_ACCENT)
+                        .borderRadius(5)
+                        .onClick(() => {
+                          this.applyPalette(palette.name);
+                        })
+                      Text('删除')
+                        .fontSize(9)
+                        .fontColor('#ff8b8b')
+                        .height(20)
+                        .padding({ left: 8, right: 8 })
+                        .backgroundColor('#3a2026')
+                        .borderRadius(5)
+                        .onClick(() => {
+                          this.deletePalette(palette.name);
+                        })
+                    }
+                    .width('100%')
+                    Row({ space: 4 }) {
+                      ForEach(palette.colors, (color: string) => {
+                        Column()
+                          .width(18)
+                          .height(18)
+                          .backgroundColor(color)
+                          .borderRadius(9)
+                          .border({ width: this.brushColor === color ? 2 : 0, color: '#f8d9a0' })
+                          .onClick(() => {
+                            this.brushColor = color;
+                          })
+                      }, (color: string) => palette.name + '-' + color)
+                    }
+                    .width('100%')
+                  }
+                  .width('100%')
+                  .padding(6)
+                  .backgroundColor('#3a2a18')
+                  .borderRadius(8)
+                }, (palette: SavedPalette) => 'palette-' + palette.name)
+              }
+              .width('100%')
+              .margin({ top: 4 })
+            }
+          }
         }
       }
     }
@@ -10526,18 +12311,52 @@ struct Index {
           .margin({ top: 8 })
       }
 
-      Button('应用滤镜')
-        .fontSize(13)
-        .height(34)
+      if (this.activeFilterJobId !== 0) {
+        Column() {
+          Row() {
+            Text(this.filterRunningLabel)
+              .fontSize(12)
+              .fontColor(COLOR_FILTER_ACCENT)
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .layoutWeight(1)
+            Button(this.filterCancelRequested ? '取消中…' : '取消滤镜')
+              .fontSize(11)
+              .height(32)
+              .width(88)
+              .padding(0)
+              .backgroundColor('#4a1a30')
+              .fontColor('#f0a8c6')
+              .borderRadius(8)
+              .enabled(!this.filterCancelRequested)
+              .onClick(() => {
+                this.cancelFilter();
+              })
+          }
+          .width('100%')
+
+          Text(this.filterProgress < 0 ? '正在准备…' :
+            '进度 ' + Math.round(this.filterProgress * 100) + '% · 取消不会写入历史')
+            .fontSize(10)
+            .fontColor('#c98aa8')
+            .margin({ top: 6 })
+        }
         .width('100%')
-        .backgroundColor(this.canFilter() ? COLOR_FILTER_ACCENT : '#4a1a30')
-        .fontColor(this.canFilter() ? '#2a0b18' : '#9d6b80')
-        .borderRadius(9)
-        .enabled(this.canFilter() && !this.busy)
         .margin({ top: 10 })
-        .onClick(() => {
-          this.applyFilter();
-        })
+      } else {
+        Button('应用滤镜')
+          .fontSize(13)
+          .height(34)
+          .width('100%')
+          .backgroundColor(this.canFilter() ? COLOR_FILTER_ACCENT : '#4a1a30')
+          .fontColor(this.canFilter() ? '#2a0b18' : '#9d6b80')
+          .borderRadius(9)
+          .enabled(this.canFilter() && !this.busy)
+          .margin({ top: 10 })
+          .onClick(() => {
+            this.applyFilter();
+          })
+      }
 
       Text(this.selectedLayerId === 0 ? '请先在图层列表选择一个像素图层' : '破坏性滤镜，可用撤销恢复；有选区时只作用于选区内')
         .fontSize(10)
@@ -10849,7 +12668,11 @@ struct Index {
       .width('100%')
       .margin({ bottom: 10 })
 
-      if (this.adjust.type === 'brightnessContrast') {
+      if (this.adjust.type === 'levels') {
+        this.LevelsEditor()
+      } else if (this.adjust.type === 'curves') {
+        this.CurvesEditor()
+      } else if (this.adjust.type === 'brightnessContrast') {
         Row({ space: 8 }) {
           Text('亮度').fontSize(11).fontColor('#b9a9e0').width(52)
           // 引擎 modern_brightness 有效范围 [-150, 150]（tone.rs:144），原 -100..100 偏小。
@@ -11014,6 +12837,8 @@ struct Index {
 
       Flex({ wrap: FlexWrap.Wrap }) {
         this.AdjustButton('亮度/对比', 'brightnessContrast')
+        this.AdjustButton('色阶', 'levels')
+        this.AdjustButton('曲线', 'curves')
         this.AdjustButton('曝光', 'exposure')
         this.AdjustButton('自然饱和', 'vibrance')
         this.AdjustButton('色相/饱和', 'hueSaturation')
@@ -11029,9 +12854,344 @@ struct Index {
     .padding(12)
     .backgroundColor(COLOR_ADJUST_CARD)
     .borderRadius(14)
-    .border({ width: { left: 4 }, color: COLOR_ADJUST_ACCENT })
+.border({ width: { left: 4 }, color: COLOR_ADJUST_ACCENT })
   }
 
+  // 色阶编辑器（对标 GIMP / Krita）：输入/输出色阶 + 灰度系数，按通道/空间独立保存。
+  private levelsFieldValue(field: string): number {
+    const c = this.levelsSelectedChannel();
+    if (field === 'inBlack') {
+      return c.inBlack;
+    }
+    if (field === 'inWhite') {
+      return c.inWhite;
+    }
+    if (field === 'gamma') {
+      return c.gamma;
+    }
+    if (field === 'outBlack') {
+      return c.outBlack;
+    }
+    return c.outWhite;
+  }
+
+  private levelsFieldLabel(field: string): string {
+    const c = this.levelsSelectedChannel();
+    if (field === 'gamma') {
+      return c.gamma.toFixed(2);
+    }
+    if (field === 'inBlack') {
+      return Math.round(c.inBlack * 255).toString();
+    }
+    if (field === 'inWhite') {
+      return Math.round(c.inWhite * 255).toString();
+    }
+    if (field === 'outBlack') {
+      return Math.round(c.outBlack * 255).toString();
+    }
+    return Math.round(c.outWhite * 255).toString();
+  }
+
+  private curveFieldValue(field: string): number {
+    const p = this.curvesSelectedPoint();
+    if (p === undefined) {
+      return 0;
+    }
+    return field === 'input' ? p.input : p.output;
+  }
+
+  private curveFieldLabel(field: string): string {
+    const p = this.curvesSelectedPoint();
+    if (p === undefined) {
+      return '—';
+    }
+    return Math.round((field === 'input' ? p.input : p.output) * 255).toString();
+  }
+
+  @Builder
+  LevelsEditor() {
+    Column({ space: 6 }) {
+      Row({ space: 6 }) {
+        this.ToneSpaceChip('levels', 'RGB', 'rgb')
+        this.ToneSpaceChip('levels', 'LAB', 'lab')
+        this.ToneSpaceChip('levels', 'CMYK', 'cmyk')
+      }
+      .width('100%')
+
+      Flex({ wrap: FlexWrap.Wrap }) {
+        if (this.toneChannelAvailable('levels', 0)) {
+          this.ToneChannelChip('levels', 0)
+        }
+        if (this.toneChannelAvailable('levels', 1)) {
+          this.ToneChannelChip('levels', 1)
+        }
+        if (this.toneChannelAvailable('levels', 2)) {
+          this.ToneChannelChip('levels', 2)
+        }
+        if (this.toneChannelAvailable('levels', 3)) {
+          this.ToneChannelChip('levels', 3)
+        }
+        if (this.toneChannelAvailable('levels', 4)) {
+          this.ToneChannelChip('levels', 4)
+        }
+      }
+      .width('100%')
+
+      this.LevelsSlider('输入黑', 'inBlack', 0, 1, 0.01)
+      this.LevelsSlider('输入白', 'inWhite', 0, 1, 0.01)
+      this.LevelsSlider('灰度', 'gamma', 0.1, 10, 0.01)
+      this.LevelsSlider('输出黑', 'outBlack', 0, 1, 0.01)
+      this.LevelsSlider('输出白', 'outWhite', 0, 1, 0.01)
+
+      Row({ space: 8 }) {
+        Button('重置通道')
+          .fontSize(10)
+          .height(26)
+          .padding({ left: 10, right: 10 })
+          .backgroundColor('#3a3050')
+          .fontColor('#e4d9ff')
+          .borderRadius(6)
+          .onClick(() => {
+            this.resetLevelsChannel();
+          })
+        Button('全部重置')
+          .fontSize(10)
+          .height(26)
+          .padding({ left: 10, right: 10 })
+          .backgroundColor('#3a3050')
+          .fontColor('#e4d9ff')
+          .borderRadius(6)
+          .onClick(() => {
+            this.resetLevels();
+          })
+      }
+      .width('100%')
+    }
+    .width('100%')
+  }
+
+  @Builder
+  LevelsSlider(label: string, field: string, min: number, max: number, step: number) {
+    Row({ space: 6 }) {
+      Text(label)
+        .fontSize(10)
+        .fontColor('#b9a9e0')
+        .width(48)
+      Slider({ value: this.levelsFieldValue(field), min: min, max: max, step: step })
+        .layoutWeight(1)
+        .onChange((value: number, mode: SliderChangeMode) => {
+          this.setLevelsValue(field, value);
+          if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
+            this.commitLevels();
+          }
+        })
+      Text(this.levelsFieldLabel(field))
+        .fontSize(10)
+        .fontColor('#b9a9e0')
+        .width(42)
+    }
+    .width('100%')
+  }
+
+  // 曲线编辑器（对标 GIMP / Krita）：240vp 画布点选/加点，选中点用滑块精调。
+  @Builder
+  CurvesEditor() {
+    Column({ space: 6 }) {
+      Row({ space: 6 }) {
+        this.ToneSpaceChip('curves', 'RGB', 'rgb')
+        this.ToneSpaceChip('curves', 'LAB', 'lab')
+        this.ToneSpaceChip('curves', 'CMYK', 'cmyk')
+      }
+      .width('100%')
+
+      Flex({ wrap: FlexWrap.Wrap }) {
+        if (this.toneChannelAvailable('curves', 0)) {
+          this.ToneChannelChip('curves', 0)
+        }
+        if (this.toneChannelAvailable('curves', 1)) {
+          this.ToneChannelChip('curves', 1)
+        }
+        if (this.toneChannelAvailable('curves', 2)) {
+          this.ToneChannelChip('curves', 2)
+        }
+        if (this.toneChannelAvailable('curves', 3)) {
+          this.ToneChannelChip('curves', 3)
+        }
+        if (this.toneChannelAvailable('curves', 4)) {
+          this.ToneChannelChip('curves', 4)
+        }
+      }
+      .width('100%')
+
+      Row() {
+        Canvas(this.curveCtx)
+          .width(240)
+          .height(240)
+          .borderRadius(8)
+          .onReady(() => {
+            this.drawCurveGraph();
+          })
+          .onTouch((event: TouchEvent) => {
+            if (event.type === TouchType.Down && event.touches.length > 0) {
+              this.curveGraphTap(event.touches[0].x, event.touches[0].y);
+              this.drawCurveGraph();
+            }
+          })
+      }
+      .width('100%')
+      .justifyContent(FlexAlign.Center)
+
+      Row({ space: 6 }) {
+        Text('点 ' + (this.curvesPointIndex + 1) + '/' + this.curvesSelectedPoints().length)
+          .fontSize(10)
+          .fontColor('#b9a9e0')
+          .width(60)
+        Button('+ 点')
+          .fontSize(10)
+          .height(24)
+          .padding({ left: 8, right: 8 })
+          .backgroundColor('#3a3050')
+          .fontColor('#e4d9ff')
+          .borderRadius(6)
+          .onClick(() => {
+            this.addCurvePoint(0.5, 0.5);
+          })
+        Button('删除点')
+          .fontSize(10)
+          .height(24)
+          .padding({ left: 8, right: 8 })
+          .backgroundColor('#3a3050')
+          .fontColor('#e4d9ff')
+          .borderRadius(6)
+          .enabled(this.curvesSelectedPoints().length > 2)
+          .onClick(() => {
+            this.removeCurvePoint();
+          })
+        Button(this.curvesInfo().pencil ? '铅笔 开' : '铅笔 关')
+          .fontSize(10)
+          .height(24)
+          .padding({ left: 8, right: 8 })
+          .backgroundColor(this.curvesInfo().pencil ? '#5b4a86' : '#3a3050')
+          .fontColor('#e4d9ff')
+          .borderRadius(6)
+          .onClick(() => {
+            this.setCurvesPencil(!this.curvesInfo().pencil);
+          })
+      }
+      .width('100%')
+
+      this.CurveSlider('输入', 'input')
+      this.CurveSlider('输出', 'output')
+
+      Flex({ wrap: FlexWrap.Wrap }) {
+        this.CurvePresetButton('增强对比', 'contrast')
+        this.CurvePresetButton('提亮', 'lighten')
+        this.CurvePresetButton('压暗', 'darken')
+        this.CurvePresetButton('褪色', 'fade')
+        Button('重置通道')
+          .fontSize(10)
+          .height(24)
+          .padding({ left: 8, right: 8 })
+          .backgroundColor('#3a3050')
+          .fontColor('#e4d9ff')
+          .borderRadius(6)
+          .margin({ right: 6, bottom: 6 })
+          .onClick(() => {
+            this.resetCurveChannel();
+          })
+        Button('全部重置')
+          .fontSize(10)
+          .height(24)
+          .padding({ left: 8, right: 8 })
+          .backgroundColor('#3a3050')
+          .fontColor('#e4d9ff')
+          .borderRadius(6)
+          .margin({ right: 6, bottom: 6 })
+          .onClick(() => {
+            this.resetCurves();
+          })
+      }
+      .width('100%')
+    }
+    .width('100%')
+  }
+
+  @Builder
+  CurveSlider(label: string, field: string) {
+    Row({ space: 6 }) {
+      Text(label)
+        .fontSize(10)
+        .fontColor('#b9a9e0')
+        .width(36)
+      Slider({ value: this.curveFieldValue(field), min: 0, max: 1, step: 0.01 })
+        .layoutWeight(1)
+        .onChange((value: number, mode: SliderChangeMode) => {
+          this.setCurveCoordinate(field, value);
+          if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
+            this.commitCurves();
+          }
+        })
+      Text(this.curveFieldLabel(field))
+        .fontSize(10)
+        .fontColor('#b9a9e0')
+        .width(40)
+    }
+    .width('100%')
+  }
+
+  @Builder
+  ToneSpaceChip(kind: string, label: string, space: string) {
+    Text(label)
+      .fontSize(10)
+      .height(24)
+      .padding({ left: 8, right: 8 })
+      .fontColor(this.toneSpaceSelected(kind) === space ? '#0b1220' : '#b9a9e0')
+      .backgroundColor(this.toneSpaceSelected(kind) === space ? '#9f7aea' : '#2b2440')
+      .borderRadius(6)
+      .onClick(() => {
+        if (kind === 'levels') {
+          this.setLevelsSpace(space);
+        } else {
+          this.setCurvesSpace(space);
+        }
+      })
+  }
+
+  @Builder
+  ToneChannelChip(kind: string, index: number) {
+    Text(this.toneChannelLabel(kind, index))
+      .fontSize(10)
+      .height(24)
+      .padding({ left: 8, right: 8 })
+      .fontColor(this.toneChannelSelected(kind, index) ? '#0b1220' : '#b9a9e0')
+      .backgroundColor(this.toneChannelSelected(kind, index) ? this.toneChannelColor(kind, index) : '#2b2440')
+      .borderRadius(6)
+      .margin({ right: 6, bottom: 6 })
+      .onClick(() => {
+        if (kind === 'levels') {
+          this.setLevelsChannel(index);
+        } else {
+          this.setCurvesChannel(index);
+        }
+      })
+  }
+
+  @Builder
+  CurvePresetButton(label: string, preset: string) {
+    Text(label)
+      .fontSize(10)
+      .height(24)
+      .padding({ left: 8, right: 8 })
+      .fontColor('#e4d9ff')
+      .backgroundColor('#3a3050')
+      .borderRadius(6)
+      .margin({ right: 6, bottom: 6 })
+      .onClick(() => {
+        this.applyCurvePreset(preset);
+      })
+  }
+
+  // 调整图层快捷按钮
   @Builder
   AdjustButton(label: string, kind: string) {
     Button(label)
@@ -11154,12 +13314,9 @@ struct Index {
             .fontSize(10)
             .fontColor('#48c78e')
             .onClick(() => {
-              // 点击后重建文档：在 EntryAbility 中处理 openRecent
-              postCardAction(this, {
-                action: 'router',
-                abilityName: 'EntryAbility',
-                params: { target: 'openRecent' }
-              });
+              // 每项打开自己的路径（此前误调 openRecent，永远只打开第一项）。
+              this.saveRecentFile(path);
+              this.openFileFromPath(path);
             })
         }
       })
@@ -11243,6 +13400,198 @@ struct Index {
   }
 
   @Builder
+  HistogramCard() {
+    Column() {
+      Row({ space: 8 }) {
+        Column()
+          .width(8)
+          .height(16)
+          .backgroundColor(COLOR_ADJUST_ACCENT)
+          .borderRadius(4)
+        Row({ space: 6 }) {
+          Text(this.histOpen ? '▾ 直方图' : '▸ 直方图')
+            .fontSize(12)
+            .fontWeight(FontWeight.Bold)
+            .fontColor('#eee6ff')
+          Text(this.histData !== undefined ? ('RGB · ' + this.histData.samples + ' px') : 'RGB')
+            .fontSize(9)
+            .fontColor('#8d7bb5')
+        }
+        .layoutWeight(1)
+        .onClick(() => {
+          this.toggleHistogram();
+        })
+        if (this.histBusy) {
+          LoadingProgress()
+            .width(14)
+            .height(14)
+            .color('#9f7aea')
+        } else {
+          Button('刷新')
+            .fontSize(9)
+            .height(24)
+            .padding({ left: 8, right: 8 })
+            .backgroundColor(FX_GROUP_BG)
+            .fontColor('#b9a9e0')
+            .borderRadius(6)
+            .enabled(this.docId !== 0)
+            .onClick(() => {
+              this.refreshHistogram();
+            })
+        }
+      }
+      .width('100%')
+
+      if (this.histOpen) {
+        Canvas(this.histCtx)
+          .width('100%')
+          .height(92)
+          .borderRadius(8)
+          .margin({ top: 8 })
+          .onReady(() => {
+            this.drawHistogram();
+          })
+        Row({ space: 10 }) {
+          Text('R').fontSize(9).fontColor('#ff5c5c')
+          Text('G').fontSize(9).fontColor('#5cff8c')
+          Text('B').fontSize(9).fontColor('#5c9dff')
+          if (this.histData !== undefined) {
+            Text('暗部 ' + this.histData.shadows.reduce((a: number, b: number) => a + b, 0))
+              .fontSize(9)
+              .fontColor('#8d7bb5')
+            Text('亮部 ' + this.histData.highlights.reduce((a: number, b: number) => a + b, 0))
+              .fontSize(9)
+              .fontColor('#8d7bb5')
+            Text(this.histData.ms + ' ms')
+              .fontSize(9)
+              .fontColor('#5b6472')
+          } else {
+            Text(this.histBusy ? '计算中…' : '打开后点「刷新」计算')
+              .fontSize(9)
+              .fontColor('#5b6472')
+          }
+        }
+        .width('100%')
+        .margin({ top: 6 })
+      }
+    }
+    .width('100%')
+    .padding(12)
+    .backgroundColor(COLOR_ADJUST_CARD)
+    .borderRadius(14)
+    .border({ width: { left: 4 }, color: COLOR_ADJUST_ACCENT })
+  }
+
+  // 图像信息卡片（GIMP 图像属性 / ImageToolbox 元数据对标）：挂在直方图下。
+  @Builder
+  InfoRow(label: string, value: string) {
+    Row({ space: 8 }) {
+      Text(label)
+        .fontSize(10)
+        .fontColor('#8ba7c4')
+        .width(64)
+      Text(value)
+        .fontSize(10)
+        .fontColor('#dcecff')
+        .layoutWeight(1)
+        .maxLines(1)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+    }
+    .width('100%')
+    .margin({ top: 3 })
+  }
+
+  @Builder
+  InfoCard() {
+    Column() {
+      Row({ space: 8 }) {
+        Column()
+          .width(8)
+          .height(16)
+          .backgroundColor('#4aa3ff')
+          .borderRadius(4)
+        Row({ space: 6 }) {
+          Text(this.infoOpen ? '▾ 图像信息' : '▸ 图像信息')
+            .fontSize(12)
+            .fontWeight(FontWeight.Bold)
+            .fontColor('#dcecff')
+          Text(this.metaData !== undefined
+            ? (this.metaData.width + ' × ' + this.metaData.height)
+            : '文件 / EXIF')
+            .fontSize(9)
+            .fontColor('#8ba7c4')
+        }
+        .layoutWeight(1)
+        .onClick(() => {
+          this.toggleInfoCard();
+        })
+        Button('刷新')
+          .fontSize(9)
+          .height(24)
+          .padding({ left: 8, right: 8 })
+          .backgroundColor('#22303f')
+          .fontColor('#dcecff')
+          .borderRadius(6)
+          .enabled(this.docId !== 0)
+          .onClick(() => {
+            this.refreshMetadata();
+          })
+      }
+      .width('100%')
+
+      if (this.infoOpen) {
+        if (this.metaData === undefined) {
+          Text(this.docId === 0 ? '打开图片后显示图像信息' : '读取中…')
+            .fontSize(9)
+            .fontColor('#5b6472')
+            .margin({ top: 6 })
+        } else {
+          Column({ space: 0 }) {
+            this.InfoRow('尺寸', this.metaData.width + ' × ' + this.metaData.height + ' px')
+            this.InfoRow('色彩模式', this.metaData.mode)
+            this.InfoRow('位深', this.metaData.depth)
+            this.InfoRow('分辨率', Math.round(this.metaData.resolution).toString() + ' ppi')
+            this.InfoRow('图层', this.metaData.layers.toString() + ' 个')
+            this.InfoRow('选区', this.metaData.selection ? '有' : '无')
+            this.InfoRow('ICC / XMP', (this.metaData.iccBytes > 0 ? 'ICC ' + this.metaData.iccBytes + ' B' : 'ICC 无') +
+              ' · ' + (this.metaData.xmp ? 'XMP 有' : 'XMP 无'))
+            this.InfoRow('文件', this.metaFormatLabel() + ' · ' + this.metaBytesLabel())
+          }
+          .width('100%')
+          .margin({ top: 6 })
+
+          Text('EXIF 拍摄参数')
+            .fontSize(10)
+            .fontWeight(FontWeight.Bold)
+            .fontColor('#8ba7c4')
+            .margin({ top: 8 })
+          if (this.metaData.exif === undefined) {
+            Text('该图片不含 EXIF 拍摄参数')
+              .fontSize(9)
+              .fontColor('#5b6472')
+              .margin({ top: 2 })
+          } else {
+            Column({ space: 0 }) {
+              this.InfoRow('相机', this.exifCameraLabel())
+              this.InfoRow('镜头', this.exifLensLabel())
+              this.InfoRow('曝光', this.exifExposureLabel() + ' · ' + this.exifApertureLabel())
+              this.InfoRow('ISO / 焦距', this.exifIsoLabel() + ' · ' + this.exifFocalLabel())
+              this.InfoRow('拍摄时间', this.exifDateLabel())
+            }
+            .width('100%')
+            .margin({ top: 2 })
+          }
+        }
+      }
+    }
+    .width('100%')
+    .padding(12)
+    .backgroundColor('#182430')
+    .borderRadius(14)
+    .border({ width: { left: 4 }, color: '#4aa3ff' })
+  }
+
+  @Builder
   Panel() {
     Scroll() {
       Column({ space: 12 }) {
@@ -11254,6 +13603,8 @@ struct Index {
         this.PenCard()
         this.TypeCard()
         this.AdjustmentCard()
+        this.HistogramCard()
+        this.InfoCard()
         if (this.recentFiles.length > 0) {
           this.RecentDocsList()
         }
@@ -11320,7 +13671,24 @@ struct Index {
         .maxLines(1)
         .textOverflow({ overflow: TextOverflow.Ellipsis })
         .layoutWeight(1)
-      if (this.busy) {
+      if (this.activeFilterJobId !== 0) {
+        Text(this.filterProgress < 0 ? '滤镜' : Math.round(this.filterProgress * 100) + '%')
+          .fontSize(10)
+          .fontColor('#4aa3ff')
+          .margin({ right: 4 })
+        Button(this.filterCancelRequested ? '取消中' : '取消')
+          .fontSize(10)
+          .height(22)
+          .width(48)
+          .padding(0)
+          .backgroundColor('#24364b')
+          .fontColor('#9bc9ff')
+          .borderRadius(6)
+          .enabled(!this.filterCancelRequested)
+          .onClick(() => {
+            this.cancelFilter();
+          })
+      } else if (this.busy) {
         LoadingProgress()
           .width(16)
           .height(16)

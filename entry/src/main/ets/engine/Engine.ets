@@ -41,6 +41,36 @@ export interface OpenOutcome {
   info: DocumentInfo;
 }
 
+export interface LevelsChannelInfo {
+  inBlack: number;
+  inWhite: number;
+  gamma: number;
+  outBlack: number;
+  outWhite: number;
+}
+
+export interface LevelsAdjustmentInfo {
+  type: 'levels';
+  master: LevelsChannelInfo;
+  perChannel: [LevelsChannelInfo, LevelsChannelInfo, LevelsChannelInfo];
+  space: string;
+  black: LevelsChannelInfo;
+}
+
+export interface CurvePointInfo {
+  input: number;
+  output: number;
+}
+
+export interface CurvesAdjustmentInfo {
+  type: 'curves';
+  master: CurvePointInfo[];
+  perChannel: [CurvePointInfo[], CurvePointInfo[], CurvePointInfo[]];
+  space: string;
+  black: CurvePointInfo[];
+  pencil: boolean;
+}
+
 export interface AdjustmentInfo {
   type: string;
   brightness: number;
@@ -55,6 +85,8 @@ export interface AdjustmentInfo {
   levels: number;
   level: number;
   colorize: boolean;
+  levelsData?: LevelsAdjustmentInfo;
+  curvesData?: CurvesAdjustmentInfo;
 }
 
 /** 渐变色标（`C-EFFECTS-API@2`）：`p` 为 0..1 位置，`color` 为 BGR 顺序 `[b, g, r, a]`。 */
@@ -228,6 +260,69 @@ interface ApiResponse {
   ok: boolean;
   error: string;
   data: OpenPayload;
+}
+
+/** `pc_adjustment_get` 的 levels/curves 参数在 data 顶层（master/perChannel/space/black），
+ * 而 UI 侧消费的是 `levelsData`/`curvesData`。本接口只用于把两种形状对齐。 */
+interface RawAdjustmentInfo extends AdjustmentInfo {
+  master?: LevelsChannelInfo | CurvePointInfo[];
+  perChannel?: LevelsChannelInfo[] | CurvePointInfo[][];
+  space?: string;
+  black?: LevelsChannelInfo | CurvePointInfo[];
+  pencil?: boolean;
+}
+
+/** 合成结果的 RGB 直方图（`pc_histogram`）：每通道 256 桶，透明与非有限像素单独计数。 */
+export interface HistogramInfo {
+  width: number;
+  height: number;
+  samples: number;
+  transparent: number;
+  invalid: number;
+  shadows: number[];
+  highlights: number[];
+  rgb: number[][];
+  ms: number;
+}
+
+interface HistogramResponse {
+  ok: boolean;
+  error: string;
+  data: HistogramInfo;
+}
+
+/** `pc_metadata` 的 EXIF 拍摄参数（缺失字段由 Engine 补空串/0）。 */
+export interface ExifInfo {
+  make: string;
+  model: string;
+  lens: string;
+  exposureTime: number;
+  fNumber: number;
+  iso: number;
+  focalLength: number;
+  focalLength35mm: number;
+  dateTaken: string;
+}
+
+/** 图像信息面板：文档基础字段 + EXIF。`exif` 为 undefined 表示图片不含拍摄参数。 */
+export interface ImageMetadataInfo {
+  name: string;
+  width: number;
+  height: number;
+  mode: string;
+  depth: string;
+  resolution: number;
+  layers: number;
+  selection: boolean;
+  iccBytes: number;
+  xmp: boolean;
+  exif: ExifInfo | undefined;
+}
+
+interface MetadataResponse {
+  ok: boolean;
+  error: string;
+  data: ImageMetadataInfo;
 }
 
 interface InfoResponse {
@@ -488,6 +583,183 @@ interface LayerTransformResponse {
   perf?: LayerTransformPerf;
 }
 
+function clamp01(value: number, fallback: number): number {
+  return Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : fallback;
+}
+
+export function identityLevelsChannel(): LevelsChannelInfo {
+  return { inBlack: 0, inWhite: 1, gamma: 1, outBlack: 0, outWhite: 1 };
+}
+
+export function identityCurve(): CurvePointInfo[] {
+  return [{ input: 0, output: 0 }, { input: 1, output: 1 }];
+}
+
+export function defaultLevelsAdjustment(): LevelsAdjustmentInfo {
+  return {
+    type: 'levels',
+    master: identityLevelsChannel(),
+    perChannel: [identityLevelsChannel(), identityLevelsChannel(), identityLevelsChannel()],
+    space: 'rgb',
+    black: identityLevelsChannel()
+  };
+}
+
+export function defaultCurvesAdjustment(): CurvesAdjustmentInfo {
+  return {
+    type: 'curves',
+    master: identityCurve(),
+    perChannel: [identityCurve(), identityCurve(), identityCurve()],
+    space: 'rgb',
+    black: identityCurve(),
+    pencil: false
+  };
+}
+
+function normalizeLevelsChannel(raw: LevelsChannelInfo | undefined): LevelsChannelInfo {
+  const fallback = identityLevelsChannel();
+  if (raw === undefined) {
+    return fallback;
+  }
+  let inBlack = clamp01(raw.inBlack, fallback.inBlack);
+  let inWhite = clamp01(raw.inWhite, fallback.inWhite);
+  if (inBlack >= inWhite) {
+    inBlack = fallback.inBlack;
+    inWhite = fallback.inWhite;
+  }
+  let outBlack = clamp01(raw.outBlack, fallback.outBlack);
+  let outWhite = clamp01(raw.outWhite, fallback.outWhite);
+  if (outBlack > outWhite) {
+    outBlack = fallback.outBlack;
+    outWhite = fallback.outWhite;
+  }
+  const gamma = Number.isFinite(raw.gamma) ? Math.max(0.01, Math.min(100, raw.gamma)) : fallback.gamma;
+  return { inBlack, inWhite, gamma, outBlack, outWhite };
+}
+
+function normalizeLevels(raw: LevelsAdjustmentInfo | undefined): LevelsAdjustmentInfo {
+  const fallback = defaultLevelsAdjustment();
+  if (raw === undefined) {
+    return fallback;
+  }
+  const channels = raw.perChannel ?? fallback.perChannel;
+  return {
+    type: 'levels',
+    master: normalizeLevelsChannel(raw.master),
+    perChannel: [
+      normalizeLevelsChannel(channels[0]),
+      normalizeLevelsChannel(channels[1]),
+      normalizeLevelsChannel(channels[2])
+    ],
+    space: raw.space === 'cmyk' || raw.space === 'lab' ? raw.space : 'rgb',
+    black: normalizeLevelsChannel(raw.black)
+  };
+}
+
+export function normalizeCurvePoints(points: CurvePointInfo[] | undefined): CurvePointInfo[] {
+  if (points === undefined || points.length === 0) {
+    return identityCurve();
+  }
+  const normalized: CurvePointInfo[] = [];
+  for (const point of points) {
+    if (!Number.isFinite(point.input) || !Number.isFinite(point.output)) {
+      continue;
+    }
+    const input = clamp01(point.input, 0);
+    const output = clamp01(point.output, 0);
+    if (normalized.length > 0 && input <= normalized[normalized.length - 1].input) {
+      continue;
+    }
+    normalized.push({ input, output });
+  }
+  return normalized.length >= 2 ? normalized : identityCurve();
+}
+
+function normalizeCurves(raw: CurvesAdjustmentInfo | undefined): CurvesAdjustmentInfo {
+  const fallback = defaultCurvesAdjustment();
+  if (raw === undefined) {
+    return fallback;
+  }
+  const channels = raw.perChannel ?? fallback.perChannel;
+  return {
+    type: 'curves',
+    master: normalizeCurvePoints(raw.master),
+    perChannel: [
+      normalizeCurvePoints(channels[0]),
+      normalizeCurvePoints(channels[1]),
+      normalizeCurvePoints(channels[2])
+    ],
+    space: raw.space === 'cmyk' || raw.space === 'lab' ? raw.space : 'rgb',
+    black: normalizeCurvePoints(raw.black),
+    pencil: raw.pencil === true
+  };
+}
+
+export function curveSamples(points: CurvePointInfo[], pencil: boolean, count: number = 65): number[] {
+  const normalized = normalizeCurvePoints(points);
+  if (pencil || normalized.length === 2) {
+    const samples: number[] = [];
+    let segment = 0;
+    for (let i = 0; i < count; i++) {
+      const input = count <= 1 ? 0 : i / (count - 1);
+      while (segment < normalized.length - 2 && input > normalized[segment + 1].input) {
+        segment++;
+      }
+      const a = normalized[segment];
+      const b = normalized[segment + 1];
+      const span = b.input - a.input;
+      const t = span > 0 ? Math.max(0, Math.min(1, (input - a.input) / span)) : 0;
+      samples.push(a.output + (b.output - a.output) * t);
+    }
+    return samples;
+  }
+  const n = normalized.length;
+  const second: number[] = new Array<number>(n).fill(0);
+  const upper: number[] = new Array<number>(n).fill(0);
+  const diagonal: number[] = new Array<number>(n).fill(0);
+  for (let i = 1; i < n - 1; i++) {
+    const h0 = normalized[i].input - normalized[i - 1].input;
+    const h1 = normalized[i + 1].input - normalized[i].input;
+    const a = h0 / 6;
+    const b = (h0 + h1) / 3;
+    const c = h1 / 6;
+    const r = (normalized[i + 1].output - normalized[i].output) / h1
+      - (normalized[i].output - normalized[i - 1].output) / h0;
+    const denominator = b - a * upper[i - 1];
+    upper[i] = c / denominator;
+    diagonal[i] = (r - a * diagonal[i - 1]) / denominator;
+  }
+  for (let i = n - 2; i >= 1; i--) {
+    second[i] = diagonal[i] - upper[i] * second[i + 1];
+  }
+  const samples: number[] = [];
+  for (let k = 0; k < count; k++) {
+    const input = count <= 1 ? 0 : k / (count - 1);
+    let segment = 0;
+    while (segment < n - 2 && input > normalized[segment + 1].input) {
+      segment++;
+    }
+    const a = normalized[segment];
+    const b = normalized[segment + 1];
+    if (input <= a.input) {
+      samples.push(a.output);
+      continue;
+    }
+    if (input >= b.input) {
+      samples.push(b.output);
+      continue;
+    }
+    const h = b.input - a.input;
+    const wa = (b.input - input) / h;
+    const wb = (input - a.input) / h;
+    const output = wa * a.output + wb * b.output
+      + ((wa * wa * wa - wa) * second[segment]
+      + (wb * wb * wb - wb) * second[segment + 1]) * h * h / 6;
+    samples.push(Math.max(0, Math.min(1, output)));
+  }
+  return samples;
+}
+
 export function emptyAdjustment(): AdjustmentInfo {
   return {
     type: '',
@@ -502,7 +774,9 @@ export function emptyAdjustment(): AdjustmentInfo {
     lightness: 0,
     levels: 4,
     level: 0.5,
-    colorize: false
+    colorize: false,
+    levelsData: defaultLevelsAdjustment(),
+    curvesData: defaultCurvesAdjustment()
   };
 }
 
@@ -764,12 +1038,31 @@ export class Engine {
     };
   }
 
-  static async filterApply(documentId: number, layerId: number, paramsJson: string): Promise<DocumentInfo> {
-    const parsed = JSON.parse(await native.filterApply(documentId, layerId, paramsJson)) as InfoResponse;
+  static async filterApply(
+    documentId: number,
+    layerId: number,
+    paramsJson: string,
+    onJobId?: (jobId: number) => void
+  ): Promise<DocumentInfo> {
+    const parsed = JSON.parse(
+      await native.filterApply(documentId, layerId, paramsJson, (jobId: number) => {
+        if (onJobId !== undefined) {
+          onJobId(jobId);
+        }
+      })
+    ) as InfoResponse;
     if (!parsed.ok) {
       throw new Error(parsed.error);
     }
     return normalizeInfo(parsed.data);
+  }
+
+  static cancelFilter(jobId: number): boolean {
+    return native.filterCancel(jobId);
+  }
+
+  static filterProgress(jobId: number): number {
+    return native.filterProgress(jobId);
   }
 
   static shapeCreate(documentId: number, paramsJson: string): ShapeOutcome {
@@ -974,7 +1267,29 @@ export class Engine {
     if (!parsed.ok) {
       throw new Error(parsed.error);
     }
-    const d = parsed.data;
+    const d = parsed.data as RawAdjustmentInfo;
+    // native 返回 levels/curves 顶层参数（adjustment_json），优先采用；旧路径仍兼容 levelsData/curvesData。
+    let levelsData: LevelsAdjustmentInfo | undefined = d.levelsData;
+    if (levelsData === undefined && d.type === 'levels' && d.master !== undefined) {
+      levelsData = {
+        type: 'levels',
+        master: d.master as LevelsChannelInfo,
+        perChannel: (d.perChannel ?? []) as [LevelsChannelInfo, LevelsChannelInfo, LevelsChannelInfo],
+        space: d.space ?? 'rgb',
+        black: (d.black ?? identityLevelsChannel()) as LevelsChannelInfo
+      };
+    }
+    let curvesData: CurvesAdjustmentInfo | undefined = d.curvesData;
+    if (curvesData === undefined && d.type === 'curves' && d.master !== undefined) {
+      curvesData = {
+        type: 'curves',
+        master: d.master as CurvePointInfo[],
+        perChannel: (d.perChannel ?? []) as [CurvePointInfo[], CurvePointInfo[], CurvePointInfo[]],
+        space: d.space ?? 'rgb',
+        black: (d.black ?? identityCurve()) as CurvePointInfo[],
+        pencil: d.pencil ?? false
+      };
+    }
     return {
       type: d.type ?? '',
       brightness: d.brightness ?? 0,
@@ -988,7 +1303,9 @@ export class Engine {
       lightness: d.lightness ?? 0,
       levels: d.levels ?? 4,
       level: d.level ?? 0.5,
-      colorize: d.colorize ?? false
+      colorize: d.colorize ?? false,
+      levelsData: normalizeLevels(levelsData),
+      curvesData: normalizeCurves(curvesData)
     };
   }
 
@@ -1028,6 +1345,14 @@ export class Engine {
     return normalizeLayerEffects(parsed.data);
   }
 
+  static updateLayerEffectsBatch(documentId: number, layerId: number, paramsJson: string): LayerEffectsInfo {
+    const parsed = JSON.parse(native.updateLayerEffectsBatch(documentId, layerId, paramsJson)) as EffectsResponse;
+    if (!parsed.ok) {
+      throw new Error(parsed.error);
+    }
+    return normalizeLayerEffects(parsed.data);
+  }
+
   // The native side returns bare RGBA8 bytes (no size header), so they go straight to PixelMap.
   static renderPixels(documentId: number, x: number, y: number, w: number, h: number): ArrayBuffer {
     return native.renderPixels(documentId, x, y, w, h);
@@ -1039,6 +1364,60 @@ export class Engine {
       throw new Error(parsed.error);
     }
     return parsed.data.revision ?? 0;
+  }
+
+  /** 合成结果的 RGB 直方图（条带合成，异步工作线程，不阻塞 UI）。 */
+  static async histogram(documentId: number): Promise<HistogramInfo> {
+    const parsed = JSON.parse(await native.histogram(documentId)) as HistogramResponse;
+    if (!parsed.ok) {
+      throw new Error(parsed.error);
+    }
+    const d = parsed.data;
+    return {
+      width: d.width ?? 0,
+      height: d.height ?? 0,
+      samples: d.samples ?? 0,
+      transparent: d.transparent ?? 0,
+      invalid: d.invalid ?? 0,
+      shadows: d.shadows ?? [0, 0, 0],
+      highlights: d.highlights ?? [0, 0, 0],
+      rgb: d.rgb ?? [[], [], []],
+      ms: d.ms ?? 0
+    };
+  }
+
+  /** 图像信息/EXIF（只读小 JSON，同步）。 */
+  static metadata(documentId: number): ImageMetadataInfo {
+    const parsed = JSON.parse(native.metadata(documentId)) as MetadataResponse;
+    if (!parsed.ok) {
+      throw new Error(parsed.error);
+    }
+    const d = parsed.data;
+    const raw = d.exif as ExifInfo | null | undefined;
+    const exif: ExifInfo | undefined = (raw === null || raw === undefined) ? undefined : {
+      make: raw.make ?? '',
+      model: raw.model ?? '',
+      lens: raw.lens ?? '',
+      exposureTime: raw.exposureTime ?? 0,
+      fNumber: raw.fNumber ?? 0,
+      iso: raw.iso ?? 0,
+      focalLength: raw.focalLength ?? 0,
+      focalLength35mm: raw.focalLength35mm ?? 0,
+      dateTaken: raw.dateTaken ?? ''
+    };
+    return {
+      name: d.name ?? '',
+      width: d.width ?? 0,
+      height: d.height ?? 0,
+      mode: d.mode ?? '',
+      depth: d.depth ?? '',
+      resolution: d.resolution ?? 0,
+      layers: d.layers ?? 0,
+      selection: d.selection ?? false,
+      iccBytes: d.iccBytes ?? 0,
+      xmp: d.xmp ?? false,
+      exif: exif
+    };
   }
 
   /** 设备算力档案（native 进程级缓存，仅首次调用探测）。 */
