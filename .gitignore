@@ -35,5 +35,8 @@
 /.ai/
 /.qwen/
 /.workbuddy-ai/
+/.workbuddy/
+/.security/
+/.zwork/
 /.tmp-*
 /build-log.txt

@@ -1333,7 +1333,10 @@ fn apply_box_blur(
     let band = i32::try_from(RESULT_BUDGET / column_bytes.max(1)).unwrap_or(i32::MAX).max(blur::STRIP) / blur::STRIP * blur::STRIP;
     let bands: Vec<Rect> = (area.x0..area.x1).step_by(band as usize).map(|x| Rect::new(x, area.y0, x.saturating_add(band).min(area.x1), area.y1)).collect();
     for (i, b) in bands.iter().enumerate() {
-        let strips = blur::box_blur(src, &read, *b, n, fmt.alpha, boxes, ctl)?;
+        let start = 0.98 * i as f32 / bands.len() as f32;
+        let end = 0.98 * (i + 1) as f32 / bands.len() as f32;
+        let progress = |fraction: f32| ctl.progress(start + (end - start) * fraction);
+        let strips = blur::box_blur(src, &read, *b, n, fmt.alpha, boxes, ctl, &progress)?;
         // Each strip lies in one tile column: the columns' tiles are written in parallel.
         let mut columns: Vec<(Surface, Vec<blur::Strip>)> = Vec::new();
         for (t, data) in strips {

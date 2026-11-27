@@ -352,13 +352,13 @@ export default function advancedTest() {
     });
 
     it('filterInFlightCancelReportsProgressAndLeavesDocumentUnchanged', 0, async () => {
-      await withDocumentAsync(768, 768, 'filter-cancel-running', async (id: number) => {
+      await withDocumentAsync(2048, 2048, 'filter-cancel-running', async (id: number) => {
         const layerId: number = Engine.info(id).layers[0].id;
         const revision: number = Engine.revision(id);
         const history: string = JSON.stringify(Engine.history(id));
-        const pixels: ArrayBuffer = Engine.renderPixels(id, 0, 0, 768, 768);
+        const pixels: ArrayBuffer = Engine.renderPixels(id, 0, 0, 2048, 2048);
         let jobId: number = 0;
-        const pending: Promise<DocumentInfo> = Engine.filterApply(id, layerId, '{"filter":"gaussianBlur","radius":32}', (started: number) => {
+        const pending: Promise<DocumentInfo> = Engine.filterApply(id, layerId, '{"filter":"gaussianBlur","radius":64}', (started: number) => {
           jobId = started;
         });
         let progress: number = 0;
@@ -376,7 +376,7 @@ export default function advancedTest() {
         expect(message.indexOf('filter cancelled') >= 0).assertTrue();
         expect(Engine.revision(id)).assertEqual(revision);
         expect(JSON.stringify(Engine.history(id))).assertEqual(history);
-        expect(pixelsEqual(Engine.renderPixels(id, 0, 0, 768, 768), pixels)).assertTrue();
+        expect(pixelsEqual(Engine.renderPixels(id, 0, 0, 2048, 2048), pixels)).assertTrue();
         expect(Engine.cancelFilter(jobId)).assertFalse();
         expect(Engine.filterProgress(jobId)).assertEqual(-1);
       });

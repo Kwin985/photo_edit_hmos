@@ -510,13 +510,13 @@ fn box_blur_honours_a_cancel_at_every_check() {
     };
     let Some(boxes) = box_widths(&FilterParams::GaussianBlur { radius: 12.0 }) else { panic!("box passes") };
     let out = Rect::new(-5, 3, 155, 80);
-    let want = box_blur(src, &read, out, n, true, &boxes, &Interrupt::NONE).unwrap();
+    let want = box_blur(src, &read, out, n, true, &boxes, &Interrupt::NONE, &|_| {}).unwrap();
     let checks = AtomicUsize::new(0);
     let count = || {
         checks.fetch_add(1, Ordering::SeqCst);
         false
     };
-    let got = box_blur(src, &read, out, n, true, &boxes, &Interrupt::cancel_only(&count)).unwrap();
+    let got = box_blur(src, &read, out, n, true, &boxes, &Interrupt::cancel_only(&count), &|_| {}).unwrap();
     assert_eq!(got.len(), want.len());
     for ((ta, a), (tb, b)) in got.iter().zip(&want) {
         assert_eq!(ta, tb);
@@ -526,6 +526,28 @@ fn box_blur_honours_a_cancel_at_every_check() {
     for k in (0..total).step_by((total / 40).max(1)) {
         let seen = AtomicUsize::new(0);
         let cancel = || seen.fetch_add(1, Ordering::SeqCst) >= k;
-        assert!(box_blur(src, &read, out, n, true, &boxes, &Interrupt::cancel_only(&cancel)).is_none(), "cancelled at check {k}");
+        assert!(box_blur(src, &read, out, n, true, &boxes, &Interrupt::cancel_only(&cancel), &|_| {}).is_none(), "cancelled at check {k}");
     }
+}
+
+#[test]
+fn box_blur_reports_progress_before_completion() {
+    use std::sync::Mutex;
+    let (n, src) = (4usize, Rect::new(0, 0, 150, 90));
+    let px = vec![0.5f32; src.width() as usize * src.height() as usize * n];
+    let read = |r: Rect, buf: &mut Vec<f32>| {
+        buf.clear();
+        let (x0, x1) = ((r.x0 * n as i32) as usize, (r.x1 * n as i32) as usize);
+        let row = r.y0 as usize * src.width() as usize * n;
+        buf.extend_from_slice(&px[row + x0..row + x1]);
+    };
+    let boxes = box_widths(&FilterParams::GaussianBlur { radius: 12.0 }).expect("box passes");
+    let seen = Mutex::new(Vec::new());
+    let result = box_blur(src, &read, src, n, true, &boxes, &Interrupt::NONE, &|f| {
+        seen.lock().expect("progress lock").push(f);
+    });
+    assert!(result.is_some());
+    let seen = seen.into_inner().expect("progress lock");
+    assert!(seen.iter().any(|f| *f > 0.0 && *f < 1.0), "{seen:?}");
+    assert_eq!(seen.last(), Some(&1.0));
 }

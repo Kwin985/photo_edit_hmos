@@ -310,6 +310,7 @@ pub(crate) fn box_blur(
     alpha: bool,
     boxes: &[usize],
     ctl: &Interrupt,
+    progress: &(dyn Fn(f32) + Sync),
 ) -> Option<Vec<Strip>> {
     let radii: Vec<usize> = boxes.iter().map(|w| w / 2).collect();
     let reach = i32::try_from(radii.iter().sum::<usize>()).unwrap_or(i32::MAX);
@@ -341,10 +342,15 @@ pub(crate) fn box_blur(
             line_passes(dst, n, &radii, &mut s, ctl);
         }
     });
+    if ctl.cancelled() {
+        return None;
+    }
+    progress(0.25);
     // Vertical passes, strip by strip, the same way down the columns.
     let (top, bottom) = ((used.y0 - out.y0.saturating_sub(reach)) as usize, (out.y1.saturating_add(reach) - used.y1) as usize);
     let (rows, stride) = (used.height() as usize, ow * n);
     let strips: Vec<Rect> = strips(out).collect();
+    let done = std::sync::atomic::AtomicUsize::new(0);
     let done = par_map(strips.len(), |k| {
         let t = strips[k];
         if ctl.cancelled() {
@@ -362,9 +368,15 @@ pub(crate) fn box_blur(
             return (t, Vec::new());
         }
         unpremultiply(&mut res, n, alpha);
+        let finished = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        progress(0.25 + 0.75 * finished as f32 / strips.len() as f32);
         (t, res)
     });
-    (!ctl.cancelled()).then_some(done)
+    if ctl.cancelled() {
+        return None;
+    }
+    progress(1.0);
+    Some(done)
 }
 
 /// Column strips of `out` at multiples of [`STRIP`], so each lies inside one tile column.
@@ -387,7 +399,7 @@ fn box_passes(src: &Image, out: Rect, alpha: bool, boxes: &[usize]) -> Vec<f32> 
     if res.is_empty() {
         return res;
     }
-    for (t, data) in box_blur(src.rect, &read, out, n, alpha, boxes, &Interrupt::NONE).unwrap_or_default() {
+    for (t, data) in box_blur(src.rect, &read, out, n, alpha, boxes, &Interrupt::NONE, &|_| {}).unwrap_or_default() {
         let (x0, w) = ((t.x0 - out.x0) as usize * n, t.width() as usize * n);
         for (dst, s) in res.chunks_exact_mut(ow).zip(data.chunks_exact(w)) {
             dst[x0..x0 + w].copy_from_slice(s);
